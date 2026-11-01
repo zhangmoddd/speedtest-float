@@ -62,7 +62,9 @@ namespace NetSpeedBall
 
     internal sealed class SpeedBallApplication : ApplicationContext
     {
-        private const string AppName = "NetSpeedBall";
+        // 必须与合并版设置的启动项名称一致，否则右键菜单会误报“未开启”，
+        // 再点一次会写出第二条重复的启动项。
+        private const string AppName = "测速浮光";
         private readonly NotifyIcon trayIcon;
         private readonly SpeedBallForm ballForm;
         private readonly ThreadingTimer sampleTimer;
@@ -1307,16 +1309,18 @@ namespace NetSpeedBall
             float flight = launchAnimating
                 ? (float)Math.Max(0.0, Math.Min(1.0, (launchElapsed - 0.36) / 0.95))
                 : 0.0f;
+            // 窗口只有 122px 高，大火箭加长尾焰会从底边被硬裁掉。
+            // 把整枚火箭上移，并把尾焰长度封顶，保证火苗完整。
             float flameScale = launchAnimating
-                ? 1.0f + (float)Math.Min(0.75, launchElapsed * 1.5) + (float)pulse * 0.18f
-                : 0.60f + (float)pulse * 0.10f;
+                ? 0.72f + (float)Math.Min(0.15, launchElapsed * 0.4) + (float)pulse * 0.05f
+                : 0.50f + (float)pulse * 0.08f;
             float shakeX = launchAnimating && launchElapsed < 0.36
                 ? (float)Math.Sin(launchElapsed * 82.0) * 1.5f
                 : 0.0f;
             float lift = launchAnimating && launchElapsed < 0.36
                 ? (float)(launchElapsed / 0.36 * 4.0)
                 : 4.0f;
-            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + rect.Height * 0.48f - lift);
+            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + rect.Height * 0.39f - lift);
 
             if (flight > 0.0f)
             {
@@ -1347,7 +1351,7 @@ namespace NetSpeedBall
                 }
             }
 
-            DrawLaunchRocketBody(g, center, 2.55f, -90.0f, true, flameScale);
+            DrawLaunchRocketBody(g, center, 2.25f, -90.0f, true, flameScale);
         }
 
         private void DrawLaunchRocketBody(Graphics g, PointF center, float scale, float angle, bool flameOn, float flameScale)
