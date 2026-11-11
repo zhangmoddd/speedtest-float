@@ -568,6 +568,16 @@ namespace NetSpeedBall
         private static readonly int ShowBallMessageId =
             (int)NativeMethods.RegisterWindowMessage("NetSpeedBall.ShowBall");
         private SpeedSample currentSample;
+
+        /// <summary>
+        /// 实际画在球上的速率（字节/秒），每帧朝 currentSample 逼近。
+        ///
+        /// 采样是一秒一拍，直接画就会「1 秒跳一下」；这里按帧插值，
+        /// 数字就和火箭、光环一样是连续变化的。真正的测量值仍是 currentSample。
+        /// </summary>
+        private double shownDownload;
+        private double shownUpload;
+        private bool shownPrimed;
         private bool useMegabits;
         private Point dragStart;
         private bool dragMoved;
@@ -714,6 +724,14 @@ namespace NetSpeedBall
         public void UpdateSpeed(SpeedSample sample)
         {
             currentSample = sample;
+            if (!shownPrimed)
+            {
+                // 第一拍没有历史值，直接落位，否则会从 0 慢慢爬上来
+                shownDownload = sample.DownloadBytesPerSecond;
+                shownUpload = sample.UploadBytesPerSecond;
+                shownPrimed = true;
+            }
+
             detailsForm.AddSample(sample);
             Invalidate();
         }
@@ -736,6 +754,13 @@ namespace NetSpeedBall
             DateTime now = DateTime.UtcNow;
             double elapsed = Math.Min(0.08, Math.Max(0.0, (now - lastAnimationFrame).TotalSeconds));
             lastAnimationFrame = now;
+
+            // 采样一秒一次，画出来的数字要按帧追上去，否则就是"隔一秒跳一个数"
+            shownDownload = SmoothValue.Toward(shownDownload,
+                currentSample.DownloadBytesPerSecond, elapsed, 0.25, 512.0);
+            shownUpload = SmoothValue.Toward(shownUpload,
+                currentSample.UploadBytesPerSecond, elapsed, 0.25, 512.0);
+            detailsForm.Animate(elapsed);
 
             float targetSpeed = GetRocketOrbitSpeed();
             float blend = Math.Min(1.0f, (float)(elapsed * 4.5));
@@ -1384,10 +1409,10 @@ namespace NetSpeedBall
             }
 
             RateText main = useMegabits
-                ? SpeedFormatter.FormatBits(currentSample.DownloadBytesPerSecond)
-                : SpeedFormatter.FormatMegabytesRate(currentSample.DownloadBytesPerSecond);
-            string down = SpeedFormatter.FormatCompact(currentSample.DownloadBytesPerSecond);
-            string up = SpeedFormatter.FormatCompact(currentSample.UploadBytesPerSecond);
+                ? SpeedFormatter.FormatBits(shownDownload)
+                : SpeedFormatter.FormatMegabytesRate(shownDownload);
+            string down = SpeedFormatter.FormatCompact(shownDownload);
+            string up = SpeedFormatter.FormatCompact(shownUpload);
 
             // 三行文字上移 5px，给沿外圈顺时针经过下方的火箭留出空间。
             DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), Width - 30);
@@ -1472,7 +1497,7 @@ namespace NetSpeedBall
                 return 0.0f;
             }
 
-            double bytes = Math.Max(currentSample.DownloadBytesPerSecond, currentSample.UploadBytesPerSecond);
+            double bytes = Math.Max(shownDownload, shownUpload);
             double ratio = Math.Log(bytes + 1.0) / Math.Log((2.0 * 1024.0 * 1024.0) + 1.0);
             if (bytes > 0 && ratio < 0.08)
             {
@@ -1510,7 +1535,7 @@ namespace NetSpeedBall
                 return 0.0f;
             }
 
-            double download = currentSample.DownloadBytesPerSecond;
+            double download = shownDownload;
             if (double.IsNaN(download) || download <= 0.0)
             {
                 // NaN 会穿过 Min/Max 污染 rocketAngle，让它永远卡在 NaN 上不再转动；按空闲处理。
@@ -1789,6 +1814,7 @@ namespace NetSpeedBall
         private const int MetricWidth = 128;
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
+        private readonly double[] smoothBuffer = new double[MaxSamples];
         private int sampleCount;
         /// <summary>这 60 秒里出现过的最高速率，画在曲线右上角当比例尺的说明。</summary>
         private double historyPeak;
@@ -1796,6 +1822,14 @@ namespace NetSpeedBall
         private SpeedSample currentSample;
         private readonly SystemResourceMonitor resourceMonitor = new SystemResourceMonitor();
         private SystemResourceSnapshot resourceSnapshot;
+
+        // 面板上真正画出来的数字，每帧朝采样值逼近，避免"一秒跳一下"。
+        private double shownDownload;
+        private double shownUpload;
+        private double shownCpu;
+        private double shownMemory;
+        private double[] shownDisks = new double[0];
+        private bool shownPrimed;
         private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
         private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
         private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
@@ -1884,7 +1918,115 @@ namespace NetSpeedBall
             }
 
             historyPeak = peak;
+
+            if (!shownPrimed)
+            {
+                // 第一拍直接落位，否则一开面板就是从 0 往上爬
+                SnapShownValues();
+                shownPrimed = true;
+            }
+
             Invalidate();
+        }
+
+        /// <summary>
+        /// 每帧调一次：把面板上的数字朝最新采样值挪一小步。
+        ///
+        /// 采样是一秒一拍，直接画就是「这一秒 0.1、下一秒 2.3」的硬跳；
+        /// 按帧插值之后，数字、百分比和进度条都是连续爬过去的，跟火箭动画一个节奏。
+        /// </summary>
+        public void Animate(double elapsed)
+        {
+            if (!Visible)
+            {
+                // 没显示就不做动画，直接落位，免得下次打开时从几分钟前的旧数字爬过来
+                SnapShownValues();
+                return;
+            }
+
+            bool moved = false;
+
+            double down = SmoothValue.Toward(shownDownload, currentSample.DownloadBytesPerSecond,
+                elapsed, 0.22, 256.0);
+            if (down != shownDownload)
+            {
+                shownDownload = down;
+                moved = true;
+            }
+
+            double up = SmoothValue.Toward(shownUpload, currentSample.UploadBytesPerSecond,
+                elapsed, 0.22, 256.0);
+            if (up != shownUpload)
+            {
+                shownUpload = up;
+                moved = true;
+            }
+
+            double cpu = SmoothValue.Toward(shownCpu, resourceSnapshot.CpuPercent, elapsed, 0.25, 0.05);
+            if (cpu != shownCpu)
+            {
+                shownCpu = cpu;
+                moved = true;
+            }
+
+            double memory = SmoothValue.Toward(shownMemory, resourceSnapshot.MemoryPercent,
+                elapsed, 0.25, 0.05);
+            if (memory != shownMemory)
+            {
+                shownMemory = memory;
+                moved = true;
+            }
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+                for (int i = 0; i < count; i++)
+                {
+                    shownDisks[i] = disks[i].Percent;
+                }
+
+                moved = true;
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    double value = SmoothValue.Toward(shownDisks[i], disks[i].Percent,
+                        elapsed, 0.3, 0.1);
+                    if (value != shownDisks[i])
+                    {
+                        shownDisks[i] = value;
+                        moved = true;
+                    }
+                }
+            }
+
+            if (moved)
+            {
+                Invalidate();
+            }
+        }
+
+        private void SnapShownValues()
+        {
+            shownDownload = currentSample.DownloadBytesPerSecond;
+            shownUpload = currentSample.UploadBytesPerSecond;
+            shownCpu = resourceSnapshot.CpuPercent;
+            shownMemory = resourceSnapshot.MemoryPercent;
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                shownDisks[i] = disks[i].Percent;
+            }
         }
 
         /// <summary>
@@ -1918,7 +2060,8 @@ namespace NetSpeedBall
 
         /// <summary>
         /// 把详情面板原样渲染成 PNG，只给 <c>--render-details 路径</c> 自检用。
-        /// 喂一串带尖刺的假数据，方便核对曲线的比例尺和文字排版有没有挤在一起。
+        /// 假数据按日常待机那种"20~50 KB/s 抖 + 偶尔一下 190 KB/s"来造，
+        /// 这样能看出真实场景下曲线是什么样，而不是一排理想化的正弦波。
         /// </summary>
         public static void SavePreview(string path)
         {
@@ -1931,8 +2074,6 @@ namespace NetSpeedBall
                     return;
                 }
 
-                const double mb = 1024.0 * 1024.0;
-
                 // 磁盘活动率是"两次读数之间的差值"，必须真的隔一秒取两次，
                 // 连着循环喂 60 条假数据只会算出垃圾值（间隔≈0）。
                 form.resourceSnapshot = form.resourceMonitor.Read();
@@ -1940,22 +2081,27 @@ namespace NetSpeedBall
                 form.resourceSnapshot = form.resourceMonitor.Read();
 
                 // 曲线历史直接写数组，不走 AddSample —— 否则每写一个点都会再读一次计数器。
+                double peak = 0;
                 for (int i = 0; i < MaxSamples; i++)
                 {
-                    double down = 0.06 * mb + 0.05 * mb * Math.Sin(i / 3.0);
-                    if (i >= 31)
+                    double down = (28 + 16 * Math.Sin(i * 1.13) + 10 * Math.Sin(i * 2.71)) * 1024.0;
+                    if (i == 19 || i == 20)
                     {
-                        down = Math.Max(down, 4.6 * mb * Math.Exp(-(i - 31) / 2.2));
+                        down = 190 * 1024.0;
                     }
 
+                    double up = (16 + 9 * Math.Sin(i * 1.7 + 1.2)) * 1024.0;
+
                     form.downloadHistory[i] = down;
-                    form.uploadHistory[i] = 0.012 * mb + 0.004 * mb * Math.Sin(i / 2.0);
+                    form.uploadHistory[i] = up;
+                    peak = Math.Max(peak, Math.Max(down, up));
                 }
 
                 form.sampleCount = MaxSamples;
-                form.historyPeak = 4.6 * mb;
+                form.historyPeak = peak;
                 form.currentSample = new SpeedSample(form.downloadHistory[MaxSamples - 1],
                     form.uploadHistory[MaxSamples - 1], true, 1.0, 0, 0);
+                form.SnapShownValues();
                 form.SyncResourcePanelHeight();
 
                 using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
@@ -2056,8 +2202,8 @@ namespace NetSpeedBall
             {
                 g.DrawString("\u7f51\u7edc\u8be6\u60c5", titleFont, dark, 16, 13);
                 g.DrawString(currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf", smallFont, muted, 236, 17);
-                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(currentSample.DownloadBytesPerSecond), valueFont, downBrush, 16, 43);
-                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(currentSample.UploadBytesPerSecond), valueFont, upBrush, 168, 43);
+                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(shownDownload), valueFont, downBrush, 16, 43);
+                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(shownUpload), valueFont, upBrush, 168, 43);
                 g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, muted, 16, 72);
 
                 // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
@@ -2115,17 +2261,18 @@ namespace NetSpeedBall
             }
 
             int left = panel.Left + 8;
-            DrawResourceMetric(g, "CPU", FormatPercent(resourceSnapshot.CpuPercent),
-                resourceSnapshot.CpuPercent, left, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "CPU", FormatPercent(shownCpu),
+                shownCpu, left, panel.Top + 6, MetricWidth,
                 Color.FromArgb(242, 126, 42));
-            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(resourceSnapshot.MemoryPercent),
-                resourceSnapshot.MemoryPercent, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(shownMemory),
+                shownMemory, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
                 Color.FromArgb(35, 119, 238));
 
             int y = panel.Top + 6 + MetricRowHeight;
             for (int i = 0; i < diskCount; i++)
             {
-                DrawDiskRow(g, disks[i], left, y, panel.Width - 16, i);
+                double percent = i < shownDisks.Length ? shownDisks[i] : disks[i].Percent;
+                DrawDiskRow(g, disks[i].Label, percent, left, y, panel.Width - 16, i);
                 y += DiskRowHeight;
             }
         }
@@ -2151,7 +2298,7 @@ namespace NetSpeedBall
         /// 一块物理磁盘占一行：左边"磁盘 0  C:"，右边活动百分比，下面一条通栏进度条。
         /// 口径跟任务管理器那一列一样 —— 磁盘有多忙，不是磁盘用了多少空间。
         /// </summary>
-        private void DrawDiskRow(Graphics g, DiskActivityRow disk, int x, int y, int width, int index)
+        private void DrawDiskRow(Graphics g, string label, double percent, int x, int y, int width, int index)
         {
             Color color = index % 2 == 0
                 ? Color.FromArgb(16, 178, 92)
@@ -2162,15 +2309,15 @@ namespace NetSpeedBall
             using (Brush track = new SolidBrush(Color.FromArgb(210, 224, 235)))
             using (Brush bar = new SolidBrush(color))
             {
-                g.DrawString(disk.Label, smallFont, muted, x, y);
+                g.DrawString(label, smallFont, muted, x, y);
 
-                string value = FormatPercent(disk.Percent);
+                string value = FormatPercent(percent);
                 SizeF size = g.MeasureString(value, smallFont);
                 g.DrawString(value, smallFont, dark, x + width - size.Width, y);
 
                 g.FillRectangle(track, x, y + 15, width, 5);
                 g.FillRectangle(bar, x, y + 15,
-                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, disk.Percent)) / 100.0), 5);
+                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0), 5);
             }
         }
 
@@ -2202,10 +2349,8 @@ namespace NetSpeedBall
                 return;
             }
 
-            // 线性刻度在这张图上没法看：60 秒里一根 5 MB/s 的尖刺，会把 0.1~0.5 MB/s
-            // 压成贴着底边的一条直线，看起来像"根本没流量"。改成按平方根压缩纵向比例 ——
-            // 相差 4 倍的高度差 2 倍，形状和先后顺序不变，零头也能看出起伏。
-            // 真实量级不靠读图：标题行右边直接写峰值，顶上那行写当前速率。
+            // 比例尺以窗口内的最高值为准（下面再兜一个 512 KB/s 的地板），
+            // 这样 5 MB/s 的大下载能顶满，日常零碎流量也不会被放大成假起伏。
             double peak = 0;
             for (int i = 0; i < sampleCount; i++)
             {
@@ -2218,8 +2363,10 @@ namespace NetSpeedBall
                 }
             }
 
-            // 下限 64 KB/s：没流量时别把几 KB 的心跳放大成半张图。
-            double ceiling = Math.Max(peak, 64.0 * 1024.0);
+            // 比例尺用线性，但设一个 512 KB/s 的地板：
+            // 后台心跳、网页聊天这种 20~50 KB/s 的流量本来就不该占满整张图，
+            // 地板把它们压成贴着底边的细线，真有下载时才会顶上去。
+            double ceiling = Math.Max(peak, 512.0 * 1024.0);
 
             // 画线区域往里缩一圈，端点的圆点才不会压在边框上
             Rectangle plot = new Rectangle(graph.Left + 5, graph.Top + 6,
@@ -2274,17 +2421,27 @@ namespace NetSpeedBall
         }
 
         /// <summary>
-        /// 把采样值换算成坐标。纵向是平方根压缩的（见 DrawGraph 里的说明），
+        /// 把采样值换算成坐标。纵向是线性的（地板 512 KB/s，见 DrawGraph），
         /// 横向按当前点数铺满整条宽度 —— 刚打开面板时也不会只画左半截。
+        ///
+        /// 画之前做一次三点加权平滑：采样一秒一个，20~50 KB/s 的日常流量本身就在抖，
+        /// 直接连点会画出一排锯齿。真正的测量值没动，只是画出来的线不跟着抖。
         /// </summary>
         private PointF[] BuildPoints(Rectangle plot, double[] values, double ceiling)
         {
+            for (int i = 0; i < sampleCount; i++)
+            {
+                double previous = values[i > 0 ? i - 1 : i];
+                double next = values[i < sampleCount - 1 ? i + 1 : i];
+                smoothBuffer[i] = (previous + values[i] * 2.0 + next) / 4.0;
+            }
+
             PointF[] points = new PointF[sampleCount];
             float span = sampleCount > 1 ? sampleCount - 1 : 1;
             for (int i = 0; i < sampleCount; i++)
             {
                 float x = plot.Left + (plot.Width - 1) * i / span;
-                float ratio = (float)Math.Min(1.0, Math.Sqrt(Math.Max(0.0, values[i]) / ceiling));
+                float ratio = (float)Math.Min(1.0, Math.Max(0.0, smoothBuffer[i]) / ceiling);
                 points[i] = new PointF(x, plot.Bottom - ratio * (plot.Height - 1));
             }
 
@@ -4996,6 +5153,43 @@ namespace NetSpeedBall
         {
             Value = value;
             Unit = unit;
+        }
+    }
+
+    /// <summary>
+    /// 把「一秒跳一次」的采样值变成连续变化的动画值。
+    ///
+    /// 做法是指数趋近：每帧把当前值往目标值挪一小段，越接近目标挪得越慢，
+    /// 人眼看着就是平滑加速 / 平滑停下，而不是数字直接跳。差值小到看不见时
+    /// 直接吸附到目标，否则会永远差一点点，白白重绘。
+    /// </summary>
+    internal static class SmoothValue
+    {
+        /// <param name="current">当前显示值</param>
+        /// <param name="target">最新采样值</param>
+        /// <param name="elapsed">这一帧过去的秒数</param>
+        /// <param name="tau">时间常数，越小追得越快（0.22 ≈ 半秒走完 90%）</param>
+        /// <param name="epsilon">小于这个差值就直接落位</param>
+        public static double Toward(double current, double target, double elapsed, double tau, double epsilon)
+        {
+            if (double.IsNaN(target) || double.IsInfinity(target))
+            {
+                target = 0;
+            }
+
+            if (double.IsNaN(current) || double.IsInfinity(current))
+            {
+                return target;
+            }
+
+            if (elapsed <= 0)
+            {
+                return current;
+            }
+
+            double alpha = 1.0 - Math.Exp(-elapsed / tau);
+            double next = current + (target - current) * alpha;
+            return Math.Abs(target - next) <= epsilon ? target : next;
         }
     }
 
