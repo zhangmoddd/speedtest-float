@@ -755,11 +755,14 @@ namespace NetSpeedBall
             double elapsed = Math.Min(0.08, Math.Max(0.0, (now - lastAnimationFrame).TotalSeconds));
             lastAnimationFrame = now;
 
-            // 采样一秒一次，画出来的数字要按帧追上去，否则就是"隔一秒跳一个数"
+            // 采样一秒一次，画出来的数字要按帧追上去，否则就是"隔一秒跳一个数"。
+            // tau 给到 0.6 秒：太快（0.2）会像秒表倒数一样糊成一片，0.6 才是"数字在走"。
             shownDownload = SmoothValue.Toward(shownDownload,
-                currentSample.DownloadBytesPerSecond, elapsed, 0.25, 512.0);
+                currentSample.DownloadBytesPerSecond, elapsed, 0.6,
+                Math.Max(512.0, currentSample.DownloadBytesPerSecond * 0.02));
             shownUpload = SmoothValue.Toward(shownUpload,
-                currentSample.UploadBytesPerSecond, elapsed, 0.25, 512.0);
+                currentSample.UploadBytesPerSecond, elapsed, 0.6,
+                Math.Max(512.0, currentSample.UploadBytesPerSecond * 0.02));
             detailsForm.Animate(elapsed);
 
             float targetSpeed = GetRocketOrbitSpeed();
@@ -1947,7 +1950,7 @@ namespace NetSpeedBall
             bool moved = false;
 
             double down = SmoothValue.Toward(shownDownload, currentSample.DownloadBytesPerSecond,
-                elapsed, 0.22, 256.0);
+                elapsed, 0.6, Math.Max(512.0, currentSample.DownloadBytesPerSecond * 0.02));
             if (down != shownDownload)
             {
                 shownDownload = down;
@@ -1955,14 +1958,15 @@ namespace NetSpeedBall
             }
 
             double up = SmoothValue.Toward(shownUpload, currentSample.UploadBytesPerSecond,
-                elapsed, 0.22, 256.0);
+                elapsed, 0.6, Math.Max(512.0, currentSample.UploadBytesPerSecond * 0.02));
             if (up != shownUpload)
             {
                 shownUpload = up;
                 moved = true;
             }
 
-            double cpu = SmoothValue.Toward(shownCpu, resourceSnapshot.CpuPercent, elapsed, 0.25, 0.05);
+            double cpu = SmoothValue.Toward(shownCpu, resourceSnapshot.CpuPercent,
+                elapsed, 0.55, 0.2);
             if (cpu != shownCpu)
             {
                 shownCpu = cpu;
@@ -1970,7 +1974,7 @@ namespace NetSpeedBall
             }
 
             double memory = SmoothValue.Toward(shownMemory, resourceSnapshot.MemoryPercent,
-                elapsed, 0.25, 0.05);
+                elapsed, 0.55, 0.1);
             if (memory != shownMemory)
             {
                 shownMemory = memory;
