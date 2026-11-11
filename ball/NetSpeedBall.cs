@@ -2186,19 +2186,19 @@ namespace NetSpeedBall
 
         private void DrawGraph(Graphics g, Rectangle graph)
         {
-            using (Brush fill = new SolidBrush(Color.FromArgb(225, 240, 250)))
-            using (Pen grid = new Pen(Color.FromArgb(80, 150, 180, 205), 1.0f))
+            // 底：圆角卡片 + 极淡的竖向渐变，比一块生硬的浅蓝方块耐看
+            using (GraphicsPath shape = CreateRoundedRectangle(graph, 7))
+            using (LinearGradientBrush background = new LinearGradientBrush(
+                new Rectangle(graph.Left, graph.Top, Math.Max(1, graph.Width), Math.Max(1, graph.Height * 2)),
+                Color.FromArgb(253, 254, 255), Color.FromArgb(231, 242, 253),
+                LinearGradientMode.Vertical))
             {
-                g.FillRectangle(fill, graph);
-                for (int row = 1; row < 4; row++)
-                {
-                    int y = graph.Top + graph.Height * row / 4;
-                    g.DrawLine(grid, graph.Left, y, graph.Right, y);
-                }
+                g.FillPath(background, shape);
             }
 
             if (sampleCount < 2)
             {
+                DrawGraphBorder(g, graph);
                 return;
             }
 
@@ -2221,29 +2221,123 @@ namespace NetSpeedBall
             // 下限 64 KB/s：没流量时别把几 KB 的心跳放大成半张图。
             double ceiling = Math.Max(peak, 64.0 * 1024.0);
 
-            DrawHistoryLine(g, graph, downloadHistory, ceiling, Color.FromArgb(35, 119, 238));
-            DrawHistoryLine(g, graph, uploadHistory, ceiling, Color.FromArgb(16, 178, 92));
+            // 画线区域往里缩一圈，端点的圆点才不会压在边框上
+            Rectangle plot = new Rectangle(graph.Left + 5, graph.Top + 6,
+                graph.Width - 10, graph.Height - 12);
+
+            Color downColor = Color.FromArgb(35, 119, 238);
+            Color upColor = Color.FromArgb(16, 178, 92);
+
+            GraphicsState state = g.Save();
+            try
+            {
+                using (GraphicsPath clip = CreateRoundedRectangle(graph, 7))
+                {
+                    g.SetClip(clip);
+
+                    using (Pen grid = new Pen(Color.FromArgb(40, 110, 150, 190), 1.0f))
+                    {
+                        grid.DashStyle = DashStyle.Dash;
+                        grid.DashPattern = new float[] { 3.0f, 5.0f };
+                        for (int row = 1; row <= 2; row++)
+                        {
+                            int y = plot.Top + plot.Height * row / 3;
+                            g.DrawLine(grid, graph.Left + 1, y, graph.Right - 1, y);
+                        }
+                    }
+
+                    DrawHistoryArea(g, plot, downloadHistory, ceiling, downColor, 120);
+                    DrawHistoryArea(g, plot, uploadHistory, ceiling, upColor, 90);
+                    DrawHistoryLine(g, plot, downloadHistory, ceiling, downColor, 2.4f);
+                    DrawHistoryLine(g, plot, uploadHistory, ceiling, upColor, 1.9f);
+                }
+            }
+            finally
+            {
+                // 裁剪必须还原，否则后面的流量数字和磁盘行全被裁掉
+                g.Restore(state);
+            }
+
+            DrawHistoryDot(g, plot, downloadHistory, ceiling, downColor);
+            DrawHistoryDot(g, plot, uploadHistory, ceiling, upColor);
+
+            DrawGraphBorder(g, graph);
         }
 
-        private void DrawHistoryLine(Graphics g, Rectangle graph, double[] values, double ceiling, Color color)
+        private static void DrawGraphBorder(Graphics g, Rectangle graph)
+        {
+            using (GraphicsPath shape = CreateRoundedRectangle(graph, 7))
+            using (Pen border = new Pen(Color.FromArgb(64, 148, 190, 226), 1.0f))
+            {
+                g.DrawPath(border, shape);
+            }
+        }
+
+        /// <summary>
+        /// 把采样值换算成坐标。纵向是平方根压缩的（见 DrawGraph 里的说明），
+        /// 横向按当前点数铺满整条宽度 —— 刚打开面板时也不会只画左半截。
+        /// </summary>
+        private PointF[] BuildPoints(Rectangle plot, double[] values, double ceiling)
         {
             PointF[] points = new PointF[sampleCount];
-            // 只有满 60 个点时才能用 MaxSamples 当分母；刚打开窗口时点数不足，
-            // 用 MaxSamples 会把曲线挤在左边一小截，看起来像"只画了一半"。
             float span = sampleCount > 1 ? sampleCount - 1 : 1;
             for (int i = 0; i < sampleCount; i++)
             {
-                float x = graph.Left + (graph.Width - 1) * i / span;
+                float x = plot.Left + (plot.Width - 1) * i / span;
                 float ratio = (float)Math.Min(1.0, Math.Sqrt(Math.Max(0.0, values[i]) / ceiling));
-                float y = graph.Bottom - 2 - ratio * (graph.Height - 5);
-                points[i] = new PointF(x, y);
+                points[i] = new PointF(x, plot.Bottom - ratio * (plot.Height - 1));
             }
 
-            using (Pen pen = new Pen(color, 2.0f))
+            return points;
+        }
+
+        /// <summary>曲线下面的渐变填充，让"有流量"这件事一眼看得出来。</summary>
+        private void DrawHistoryArea(Graphics g, Rectangle plot, double[] values, double ceiling,
+            Color color, int alpha)
+        {
+            PointF[] points = BuildPoints(plot, values, ceiling);
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                // 0.45 的张力 = 轻微平滑，不会把尖锐的突发抹成圆包
+                path.AddCurve(points, 0.45f);
+                path.AddLine(points[sampleCount - 1].X, plot.Bottom, points[0].X, plot.Bottom);
+                path.CloseFigure();
+
+                using (LinearGradientBrush fill = new LinearGradientBrush(
+                    new Rectangle(plot.Left, plot.Top - 2, Math.Max(1, plot.Width), Math.Max(2, plot.Height + 2)),
+                    Color.FromArgb(alpha, color), Color.FromArgb(8, color),
+                    LinearGradientMode.Vertical))
+                {
+                    g.FillPath(fill, path);
+                }
+            }
+        }
+
+        private void DrawHistoryLine(Graphics g, Rectangle plot, double[] values, double ceiling,
+            Color color, float width)
+        {
+            PointF[] points = BuildPoints(plot, values, ceiling);
+            using (Pen pen = new Pen(color, width))
             {
                 pen.StartCap = LineCap.Round;
                 pen.EndCap = LineCap.Round;
-                g.DrawLines(pen, points);
+                pen.LineJoin = LineJoin.Round;
+                g.DrawCurve(pen, points, 0.45f);
+            }
+        }
+
+        /// <summary>最右端点一个小圆点，表示"这条线现在在这里"。</summary>
+        private void DrawHistoryDot(Graphics g, Rectangle plot, double[] values, double ceiling, Color color)
+        {
+            PointF last = BuildPoints(plot, values, ceiling)[sampleCount - 1];
+            using (Brush halo = new SolidBrush(Color.FromArgb(230, 255, 255, 255)))
+            {
+                g.FillEllipse(halo, last.X - 4.0f, last.Y - 4.0f, 8.0f, 8.0f);
+            }
+
+            using (Brush dot = new SolidBrush(color))
+            {
+                g.FillEllipse(dot, last.X - 2.6f, last.Y - 2.6f, 5.2f, 5.2f);
             }
         }
 
@@ -2569,7 +2663,11 @@ namespace NetSpeedBall
             return int.TryParse(head, out value) ? value : int.MaxValue;
         }
 
-        /// <summary>把「0 C:」这种实例名翻成「磁盘 0  C:」。</summary>
+        /// <summary>
+        /// 把「0 C: D:」这种实例名翻成「磁盘 0（C: D:）」。
+        /// 括号是刻意加的：C: 和 D: 是同一块硬盘上的两个分区，任务管理器里也是一行，
+        /// 写成括号一眼就知道"这两个盘符属于同一块物理盘"。
+        /// </summary>
         private static string FriendlyDiskName(string instance)
         {
             int space = instance.IndexOf(' ');
@@ -2581,7 +2679,7 @@ namespace NetSpeedBall
             string number = instance.Substring(0, space);
             string volumes = instance.Substring(space + 1).Trim();
             return volumes.Length > 0
-                ? "\u78c1\u76d8 " + number + "  " + volumes
+                ? "\u78c1\u76d8 " + number + "\uff08" + volumes + "\uff09"
                 : "\u78c1\u76d8 " + number;
         }
     }
