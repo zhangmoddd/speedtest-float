@@ -130,6 +130,12 @@ namespace NetSpeedBall
         private bool hasNetworkState;
         private bool lastNetworkState;
 
+        // 定时关机 / 重启交给系统的 shutdown.exe；睡眠和锁定只能在进程里等时间到了自己执行。
+        private readonly FormsTimer powerTimer;
+        private DateTime powerDeadline;
+        private string powerPendingAction;
+        private bool shutdownPending;
+
         public SpeedBallApplication() : this(false)
         {
         }
@@ -155,7 +161,9 @@ namespace NetSpeedBall
             };
             startupItem = new ToolStripMenuItem("\u5f00\u673a\u81ea\u542f\u52a8", null, OnToggleStartup)
             {
-                Checked = StartupManager.IsEnabled(AppName),
+                // 勾选状态等菜单第一次弹出时再查：判断计划任务要调 schtasks.exe，
+                // 启动阶段没必要为它多等一次进程创建。
+                Checked = false,
                 CheckOnClick = true
             };
             opacityItem = new ToolStripMenuItem("\u534a\u900f\u660e\u6a21\u5f0f", null, OnToggleOpacity)
@@ -182,6 +190,7 @@ namespace NetSpeedBall
             menu.Items.Add(unitMenu);
             menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u7f51\u7edc\u8be6\u60c5", null, OnShowDetails));
             menu.Items.Add(new ToolStripMenuItem("\u6d41\u91cf\u7edf\u8ba1", null, OnShowTrafficWindow));
+            menu.Items.Add(BuildPowerMenu());
             menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u4efb\u52a1\u7ba1\u7406\u5668", null, OnOpenTaskManager));
             menu.Items.Add(new ToolStripMenuItem("\u91cd\u7f6e\u4eca\u65e5\u6d41\u91cf", null, OnResetTraffic));
             menu.Opening += OnMenuOpening;
@@ -220,6 +229,10 @@ namespace NetSpeedBall
             ballForm.SetIcon(icon);
 
             sampleTimer = new ThreadingTimer(OnSampleTimer, null, 0, 1000);
+
+            powerTimer = new FormsTimer { Interval = 1000 };
+            powerTimer.Tick += OnPowerTick;
+            powerTimer.Start();
 
             if (enableElevatedStartup)
             {
@@ -628,6 +641,218 @@ namespace NetSpeedBall
         private void OnExit(object sender, EventArgs e)
         {
             ExitThread();
+        }
+
+        // ===========================================================
+        // 定时关机 / 重启 / 睡眠 / 锁定
+        // ===========================================================
+
+        private ToolStripMenuItem BuildPowerMenu()
+        {
+            ToolStripMenuItem root = new ToolStripMenuItem("\u5b9a\u65f6\u5173\u673a");
+            AddPowerPreset(root, "15 \u5206\u949f\u540e\u5173\u673a", 15);
+            AddPowerPreset(root, "30 \u5206\u949f\u540e\u5173\u673a", 30);
+            AddPowerPreset(root, "1 \u5c0f\u65f6\u540e\u5173\u673a", 60);
+            AddPowerPreset(root, "2 \u5c0f\u65f6\u540e\u5173\u673a", 120);
+            root.DropDownItems.Add(new ToolStripSeparator());
+            root.DropDownItems.Add(new ToolStripMenuItem(
+                "\u81ea\u5b9a\u4e49\uff08\u5173\u673a / \u91cd\u542f / \u7761\u7720 / \u9501\u5b9a\uff09\u2026", null, OnPowerCustom));
+            root.DropDownItems.Add(new ToolStripSeparator());
+            root.DropDownItems.Add(new ToolStripMenuItem("\u7acb\u5373\u7761\u7720", null, OnSleepNow));
+            root.DropDownItems.Add(new ToolStripMenuItem("\u7acb\u5373\u9501\u5b9a", null, OnLockNow));
+            root.DropDownItems.Add(new ToolStripSeparator());
+            root.DropDownItems.Add(new ToolStripMenuItem("\u53d6\u6d88\u5b9a\u65f6\u4efb\u52a1", null, OnCancelPower));
+            return root;
+        }
+
+        private void AddPowerPreset(ToolStripMenuItem root, string text, int minutes)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text, null, OnPowerPreset);
+            item.Tag = minutes;
+            root.DropDownItems.Add(item);
+        }
+
+        private void OnPowerPreset(object sender, EventArgs e)
+        {
+            ToolStripMenuItem item = sender as ToolStripMenuItem;
+            int minutes = item != null && item.Tag is int ? (int)item.Tag : 30;
+            SchedulePower("shutdown", minutes);
+        }
+
+        private void OnPowerCustom(object sender, EventArgs e)
+        {
+            using (PowerScheduleForm dialog = new PowerScheduleForm())
+            {
+                if (dialog.ShowDialog() != DialogResult.OK)
+                {
+                    return;
+                }
+
+                SchedulePower(dialog.SelectedAction, dialog.Minutes);
+            }
+        }
+
+        private void OnSleepNow(object sender, EventArgs e)
+        {
+            SchedulePower("sleep", 0);
+        }
+
+        private void OnLockNow(object sender, EventArgs e)
+        {
+            SchedulePower("lock", 0);
+        }
+
+        private void OnCancelPower(object sender, EventArgs e)
+        {
+            CancelPower(true);
+        }
+
+        /// <summary>
+        /// 安排一次电源动作。minutes = 0 表示立刻执行。
+        ///
+        /// 关机和重启直接交给系统的 shutdown.exe（带 /t 倒计时），所以就算本程序退出，
+        /// 计划依然有效，`shutdown /a` 也能取消。睡眠和锁定系统没有"定时"接口，
+        /// 只能在进程里等到点自己调。
+        /// </summary>
+        private void SchedulePower(string action, int minutes)
+        {
+            CancelPower(false);
+
+            if (minutes <= 0)
+            {
+                ExecutePower(action);
+                return;
+            }
+
+            if (action == "shutdown" || action == "restart")
+            {
+                string flag = action == "restart" ? "/r" : "/s";
+                string comment = action == "restart"
+                    ? "\u7f51\u7edc\u6d4b\u901f\u7403\uff1a\u5b9a\u65f6\u91cd\u542f"
+                    : "\u7f51\u7edc\u6d4b\u901f\u7403\uff1a\u5b9a\u65f6\u5173\u673a";
+                if (!RunShutdown(flag + " /t " + (minutes * 60) + " /c \"" + comment + "\""))
+                {
+                    MessageBox.Show("\u5b89\u6392\u5931\u8d25\uff1a\u7cfb\u7edf\u62d2\u7edd\u4e86\u5173\u673a\u547d\u4ee4\u3002",
+                        "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                shutdownPending = true;
+            }
+            else
+            {
+                powerPendingAction = action;
+                powerDeadline = DateTime.Now.AddMinutes(minutes);
+            }
+
+            trayIcon.ShowBalloonTip(4000, "\u5df2\u5b89\u6392" + PowerActionName(action),
+                minutes + " \u5206\u949f\u540e" + PowerActionName(action) +
+                "\u3002\u8981\u53d6\u6d88\uff1a\u53f3\u952e\u60ac\u6d6e\u7403 \u2192 \u5b9a\u65f6\u5173\u673a \u2192 \u53d6\u6d88\u5b9a\u65f6\u4efb\u52a1\u3002",
+                ToolTipIcon.Info);
+        }
+
+        private void CancelPower(bool notify)
+        {
+            bool hadSomething = shutdownPending || powerPendingAction != null;
+
+            if (shutdownPending)
+            {
+                RunShutdown("/a");
+                shutdownPending = false;
+            }
+
+            powerPendingAction = null;
+
+            if (!notify)
+            {
+                return;
+            }
+
+            if (hadSomething)
+            {
+                trayIcon.ShowBalloonTip(3000, "\u5df2\u53d6\u6d88", "\u5b9a\u65f6\u4efb\u52a1\u5df2\u53d6\u6d88\u3002", ToolTipIcon.Info);
+            }
+            else
+            {
+                trayIcon.ShowBalloonTip(3000, "\u6ca1\u6709\u5b9a\u65f6\u4efb\u52a1",
+                    "\u5f53\u524d\u6ca1\u6709\u5b89\u6392\u5173\u673a / \u91cd\u542f / \u7761\u7720 / \u9501\u5b9a\u3002", ToolTipIcon.Info);
+            }
+        }
+
+        private void OnPowerTick(object sender, EventArgs e)
+        {
+            if (powerPendingAction == null || DateTime.Now < powerDeadline)
+            {
+                return;
+            }
+
+            string action = powerPendingAction;
+            powerPendingAction = null;
+            ExecutePower(action);
+        }
+
+        private static void ExecutePower(string action)
+        {
+            switch (action)
+            {
+                case "restart":
+                    RunShutdown("/r /t 0");
+                    break;
+                case "sleep":
+                    NativeMethods.SetSuspendState(false, false, false);
+                    break;
+                case "lock":
+                    NativeMethods.LockWorkStation();
+                    break;
+                default:
+                    RunShutdown("/s /t 0");
+                    break;
+            }
+        }
+
+        private static string PowerActionName(string action)
+        {
+            switch (action)
+            {
+                case "restart":
+                    return "\u91cd\u542f";
+                case "sleep":
+                    return "\u7761\u7720";
+                case "lock":
+                    return "\u9501\u5b9a";
+                default:
+                    return "\u5173\u673a";
+            }
+        }
+
+        private static bool RunShutdown(string arguments)
+        {
+            try
+            {
+                ProcessStartInfo info = new ProcessStartInfo("shutdown.exe", arguments);
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.WindowStyle = ProcessWindowStyle.Hidden;
+
+                using (Process process = Process.Start(info))
+                {
+                    if (process == null)
+                    {
+                        return false;
+                    }
+
+                    if (!process.WaitForExit(5000))
+                    {
+                        return false;
+                    }
+
+                    return process.ExitCode == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         protected override void Dispose(bool disposing)
@@ -5463,6 +5688,105 @@ namespace NetSpeedBall
         }
     }
 
+    /// <summary>
+    /// 「定时关机」的自定义对话框：选分钟数和动作（关机 / 重启 / 睡眠 / 锁定）。
+    /// </summary>
+    internal sealed class PowerScheduleForm : Form
+    {
+        private readonly NumericUpDown minutesBox;
+        private readonly ComboBox actionBox;
+
+        public int Minutes
+        {
+            get { return (int)minutesBox.Value; }
+        }
+
+        public string SelectedAction
+        {
+            get
+            {
+                switch (actionBox.SelectedIndex)
+                {
+                    case 1:
+                        return "restart";
+                    case 2:
+                        return "sleep";
+                    case 3:
+                        return "lock";
+                    default:
+                        return "shutdown";
+                }
+            }
+        }
+
+        public PowerScheduleForm()
+        {
+            Text = "\u5b9a\u65f6\u5173\u673a";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            TopMost = true;
+            ClientSize = new Size(300, 134);
+            Font = new Font("Segoe UI", 9.0f);
+
+            Label timeLabel = new Label();
+            timeLabel.Text = "\u591a\u4e45\u4e4b\u540e\uff1f";
+            timeLabel.AutoSize = true;
+            timeLabel.Location = new Point(16, 20);
+            Controls.Add(timeLabel);
+
+            minutesBox = new NumericUpDown();
+            minutesBox.Minimum = 1;
+            minutesBox.Maximum = 1440;
+            minutesBox.Value = 30;
+            minutesBox.Location = new Point(104, 17);
+            minutesBox.Width = 70;
+            Controls.Add(minutesBox);
+
+            Label unitLabel = new Label();
+            unitLabel.Text = "\u5206\u949f\u540e";
+            unitLabel.AutoSize = true;
+            unitLabel.Location = new Point(180, 20);
+            Controls.Add(unitLabel);
+
+            Label actionLabel = new Label();
+            actionLabel.Text = "\u52a8\u4f5c";
+            actionLabel.AutoSize = true;
+            actionLabel.Location = new Point(16, 58);
+            Controls.Add(actionLabel);
+
+            actionBox = new ComboBox();
+            actionBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            actionBox.Items.AddRange(new object[]
+            {
+                "\u5173\u673a", "\u91cd\u542f", "\u7761\u7720", "\u9501\u5b9a"
+            });
+            actionBox.SelectedIndex = 0;
+            actionBox.Location = new Point(104, 55);
+            actionBox.Width = 100;
+            Controls.Add(actionBox);
+
+            Button okButton = new Button();
+            okButton.Text = "\u786e\u5b9a";
+            okButton.DialogResult = DialogResult.OK;
+            okButton.Location = new Point(148, 96);
+            okButton.Size = new Size(64, 26);
+            Controls.Add(okButton);
+
+            Button cancelButton = new Button();
+            cancelButton.Text = "\u53d6\u6d88";
+            cancelButton.DialogResult = DialogResult.Cancel;
+            cancelButton.Location = new Point(220, 96);
+            cancelButton.Size = new Size(64, 26);
+            Controls.Add(cancelButton);
+
+            AcceptButton = okButton;
+            CancelButton = cancelButton;
+        }
+    }
+
     internal static class SpeedFormatter
     {
         private static readonly string[] Units = { "B", "KB", "MB", "GB" };
@@ -6114,6 +6438,14 @@ namespace NetSpeedBall
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+
+        // 睡眠 / 休眠（hibernate = true 就是休眠）。普通用户就能调，不需要管理员。
+        [DllImport("powrprof.dll", SetLastError = true)]
+        public static extern bool SetSuspendState(bool hibernate, bool forceCritical, bool disableWakeEvent);
+
+        // 锁定当前工作站，等同于 Win+L。
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool LockWorkStation();
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool DestroyIcon(IntPtr hIcon);
