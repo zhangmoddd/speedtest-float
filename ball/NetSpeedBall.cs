@@ -577,6 +577,13 @@ namespace NetSpeedBall
         /// </summary>
         private double shownDownload;
         private double shownUpload;
+        /// <summary>
+        /// 真正写进文字的数值。每 4 帧才跟一次 shownDownload，
+        /// 免得数字每秒变 30 次糊成一片 —— 动画还在跑，只是文字不被逐帧重绘。
+        /// </summary>
+        private double textDownload;
+        private double textUpload;
+        private int textUpdateFrame;
         private bool shownPrimed;
         private bool useMegabits;
         private Point dragStart;
@@ -729,6 +736,8 @@ namespace NetSpeedBall
                 // 第一拍没有历史值，直接落位，否则会从 0 慢慢爬上来
                 shownDownload = sample.DownloadBytesPerSecond;
                 shownUpload = sample.UploadBytesPerSecond;
+                textDownload = shownDownload;
+                textUpload = shownUpload;
                 shownPrimed = true;
             }
 
@@ -744,6 +753,10 @@ namespace NetSpeedBall
             {
                 g.Clear(Color.Transparent);
                 preview.currentSample = new SpeedSample(850.0 * 1024.0, 25.6 * 1024.0, true);
+                preview.shownDownload = 850.0 * 1024.0;
+                preview.shownUpload = 25.6 * 1024.0;
+                preview.textDownload = preview.shownDownload;
+                preview.textUpload = preview.shownUpload;
                 preview.DrawSurface(g);
                 bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             }
@@ -755,14 +768,24 @@ namespace NetSpeedBall
             double elapsed = Math.Min(0.08, Math.Max(0.0, (now - lastAnimationFrame).TotalSeconds));
             lastAnimationFrame = now;
 
-            // 采样一秒一次，画出来的数字要按帧追上去，否则就是"隔一秒跳一个数"。
-            // tau 给到 0.6 秒：太快（0.2）会像秒表倒数一样糊成一片，0.6 才是"数字在走"。
+            // 采样一秒一次，画出来的数字按帧追上去，否则就是"隔一秒跳一个数"。
+            // tau 1 秒：数值像指针一样慢慢挪；8% 死区让几十 KB 的日常抖动不动数字。
             shownDownload = SmoothValue.Toward(shownDownload,
-                currentSample.DownloadBytesPerSecond, elapsed, 0.6,
-                Math.Max(512.0, currentSample.DownloadBytesPerSecond * 0.02));
+                currentSample.DownloadBytesPerSecond, elapsed, 1.0,
+                Math.Max(1024.0, currentSample.DownloadBytesPerSecond * 0.08));
             shownUpload = SmoothValue.Toward(shownUpload,
-                currentSample.UploadBytesPerSecond, elapsed, 0.6,
-                Math.Max(512.0, currentSample.UploadBytesPerSecond * 0.02));
+                currentSample.UploadBytesPerSecond, elapsed, 1.0,
+                Math.Max(1024.0, currentSample.UploadBytesPerSecond * 0.08));
+
+            // 文字每 4 帧（约 130ms）才换一次。
+            // 30fps 逐帧改文字 = 每秒换 30 个数字，末位一直在跳，看起来就是"闪"；
+            // 7~8 次/秒才会被眼睛读成"数字在滚动"。
+            if (++textUpdateFrame >= 6)
+            {
+                textUpdateFrame = 0;
+                textDownload = shownDownload;
+                textUpload = shownUpload;
+            }
             detailsForm.Animate(elapsed);
 
             float targetSpeed = GetRocketOrbitSpeed();
@@ -1412,10 +1435,10 @@ namespace NetSpeedBall
             }
 
             RateText main = useMegabits
-                ? SpeedFormatter.FormatBits(shownDownload)
-                : SpeedFormatter.FormatMegabytesRate(shownDownload);
-            string down = SpeedFormatter.FormatCompact(shownDownload);
-            string up = SpeedFormatter.FormatCompact(shownUpload);
+                ? SpeedFormatter.FormatBits(textDownload)
+                : SpeedFormatter.FormatMegabytesRate(textDownload);
+            string down = SpeedFormatter.FormatCompact(textDownload);
+            string up = SpeedFormatter.FormatCompact(textUpload);
 
             // 三行文字上移 5px，给沿外圈顺时针经过下方的火箭留出空间。
             DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), Width - 30);
@@ -1833,6 +1856,14 @@ namespace NetSpeedBall
         private double shownMemory;
         private double[] shownDisks = new double[0];
         private bool shownPrimed;
+
+        // 写进文字的值：每 4 帧（约 130ms）才更新一次。逐帧改文字会看起来在"闪"。
+        private double textDownload;
+        private double textUpload;
+        private double textCpu;
+        private double textMemory;
+        private double[] textDisks = new double[0];
+        private int textUpdateFrame;
         private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
         private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
         private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
@@ -1950,7 +1981,7 @@ namespace NetSpeedBall
             bool moved = false;
 
             double down = SmoothValue.Toward(shownDownload, currentSample.DownloadBytesPerSecond,
-                elapsed, 0.6, Math.Max(512.0, currentSample.DownloadBytesPerSecond * 0.02));
+                elapsed, 1.0, Math.Max(1024.0, currentSample.DownloadBytesPerSecond * 0.08));
             if (down != shownDownload)
             {
                 shownDownload = down;
@@ -1958,7 +1989,7 @@ namespace NetSpeedBall
             }
 
             double up = SmoothValue.Toward(shownUpload, currentSample.UploadBytesPerSecond,
-                elapsed, 0.6, Math.Max(512.0, currentSample.UploadBytesPerSecond * 0.02));
+                elapsed, 1.0, Math.Max(1024.0, currentSample.UploadBytesPerSecond * 0.08));
             if (up != shownUpload)
             {
                 shownUpload = up;
@@ -2009,7 +2040,32 @@ namespace NetSpeedBall
 
             if (moved)
             {
+                if (++textUpdateFrame >= 6)
+                {
+                    textUpdateFrame = 0;
+                    SyncTextValues();
+                }
+
                 Invalidate();
+            }
+        }
+
+        /// <summary>把动画值抄到"文字值"上，文字才按低频率刷新。</summary>
+        private void SyncTextValues()
+        {
+            textDownload = shownDownload;
+            textUpload = shownUpload;
+            textCpu = shownCpu;
+            textMemory = shownMemory;
+
+            if (textDisks.Length != shownDisks.Length)
+            {
+                textDisks = new double[shownDisks.Length];
+            }
+
+            for (int i = 0; i < shownDisks.Length; i++)
+            {
+                textDisks[i] = shownDisks[i];
             }
         }
 
@@ -2031,6 +2087,8 @@ namespace NetSpeedBall
             {
                 shownDisks[i] = disks[i].Percent;
             }
+
+            SyncTextValues();
         }
 
         /// <summary>
@@ -2206,8 +2264,8 @@ namespace NetSpeedBall
             {
                 g.DrawString("\u7f51\u7edc\u8be6\u60c5", titleFont, dark, 16, 13);
                 g.DrawString(currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf", smallFont, muted, 236, 17);
-                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(shownDownload), valueFont, downBrush, 16, 43);
-                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(shownUpload), valueFont, upBrush, 168, 43);
+                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(textDownload), valueFont, downBrush, 16, 43);
+                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(textUpload), valueFont, upBrush, 168, 43);
                 g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, muted, 16, 72);
 
                 // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
@@ -2265,17 +2323,17 @@ namespace NetSpeedBall
             }
 
             int left = panel.Left + 8;
-            DrawResourceMetric(g, "CPU", FormatPercent(shownCpu),
-                shownCpu, left, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "CPU", FormatPercent(textCpu),
+                textCpu, left, panel.Top + 6, MetricWidth,
                 Color.FromArgb(242, 126, 42));
-            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(shownMemory),
-                shownMemory, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(textMemory),
+                textMemory, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
                 Color.FromArgb(35, 119, 238));
 
             int y = panel.Top + 6 + MetricRowHeight;
             for (int i = 0; i < diskCount; i++)
             {
-                double percent = i < shownDisks.Length ? shownDisks[i] : disks[i].Percent;
+                double percent = i < textDisks.Length ? textDisks[i] : disks[i].Percent;
                 DrawDiskRow(g, disks[i].Label, percent, left, y, panel.Width - 16, i);
                 y += DiskRowHeight;
             }
