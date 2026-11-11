@@ -65,7 +65,19 @@ namespace NetSpeedBall
                     return;
                 }
 
-                Application.Run(new SpeedBallApplication());
+                bool enableStartup = false;
+                if (args != null)
+                {
+                    for (int i = 0; i < args.Length; i++)
+                    {
+                        if (string.Equals(args[i], "--enable-startup", StringComparison.OrdinalIgnoreCase))
+                        {
+                            enableStartup = true;
+                        }
+                    }
+                }
+
+                Application.Run(new SpeedBallApplication(enableStartup));
             }
         }
     }
@@ -95,7 +107,14 @@ namespace NetSpeedBall
         private bool hasNetworkState;
         private bool lastNetworkState;
 
-        public SpeedBallApplication()
+        public SpeedBallApplication() : this(false)
+        {
+        }
+
+        /// <param name="enableElevatedStartup">
+        /// 由提权重启带过来的开关：这一趟启动后把"登录时以最高权限启动"的计划任务建好。
+        /// </param>
+        public SpeedBallApplication(bool enableElevatedStartup)
         {
             appMonitor = new AppTrafficMonitor(trafficStore);
             ballForm = new SpeedBallForm(trafficStore);
@@ -178,6 +197,22 @@ namespace NetSpeedBall
             ballForm.SetIcon(icon);
 
             sampleTimer = new ThreadingTimer(OnSampleTimer, null, 0, 1000);
+
+            if (enableElevatedStartup)
+            {
+                if (StartupManager.TryEnableElevated(AppName))
+                {
+                    startupItem.Checked = true;
+                }
+                else
+                {
+                    startupItem.Checked = StartupManager.IsEnabled(AppName);
+                    MessageBox.Show(
+                        "\u5df2\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u542f\u52a8\uff0c\u4f46\u8bbe\u7f6e\u5f00\u673a\u542f\u52a8\u5931\u8d25\u3002\r\n" +
+                        "\u53ef\u4ee5\u518d\u53f3\u952e\u6258\u76d8\u56fe\u6807\u91cd\u8bd5\u4e00\u6b21\u3002",
+                        "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
         }
 
         private void OnSampleTimer(object state)
@@ -321,9 +356,51 @@ namespace NetSpeedBall
 
         private void OnToggleStartup(object sender, EventArgs e)
         {
+            bool want = startupItem.Checked;
             try
             {
-                StartupManager.SetEnabled(AppName, startupItem.Checked);
+                if (!want)
+                {
+                    StartupManager.SetEnabled(AppName, false);
+                    return;
+                }
+
+                if (NativeMethods.IsUserAnAdmin())
+                {
+                    if (StartupManager.TryEnableElevated(AppName))
+                    {
+                        return;
+                    }
+
+                    // 已经是管理员还建不上：多半是系统策略禁用了计划任务，退回普通启动项
+                    StartupManager.SetEnabled(AppName, true);
+                    MessageBox.Show(
+                        "\u8bbe\u7f6e\u201c\u5f00\u673a\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u542f\u52a8\u201d\u5931\u8d25\uff0c" +
+                        "\u5df2\u9000\u56de\u666e\u901a\u5f00\u673a\u542f\u52a8\uff08\u6ca1\u6709\u5e94\u7528\u6d41\u91cf\u6392\u884c\uff09\u3002",
+                        "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                DialogResult answer = MessageBox.Show(
+                    "\u60f3\u8ba9\u7a0b\u5e8f\u5f00\u673a\u5c31\u662f\u7ba1\u7406\u5458\u6743\u9650\uff08\u5e94\u7528\u6d41\u91cf\u6392\u884c\u8981\u7528\uff09\uff0c\r\n" +
+                    "\u9700\u8981\u73b0\u5728\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u91cd\u542f\u4e00\u6b21\uff0c\u4e4b\u540e\u5c31\u4e0d\u7528\u518d\u7ba1\u4e86\u3002\r\n\r\n" +
+                    "\u662f\uff1a\u7acb\u5373\u63d0\u6743\u91cd\u542f\uff0c\u5e76\u8bbe\u597d\u201c\u5f00\u673a\u4ee5\u7ba1\u7406\u5458\u542f\u52a8\u201d\u3002\r\n" +
+                    "\u5426\uff1a\u5148\u7528\u666e\u901a\u6743\u9650\u5f00\u673a\u542f\u52a8\uff08\u6392\u884c\u699c\u6ca1\u6709\u6570\u636e\uff09\u3002",
+                    "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+                if (answer == DialogResult.Cancel)
+                {
+                    startupItem.Checked = StartupManager.IsEnabled(AppName);
+                    return;
+                }
+
+                if (answer == DialogResult.Yes)
+                {
+                    RestartElevated(true);
+                    return;
+                }
+
+                StartupManager.SetEnabled(AppName, true);
             }
             catch (Exception ex)
             {
@@ -489,17 +566,34 @@ namespace NetSpeedBall
 
         private void OnRestartElevated(object sender, EventArgs e)
         {
+            RestartElevated(false);
+        }
+
+        /// <param name="enableStartup">
+        /// true = 提权重启后顺便把"开机以管理员启动"的计划任务建好（用户刚在菜单里勾了这个）。
+        /// </param>
+        private void RestartElevated(bool enableStartup)
+        {
+            ProcessStartInfo info = new ProcessStartInfo
+            {
+                FileName = Application.ExecutablePath,
+                UseShellExecute = true,
+                Verb = "runas"
+            };
+
+            if (enableStartup)
+            {
+                info.Arguments = "--enable-startup";
+            }
+
             try
             {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = Application.ExecutablePath,
-                    UseShellExecute = true,
-                    Verb = "runas"
-                });
+                Process.Start(info);
             }
             catch (Exception ex)
             {
+                // 用户在 UAC 弹窗上点“否”也会走到这里。此时绝不能退出，球要留在原地。
+                startupItem.Checked = StartupManager.IsEnabled(AppName);
                 MessageBox.Show("\u63d0\u6743\u5931\u8d25\uff1a\r\n" + ex.Message, "\u7f51\u7edc\u6d4b\u901f\u7403",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -5509,13 +5603,27 @@ namespace NetSpeedBall
         private const byte ApprovedEnabled = 0x02;
         private const byte ApprovedDisabled = 0x03;
 
+        /// <summary>
+        /// 计划任务名。用它实现"开机就是管理员，而且不弹 UAC"。
+        ///
+        /// 原理：计划任务里勾了"使用最高权限运行"，任务计划程序会用用户的完整令牌
+        /// 直接拉起进程 —— 这不是"右键以管理员身份运行"，所以不会弹 UAC 确认框。
+        /// 注册这种任务本身需要管理员权限，所以第一次得提权一次，之后就一劳永逸。
+        /// </summary>
+        private const string TaskName = "\u6d4b\u901f\u6d6e\u5149";
+
         public static bool IsEnabled(string appName)
         {
-            return HasRunEntry(appName) && !IsBlockedByApprovedList(appName);
+            return IsTaskEnabled() || (HasRunEntry(appName) && !IsBlockedByApprovedList(appName));
         }
 
         public static void SetEnabled(string appName, bool enabled)
         {
+            if (!enabled)
+            {
+                DisableTask();
+            }
+
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey, true))
             {
                 if (key == null)
@@ -5534,6 +5642,113 @@ namespace NetSpeedBall
             }
 
             WriteApprovedFlag(appName, enabled);
+        }
+
+        /// <summary>
+        /// 注册"登录时以最高权限启动"的计划任务，并删掉旧的 Run 键启动项（避免启动两次）。
+        /// 只有当前进程已经是管理员时才会成功。
+        /// </summary>
+        public static bool TryEnableElevated(string appName)
+        {
+            if (!NativeMethods.IsUserAnAdmin())
+            {
+                return false;
+            }
+
+            // schtasks 的 /TR 参数里，exe 路径本身要再用一对引号包起来：
+            //   /TR "\"C:\Program Files\app.exe\""
+            string quotedExe = "\"" + Application.ExecutablePath + "\"";
+            string tr = quotedExe.Replace("\"", "\\\"");
+            string arguments = "/Create /TN \"" + TaskName + "\" /TR \"" + tr +
+                "\" /SC ONLOGON /RL HIGHEST /F";
+            if (RunSchTasks(arguments) != 0)
+            {
+                return false;
+            }
+
+            // 任务和 Run 键同时存在会启动两次：第二次会被单实例锁挡掉，但球会闪一下
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    if (key != null)
+                    {
+                        key.DeleteValue(appName, false);
+                    }
+                }
+
+                WriteApprovedFlag(appName, false);
+            }
+            catch
+            {
+            }
+
+            return true;
+        }
+
+        public static bool IsTaskEnabled()
+        {
+            return RunSchTasks("/Query /TN \"" + TaskName + "\"") == 0;
+        }
+
+        private static bool DisableTask()
+        {
+            return RunSchTasks("/Delete /TN \"" + TaskName + "\" /F") == 0;
+        }
+
+        /// <summary>
+        /// 跑一次 schtasks.exe，返回退出码（0 = 成功；拿不到就 -1）。
+        /// 标准输入要重定向并立刻关掉：万一系统想交互式问密码，会直接失败而不是挂住界面。
+        /// </summary>
+        private static int RunSchTasks(string arguments)
+        {
+            try
+            {
+                ProcessStartInfo info = new ProcessStartInfo("schtasks.exe", arguments);
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardInput = true;
+                info.RedirectStandardOutput = true;
+                info.RedirectStandardError = true;
+                info.WindowStyle = ProcessWindowStyle.Hidden;
+
+                using (Process process = Process.Start(info))
+                {
+                    if (process == null)
+                    {
+                        return -1;
+                    }
+
+                    try
+                    {
+                        process.StandardInput.Close();
+                    }
+                    catch
+                    {
+                    }
+
+                    process.StandardOutput.ReadToEnd();
+                    process.StandardError.ReadToEnd();
+                    if (!process.WaitForExit(8000))
+                    {
+                        try
+                        {
+                            process.Kill();
+                        }
+                        catch
+                        {
+                        }
+
+                        return -1;
+                    }
+
+                    return process.ExitCode;
+                }
+            }
+            catch
+            {
+                return -1;
+            }
         }
 
         /// <summary>
