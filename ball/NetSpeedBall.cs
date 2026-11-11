@@ -577,13 +577,9 @@ namespace NetSpeedBall
         /// </summary>
         private double shownDownload;
         private double shownUpload;
-        /// <summary>
-        /// 真正写进文字的数值。每 4 帧才跟一次 shownDownload，
-        /// 免得数字每秒变 30 次糊成一片 —— 动画还在跑，只是文字不被逐帧重绘。
-        /// </summary>
-        private double textDownload;
-        private double textUpload;
-        private int textUpdateFrame;
+        /// <summary>带死区的目标：采样在 ±25% 内晃动时数字不动。</summary>
+        private readonly HeldValue heldDownload = new HeldValue(0.25, 2048.0);
+        private readonly HeldValue heldUpload = new HeldValue(0.25, 2048.0);
         private bool shownPrimed;
         private bool useMegabits;
         private Point dragStart;
@@ -731,13 +727,14 @@ namespace NetSpeedBall
         public void UpdateSpeed(SpeedSample sample)
         {
             currentSample = sample;
+            heldDownload.Update(sample.DownloadBytesPerSecond);
+            heldUpload.Update(sample.UploadBytesPerSecond);
+
             if (!shownPrimed)
             {
                 // 第一拍没有历史值，直接落位，否则会从 0 慢慢爬上来
-                shownDownload = sample.DownloadBytesPerSecond;
-                shownUpload = sample.UploadBytesPerSecond;
-                textDownload = shownDownload;
-                textUpload = shownUpload;
+                shownDownload = heldDownload.Target;
+                shownUpload = heldUpload.Target;
                 shownPrimed = true;
             }
 
@@ -753,10 +750,10 @@ namespace NetSpeedBall
             {
                 g.Clear(Color.Transparent);
                 preview.currentSample = new SpeedSample(850.0 * 1024.0, 25.6 * 1024.0, true);
-                preview.shownDownload = 850.0 * 1024.0;
-                preview.shownUpload = 25.6 * 1024.0;
-                preview.textDownload = preview.shownDownload;
-                preview.textUpload = preview.shownUpload;
+                preview.heldDownload.Snap(850.0 * 1024.0);
+                preview.heldUpload.Snap(25.6 * 1024.0);
+                preview.shownDownload = preview.heldDownload.Target;
+                preview.shownUpload = preview.heldUpload.Target;
                 preview.DrawSurface(g);
                 bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             }
@@ -768,24 +765,10 @@ namespace NetSpeedBall
             double elapsed = Math.Min(0.08, Math.Max(0.0, (now - lastAnimationFrame).TotalSeconds));
             lastAnimationFrame = now;
 
-            // 采样一秒一次，画出来的数字按帧追上去，否则就是"隔一秒跳一个数"。
-            // tau 1 秒：数值像指针一样慢慢挪；8% 死区让几十 KB 的日常抖动不动数字。
-            shownDownload = SmoothValue.Toward(shownDownload,
-                currentSample.DownloadBytesPerSecond, elapsed, 1.0,
-                Math.Max(1024.0, currentSample.DownloadBytesPerSecond * 0.08));
-            shownUpload = SmoothValue.Toward(shownUpload,
-                currentSample.UploadBytesPerSecond, elapsed, 1.0,
-                Math.Max(1024.0, currentSample.UploadBytesPerSecond * 0.08));
-
-            // 文字每 4 帧（约 130ms）才换一次。
-            // 30fps 逐帧改文字 = 每秒换 30 个数字，末位一直在跳，看起来就是"闪"；
-            // 7~8 次/秒才会被眼睛读成"数字在滚动"。
-            if (++textUpdateFrame >= 6)
-            {
-                textUpdateFrame = 0;
-                textDownload = shownDownload;
-                textUpload = shownUpload;
-            }
+            // 目标来自 HeldValue（带 25% 死区），所以平时它根本不换；
+            // 真要换的时候用 0.5 秒平滑过去，数字就不会蹦。
+            shownDownload = SmoothValue.Toward(shownDownload, heldDownload.Target, elapsed, 0.5, 256.0);
+            shownUpload = SmoothValue.Toward(shownUpload, heldUpload.Target, elapsed, 0.5, 256.0);
             detailsForm.Animate(elapsed);
 
             float targetSpeed = GetRocketOrbitSpeed();
@@ -1435,10 +1418,10 @@ namespace NetSpeedBall
             }
 
             RateText main = useMegabits
-                ? SpeedFormatter.FormatBits(textDownload)
-                : SpeedFormatter.FormatMegabytesRate(textDownload);
-            string down = SpeedFormatter.FormatCompact(textDownload);
-            string up = SpeedFormatter.FormatCompact(textUpload);
+                ? SpeedFormatter.FormatBits(heldDownload.Target)
+                : SpeedFormatter.FormatMegabytesRate(heldDownload.Target);
+            string down = SpeedFormatter.FormatCompact(heldDownload.Target);
+            string up = SpeedFormatter.FormatCompact(heldUpload.Target);
 
             // 三行文字上移 5px，给沿外圈顺时针经过下方的火箭留出空间。
             DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), Width - 30);
@@ -1857,13 +1840,12 @@ namespace NetSpeedBall
         private double[] shownDisks = new double[0];
         private bool shownPrimed;
 
-        // 写进文字的值：每 4 帧（约 130ms）才更新一次。逐帧改文字会看起来在"闪"。
-        private double textDownload;
-        private double textUpload;
-        private double textCpu;
-        private double textMemory;
-        private double[] textDisks = new double[0];
-        private int textUpdateFrame;
+        // 带死区的目标：采样在阈值内晃就不换目标，界面上的数字才不会一直蹦。
+        private readonly HeldValue heldDownload = new HeldValue(0.25, 2048.0);
+        private readonly HeldValue heldUpload = new HeldValue(0.25, 2048.0);
+        private readonly HeldValue heldCpu = new HeldValue(0.12, 1.0);
+        private readonly HeldValue heldMemory = new HeldValue(0.06, 0.5);
+        private readonly List<HeldValue> heldDisks = new List<HeldValue>();
         private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
         private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
         private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
@@ -1925,6 +1907,23 @@ namespace NetSpeedBall
             resourceSnapshot = resourceMonitor.Read();
             SyncResourcePanelHeight();
 
+            heldDownload.Update(sample.DownloadBytesPerSecond);
+            heldUpload.Update(sample.UploadBytesPerSecond);
+            heldCpu.Update(resourceSnapshot.CpuPercent);
+            heldMemory.Update(resourceSnapshot.MemoryPercent);
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            while (heldDisks.Count < diskCount)
+            {
+                heldDisks.Add(new HeldValue(0.2, 1.0));
+            }
+
+            for (int i = 0; i < diskCount; i++)
+            {
+                heldDisks[i].Update(disks[i].Percent);
+            }
+
             if (sampleCount < MaxSamples)
             {
                 downloadHistory[sampleCount] = sample.DownloadBytesPerSecond;
@@ -1980,32 +1979,29 @@ namespace NetSpeedBall
 
             bool moved = false;
 
-            double down = SmoothValue.Toward(shownDownload, currentSample.DownloadBytesPerSecond,
-                elapsed, 1.0, Math.Max(1024.0, currentSample.DownloadBytesPerSecond * 0.08));
+            double down = SmoothValue.Toward(shownDownload, heldDownload.Target, elapsed, 0.5, 256.0);
             if (down != shownDownload)
             {
                 shownDownload = down;
                 moved = true;
             }
 
-            double up = SmoothValue.Toward(shownUpload, currentSample.UploadBytesPerSecond,
-                elapsed, 1.0, Math.Max(1024.0, currentSample.UploadBytesPerSecond * 0.08));
+            double up = SmoothValue.Toward(shownUpload, heldUpload.Target, elapsed, 0.5, 256.0);
             if (up != shownUpload)
             {
                 shownUpload = up;
                 moved = true;
             }
 
-            double cpu = SmoothValue.Toward(shownCpu, resourceSnapshot.CpuPercent,
-                elapsed, 0.55, 0.2);
+            double cpu = SmoothValue.Toward(shownCpu, heldCpu.Target, elapsed, 0.5, 0.1);
             if (cpu != shownCpu)
             {
                 shownCpu = cpu;
                 moved = true;
             }
 
-            double memory = SmoothValue.Toward(shownMemory, resourceSnapshot.MemoryPercent,
-                elapsed, 0.55, 0.1);
+            double memory = SmoothValue.Toward(shownMemory, heldMemory.Target,
+                elapsed, 0.5, 0.05);
             if (memory != shownMemory)
             {
                 shownMemory = memory;
@@ -2028,8 +2024,8 @@ namespace NetSpeedBall
             {
                 for (int i = 0; i < count; i++)
                 {
-                    double value = SmoothValue.Toward(shownDisks[i], disks[i].Percent,
-                        elapsed, 0.3, 0.1);
+                    double target = i < heldDisks.Count ? heldDisks[i].Target : disks[i].Percent;
+                    double value = SmoothValue.Toward(shownDisks[i], target, elapsed, 0.5, 0.1);
                     if (value != shownDisks[i])
                     {
                         shownDisks[i] = value;
@@ -2040,41 +2036,21 @@ namespace NetSpeedBall
 
             if (moved)
             {
-                if (++textUpdateFrame >= 6)
-                {
-                    textUpdateFrame = 0;
-                    SyncTextValues();
-                }
-
                 Invalidate();
-            }
-        }
-
-        /// <summary>把动画值抄到"文字值"上，文字才按低频率刷新。</summary>
-        private void SyncTextValues()
-        {
-            textDownload = shownDownload;
-            textUpload = shownUpload;
-            textCpu = shownCpu;
-            textMemory = shownMemory;
-
-            if (textDisks.Length != shownDisks.Length)
-            {
-                textDisks = new double[shownDisks.Length];
-            }
-
-            for (int i = 0; i < shownDisks.Length; i++)
-            {
-                textDisks[i] = shownDisks[i];
             }
         }
 
         private void SnapShownValues()
         {
-            shownDownload = currentSample.DownloadBytesPerSecond;
-            shownUpload = currentSample.UploadBytesPerSecond;
-            shownCpu = resourceSnapshot.CpuPercent;
-            shownMemory = resourceSnapshot.MemoryPercent;
+            heldDownload.Snap(currentSample.DownloadBytesPerSecond);
+            heldUpload.Snap(currentSample.UploadBytesPerSecond);
+            heldCpu.Snap(resourceSnapshot.CpuPercent);
+            heldMemory.Snap(resourceSnapshot.MemoryPercent);
+
+            shownDownload = heldDownload.Target;
+            shownUpload = heldUpload.Target;
+            shownCpu = heldCpu.Target;
+            shownMemory = heldMemory.Target;
 
             DiskActivityRow[] disks = resourceSnapshot.Disks;
             int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
@@ -2083,12 +2059,16 @@ namespace NetSpeedBall
                 shownDisks = new double[count];
             }
 
-            for (int i = 0; i < count; i++)
+            while (heldDisks.Count < count)
             {
-                shownDisks[i] = disks[i].Percent;
+                heldDisks.Add(new HeldValue(0.2, 1.0));
             }
 
-            SyncTextValues();
+            for (int i = 0; i < count; i++)
+            {
+                heldDisks[i].Snap(disks[i].Percent);
+                shownDisks[i] = heldDisks[i].Target;
+            }
         }
 
         /// <summary>
@@ -2264,8 +2244,8 @@ namespace NetSpeedBall
             {
                 g.DrawString("\u7f51\u7edc\u8be6\u60c5", titleFont, dark, 16, 13);
                 g.DrawString(currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf", smallFont, muted, 236, 17);
-                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(textDownload), valueFont, downBrush, 16, 43);
-                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(textUpload), valueFont, upBrush, 168, 43);
+                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
+                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 168, 43);
                 g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, muted, 16, 72);
 
                 // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
@@ -2323,17 +2303,17 @@ namespace NetSpeedBall
             }
 
             int left = panel.Left + 8;
-            DrawResourceMetric(g, "CPU", FormatPercent(textCpu),
-                textCpu, left, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "CPU", FormatPercent(heldCpu.Target),
+                heldCpu.Target, left, panel.Top + 6, MetricWidth,
                 Color.FromArgb(242, 126, 42));
-            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(textMemory),
-                textMemory, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
+            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(heldMemory.Target),
+                heldMemory.Target, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
                 Color.FromArgb(35, 119, 238));
 
             int y = panel.Top + 6 + MetricRowHeight;
             for (int i = 0; i < diskCount; i++)
             {
-                double percent = i < textDisks.Length ? textDisks[i] : disks[i].Percent;
+                double percent = i < heldDisks.Count ? heldDisks[i].Target : disks[i].Percent;
                 DrawDiskRow(g, disks[i].Label, percent, left, y, panel.Width - 16, i);
                 y += DiskRowHeight;
             }
@@ -5215,6 +5195,60 @@ namespace NetSpeedBall
         {
             Value = value;
             Unit = unit;
+        }
+    }
+
+    /// <summary>
+    /// 显示值专用的"目标保持器"。
+    ///
+    /// 秒级采样天生带噪声：空闲时网速在 20~60 KB/s 之间晃、CPU 在 10~20% 之间晃，
+    /// 这些都不是用户关心的变化。把每一拍都原样喂给界面，数字就会一直蹦。
+    /// 这里加一条死区：新采样和当前保持值差得不够多（相对 25% 或绝对 2 KB），
+    /// 就继续用旧目标，界面上的数字纹丝不动；真有大变化才换目标。
+    /// </summary>
+    internal sealed class HeldValue
+    {
+        private readonly double relativeBand;
+        private readonly double absoluteBand;
+        private double held;
+        private bool primed;
+
+        public HeldValue(double relativeBand, double absoluteBand)
+        {
+            this.relativeBand = relativeBand;
+            this.absoluteBand = absoluteBand;
+        }
+
+        public double Target
+        {
+            get { return held; }
+        }
+
+        public void Snap(double value)
+        {
+            held = value;
+            primed = true;
+        }
+
+        public void Update(double sample)
+        {
+            if (double.IsNaN(sample) || double.IsInfinity(sample))
+            {
+                return;
+            }
+
+            if (!primed)
+            {
+                held = sample;
+                primed = true;
+                return;
+            }
+
+            double band = Math.Max(absoluteBand, Math.Abs(held) * relativeBand);
+            if (Math.Abs(sample - held) > band)
+            {
+                held = sample;
+            }
         }
     }
 
