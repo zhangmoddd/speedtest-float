@@ -20,6 +20,25 @@ namespace NetSpeedBall
         [STAThread]
         private static void Main(string[] args)
         {
+            // 截图自检用的两个开关必须在单实例锁之前处理：球开着的时候也要能渲染，
+            // 否则第二次启动会被当成"重复启动"，直接把已有的球亮出来就退出了。
+            if (args != null && args.Length >= 2)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                if (string.Equals(args[0], "--render-preview", StringComparison.OrdinalIgnoreCase))
+                {
+                    SpeedBallForm.SavePreview(args[1]);
+                    return;
+                }
+
+                if (string.Equals(args[0], "--render-details", StringComparison.OrdinalIgnoreCase))
+                {
+                    SpeedDetailsForm.SavePreview(args[1]);
+                    return;
+                }
+            }
+
             bool createdNew;
             using (Mutex singleInstance = new Mutex(true, "NetSpeedBall.SingleInstance", out createdNew))
             {
@@ -43,15 +62,6 @@ namespace NetSpeedBall
                         }
                     }
 
-                    return;
-                }
-
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                if (args != null && args.Length >= 2 &&
-                    string.Equals(args[0], "--render-preview", StringComparison.OrdinalIgnoreCase))
-                {
-                    SpeedBallForm.SavePreview(args[1]);
                     return;
                 }
 
@@ -1772,6 +1782,8 @@ namespace NetSpeedBall
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
         private int sampleCount;
+        /// <summary>这 60 秒里出现过的最高速率，画在曲线右上角当比例尺的说明。</summary>
+        private double historyPeak;
         private readonly TrafficStore trafficStore;
         private SpeedSample currentSample;
         private readonly SystemResourceMonitor resourceMonitor = new SystemResourceMonitor();
@@ -1850,7 +1862,56 @@ namespace NetSpeedBall
                 uploadHistory[MaxSamples - 1] = sample.UploadBytesPerSecond;
             }
 
+            double peak = 0;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                double value = downloadHistory[i] > uploadHistory[i]
+                    ? downloadHistory[i]
+                    : uploadHistory[i];
+                if (value > peak)
+                {
+                    peak = value;
+                }
+            }
+
+            historyPeak = peak;
             Invalidate();
+        }
+
+        /// <summary>
+        /// 把详情面板原样渲染成 PNG，只给 <c>--render-details 路径</c> 自检用。
+        /// 喂一串带尖刺的假数据，方便核对曲线的比例尺和文字排版有没有挤在一起。
+        /// </summary>
+        public static void SavePreview(string path)
+        {
+            TrafficStore store = new TrafficStore();
+            using (SpeedDetailsForm form = new SpeedDetailsForm(store))
+            {
+                // 逼出窗口句柄，否则 DrawToBitmap 画出来是一张白图。
+                if (form.Handle == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                const double mb = 1024.0 * 1024.0;
+                for (int i = 0; i < MaxSamples; i++)
+                {
+                    double down = 0.06 * mb + 0.05 * mb * Math.Sin(i / 3.0);
+                    if (i >= 31)
+                    {
+                        down = Math.Max(down, 4.6 * mb * Math.Exp(-(i - 31) / 2.2));
+                    }
+
+                    double up = 0.012 * mb + 0.004 * mb * Math.Sin(i / 2.0);
+                    form.AddSample(new SpeedSample(down, up, true, 1.0, (long)down, (long)up));
+                }
+
+                using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
+                {
+                    form.DrawToBitmap(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+                    bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
         }
 
         /// <summary>
@@ -1946,6 +2007,14 @@ namespace NetSpeedBall
                 g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(currentSample.DownloadBytesPerSecond), valueFont, downBrush, 16, 43);
                 g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(currentSample.UploadBytesPerSecond), valueFont, upBrush, 168, 43);
                 g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, muted, 16, 72);
+
+                // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
+                if (historyPeak > 0)
+                {
+                    string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
+                    SizeF peakSize = g.MeasureString(peakText, smallFont);
+                    g.DrawString(peakText, smallFont, muted, Width - 16 - peakSize.Width, 72);
+                }
             }
 
             DrawCloseButton(g);
@@ -1992,7 +2061,7 @@ namespace NetSpeedBall
                 resourceSnapshot.CpuPercent, 20, Color.FromArgb(242, 126, 42));
             DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(resourceSnapshot.MemoryPercent),
                 resourceSnapshot.MemoryPercent, 118, Color.FromArgb(35, 119, 238));
-            DrawResourceMetric(g, "\u78c1\u76d8", FormatPercent(resourceSnapshot.DiskPercent),
+            DrawResourceMetric(g, "C \u76d8", FormatPercent(resourceSnapshot.DiskPercent),
                 resourceSnapshot.DiskPercent, 216, Color.FromArgb(16, 178, 92));
         }
 
@@ -2039,23 +2108,39 @@ namespace NetSpeedBall
                 return;
             }
 
-            double maximum = 1;
+            // 线性刻度在这张图上没法看：60 秒里一根 5 MB/s 的尖刺，会把 0.1~0.5 MB/s
+            // 压成贴着底边的一条直线，看起来像"根本没流量"。改成按平方根压缩纵向比例 ——
+            // 相差 4 倍的高度差 2 倍，形状和先后顺序不变，零头也能看出起伏。
+            // 真实量级不靠读图：标题行右边直接写峰值，顶上那行写当前速率。
+            double peak = 0;
             for (int i = 0; i < sampleCount; i++)
             {
-                maximum = Math.Max(maximum, Math.Max(downloadHistory[i], uploadHistory[i]));
+                double value = downloadHistory[i] > uploadHistory[i]
+                    ? downloadHistory[i]
+                    : uploadHistory[i];
+                if (value > peak)
+                {
+                    peak = value;
+                }
             }
 
-            DrawHistoryLine(g, graph, downloadHistory, maximum, Color.FromArgb(35, 119, 238));
-            DrawHistoryLine(g, graph, uploadHistory, maximum, Color.FromArgb(16, 178, 92));
+            // 下限 64 KB/s：没流量时别把几 KB 的心跳放大成半张图。
+            double ceiling = Math.Max(peak, 64.0 * 1024.0);
+
+            DrawHistoryLine(g, graph, downloadHistory, ceiling, Color.FromArgb(35, 119, 238));
+            DrawHistoryLine(g, graph, uploadHistory, ceiling, Color.FromArgb(16, 178, 92));
         }
 
-        private void DrawHistoryLine(Graphics g, Rectangle graph, double[] values, double maximum, Color color)
+        private void DrawHistoryLine(Graphics g, Rectangle graph, double[] values, double ceiling, Color color)
         {
             PointF[] points = new PointF[sampleCount];
+            // 只有满 60 个点时才能用 MaxSamples 当分母；刚打开窗口时点数不足，
+            // 用 MaxSamples 会把曲线挤在左边一小截，看起来像"只画了一半"。
+            float span = sampleCount > 1 ? sampleCount - 1 : 1;
             for (int i = 0; i < sampleCount; i++)
             {
-                float x = graph.Left + (graph.Width - 1) * i / (float)(MaxSamples - 1);
-                float ratio = (float)Math.Min(1.0, values[i] / maximum);
+                float x = graph.Left + (graph.Width - 1) * i / span;
+                float ratio = (float)Math.Min(1.0, Math.Sqrt(Math.Max(0.0, values[i]) / ceiling));
                 float y = graph.Bottom - 2 - ratio * (graph.Height - 5);
                 points[i] = new PointF(x, y);
             }
@@ -2118,23 +2203,13 @@ namespace NetSpeedBall
 
     internal sealed class SystemResourceMonitor : IDisposable
     {
-        private PerformanceCounter diskActivityCounter;
         private bool hasCpuBaseline;
         private long lastIdle;
         private long lastKernel;
         private long lastUser;
 
-        public SystemResourceMonitor()
+        public void Dispose()
         {
-            try
-            {
-                diskActivityCounter = new PerformanceCounter("PhysicalDisk", "% Disk Time", "_Total", true);
-                diskActivityCounter.NextValue();
-            }
-            catch
-            {
-                diskActivityCounter = null;
-            }
         }
 
         public SystemResourceSnapshot Read()
@@ -2197,27 +2272,35 @@ namespace NetSpeedBall
             return Math.Max(0.0, Math.Min(100.0, status.MemoryLoad));
         }
 
-        private double ReadDiskPercent()
+        /// <summary>
+        /// C 盘空间占用率（已用 / 总容量）。
+        ///
+        /// 原来这里读的是 <c>PhysicalDisk\% Disk Time</c>，也就是「磁盘忙闲时间」——
+        /// 那个数跟「磁盘用了多少」没有半点关系：机器闲着的时候它常年 0~3%，
+        /// 而 C 盘可能已经快满了。界面上只写「磁盘 2.7%」，任何人都会读成
+        /// 「磁盘才用了 2.7%」，这就是口径和标签对不上，属于显示错误，不是理解问题。
+        /// </summary>
+        private static double ReadDiskPercent()
         {
-            if (diskActivityCounter != null)
+            try
             {
-                try
+                string root = Path.GetPathRoot(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+                if (!string.IsNullOrEmpty(root))
                 {
-                    float activity = diskActivityCounter.NextValue();
-                    if (!float.IsNaN(activity) && !float.IsInfinity(activity))
+                    DriveInfo system = new DriveInfo(root);
+                    if (system.IsReady && system.TotalSize > 0)
                     {
-                        return Math.Max(0.0, Math.Min(100.0, activity));
+                        return Math.Max(0.0, Math.Min(100.0,
+                            100.0 * (system.TotalSize - system.AvailableFreeSpace) / system.TotalSize));
                     }
                 }
-                catch
-                {
-                    diskActivityCounter.Dispose();
-                    diskActivityCounter = null;
-                }
+            }
+            catch
+            {
+                // 系统盘读不到（极少见）就走下面的全盘汇总。
             }
 
-            // This fallback is capacity usage, used only when the disk activity counter
-            // is unavailable on a stripped-down Windows performance-counter installation.
             long total = 0;
             long free = 0;
             foreach (DriveInfo drive in DriveInfo.GetDrives())
@@ -2243,15 +2326,6 @@ namespace NetSpeedBall
             }
 
             return Math.Max(0.0, Math.Min(100.0, 100.0 * (total - free) / total));
-        }
-
-        public void Dispose()
-        {
-            if (diskActivityCounter != null)
-            {
-                diskActivityCounter.Dispose();
-                diskActivityCounter = null;
-            }
         }
     }
 
