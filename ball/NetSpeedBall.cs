@@ -3690,6 +3690,12 @@ namespace NetSpeedBall
         private const byte RecordKindApp = 1;
         private const int MaxNameBytes = 512;
 
+        /// <summary>
+        /// 单条历史记录允许的最大字节数（1 PB）。
+        /// 只是用来挡住"把未初始化内存当成流量"写进来的垃圾记录 —— 见 AppTrafficMonitor。
+        /// </summary>
+        private const long MaxPlausibleRecord = 1L << 50;
+
         private readonly object gate = new object();
         private readonly string archivePath;
         private readonly string pendingPath;
@@ -4198,6 +4204,12 @@ namespace NetSpeedBall
                             return false;
                         }
 
+                        // 垃圾记录（未初始化内存当流量写进来的）不再折进归档，免得永远留在历史里
+                        if (record.Rx > MaxPlausibleRecord || record.Tx > MaxPlausibleRecord)
+                        {
+                            continue;
+                        }
+
                         string key = record.Kind.ToString(
                             System.Globalization.CultureInfo.InvariantCulture) + "\u0001" +
                             record.Date.ToString(System.Globalization.CultureInfo.InvariantCulture) +
@@ -4347,6 +4359,12 @@ namespace NetSpeedBall
                         if (!TryReadRecord(reader, out record))
                         {
                             return;
+                        }
+
+                        // 垃圾记录（见 MaxPlausibleRecord）读进来只会污染排行榜，跳过它继续读下一条
+                        if (record.Rx > MaxPlausibleRecord || record.Tx > MaxPlausibleRecord)
+                        {
+                            continue;
                         }
 
                         DayEntry entry = GetOrCreateLocked(record.Date);
@@ -4527,7 +4545,17 @@ namespace NetSpeedBall
         private byte[] v6Buffer = new byte[0];
         private IntPtr statsBuffer;
         private IntPtr enableBuffer;
+        private readonly byte[] zeroStats = new byte[NativeMethods.TcpEstatsDataSize];
         private int ticksSincePrune;
+
+        /// <summary>
+        /// 单条连接/单条记录能有的最大字节数（1 PB）。
+        ///
+        /// 超过这个量级只可能有一个来源：GetPerTcpConnectionEStats 没有真正写入缓冲区，
+        /// 我们从 AllocHGlobal 里读到了残留的堆内存 —— 曾经因此把 4.3×10^18 字节
+        /// 当成 node 的下载量写进了历史（排行榜里显示成 4060405727 GB）。
+        /// </summary>
+        private const long MaxPlausibleBytes = 1L << 50;
 
         private sealed class FlowState
         {
@@ -4690,6 +4718,9 @@ namespace NetSpeedBall
                         continue;
                     }
 
+                    // 每次调用前把缓冲区清零：API 返回成功但没写满时，读到的就是 0 而不是旧堆数据。
+                    Marshal.Copy(zeroStats, 0, statsBuffer, NativeMethods.TcpEstatsDataSize);
+
                     uint status = family == NativeMethods.AddressFamilyInet
                         ? NativeMethods.GetPerTcpConnectionEStats(rowPointer, NativeMethods.TcpEstatsTypeData,
                             IntPtr.Zero, 0, 0, IntPtr.Zero, 0, 0, statsBuffer, 0, NativeMethods.TcpEstatsDataSize)
@@ -4702,14 +4733,14 @@ namespace NetSpeedBall
 
                     long inBytes = Marshal.ReadInt64(statsBuffer, 16);  // DataBytesIn
                     long outBytes = Marshal.ReadInt64(statsBuffer, 0);  // DataBytesOut
-                    if (inBytes < 0)
-                    {
-                        inBytes = 0;
-                    }
 
-                    if (outBytes < 0)
+                    // 这两个数只要有一个不像话，说明这一拍根本没读到真数据（见 MaxPlausibleBytes），
+                    // 丢掉它并重建基线 —— 宁可少记一拍，也不能把垃圾写进历史。
+                    if (inBytes < 0 || outBytes < 0 ||
+                        inBytes > MaxPlausibleBytes || outBytes > MaxPlausibleBytes)
                     {
-                        outBytes = 0;
+                        state.HasBaseline = false;
+                        continue;
                     }
 
                     long deltaIn;
