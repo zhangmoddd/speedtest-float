@@ -37,12 +37,47 @@ namespace NetSpeedBall
                     SpeedDetailsForm.SavePreview(args[1]);
                     return;
                 }
+
+                if (string.Equals(args[0], "--render-traffic", StringComparison.OrdinalIgnoreCase))
+                {
+                    TrafficWindow.SavePreview(args[1]);
+                    return;
+                }
+            }
+
+            bool enableStartup = false;
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (string.Equals(args[i], "--enable-startup", StringComparison.OrdinalIgnoreCase))
+                    {
+                        enableStartup = true;
+                    }
+                }
             }
 
             bool createdNew;
             using (Mutex singleInstance = new Mutex(true, "NetSpeedBall.SingleInstance", out createdNew))
             {
-                if (!createdNew)
+                // 提权重启时同一个 exe 会被拉起第二次，而旧进程要过几百毫秒才退干净。
+                // 这段时间里锁还握着：新进程如果像平时那样"看到有人就退出"，结果就是两个都没了。
+                // 所以带 --enable-startup 时先等旧进程把锁放掉，最多等 8 秒。
+                bool owned = createdNew;
+                if (!owned && enableStartup)
+                {
+                    try
+                    {
+                        owned = singleInstance.WaitOne(8000);
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        // 旧进程是被强杀的，锁已经"遗弃"，现在归我们
+                        owned = true;
+                    }
+                }
+
+                if (!owned)
                 {
                     // 已经有一个实例在跑了：让那个把悬浮球亮出来，别让用户以为双击没反应。
                     uint message = NativeMethods.RegisterWindowMessage("NetSpeedBall.ShowBall");
@@ -63,18 +98,6 @@ namespace NetSpeedBall
                     }
 
                     return;
-                }
-
-                bool enableStartup = false;
-                if (args != null)
-                {
-                    for (int i = 0; i < args.Length; i++)
-                    {
-                        if (string.Equals(args[i], "--enable-startup", StringComparison.OrdinalIgnoreCase))
-                        {
-                            enableStartup = true;
-                        }
-                    }
                 }
 
                 Application.Run(new SpeedBallApplication(enableStartup));
@@ -3066,8 +3089,34 @@ namespace NetSpeedBall
             refreshTimer.Start();
         }
 
-        private void AddPresetButton(string text, string tag, int x)
+        /// <summary>
+        /// 把流量统计窗口渲染成 PNG，只给 <c>--render-traffic 路径</c> 自检用。
+        /// 默认渲染"上个月"，因为垃圾数据就是在上个月暴露出来的。
+        /// </summary>
+        public static void SavePreview(string path)
         {
+            TrafficStore store = new TrafficStore();
+            using (TrafficWindow window = new TrafficWindow(store))
+            {
+                if (window.Handle == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                DateTime monthStart = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1).AddMonths(-1);
+                window.rangeFrom = TrafficStore.ToDateInt(monthStart);
+                window.rangeTo = TrafficStore.ToDateInt(monthStart.AddMonths(1).AddDays(-1));
+                window.RefreshData();
+
+                using (Bitmap bitmap = new Bitmap(window.Width, window.Height))
+                {
+                    window.DrawToBitmap(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+                    bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+        }
+
+        private void AddPresetButton(string text, string tag, int x)        {
             Button button = new Button();
             button.Text = text;
             button.Tag = tag;
