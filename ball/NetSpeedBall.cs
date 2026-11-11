@@ -1779,6 +1779,14 @@ namespace NetSpeedBall
     internal sealed class SpeedDetailsForm : Form
     {
         private const int MaxSamples = 60;
+        /// <summary>资源面板最多画几块磁盘。 Dock 里插一排 U 盘也不会把窗口撑到屏幕外。</summary>
+        private const int MaxDiskRows = 8;
+        /// <summary>CPU/内存那一行的高度。</summary>
+        private const int MetricRowHeight = 44;
+        /// <summary>每块磁盘一行的高度。</summary>
+        private const int DiskRowHeight = 24;
+        /// <summary>CPU/内存两列的宽度。</summary>
+        private const int MetricWidth = 128;
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
         private int sampleCount;
@@ -1847,6 +1855,7 @@ namespace NetSpeedBall
         {
             currentSample = sample;
             resourceSnapshot = resourceMonitor.Read();
+            SyncResourcePanelHeight();
 
             if (sampleCount < MaxSamples)
             {
@@ -1879,6 +1888,35 @@ namespace NetSpeedBall
         }
 
         /// <summary>
+        /// 磁盘数量一变就把窗口高度跟上：插个 U 盘当场多一行，拔掉当场少一行。
+        /// 变高之后底边可能已经出屏了，所以顺手按回工作区内。
+        /// </summary>
+        private void SyncResourcePanelHeight()
+        {
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int rows = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            int height = 275 + (8 + MetricRowHeight + rows * DiskRowHeight + 8) + 12;
+            if (height == Height)
+            {
+                return;
+            }
+
+            Height = height;
+
+            try
+            {
+                Rectangle area = Screen.FromControl(this).WorkingArea;
+                if (Bottom > area.Bottom)
+                {
+                    Top = Math.Max(area.Top, area.Bottom - Height);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
         /// 把详情面板原样渲染成 PNG，只给 <c>--render-details 路径</c> 自检用。
         /// 喂一串带尖刺的假数据，方便核对曲线的比例尺和文字排版有没有挤在一起。
         /// </summary>
@@ -1894,6 +1932,14 @@ namespace NetSpeedBall
                 }
 
                 const double mb = 1024.0 * 1024.0;
+
+                // 磁盘活动率是"两次读数之间的差值"，必须真的隔一秒取两次，
+                // 连着循环喂 60 条假数据只会算出垃圾值（间隔≈0）。
+                form.resourceSnapshot = form.resourceMonitor.Read();
+                System.Threading.Thread.Sleep(1100);
+                form.resourceSnapshot = form.resourceMonitor.Read();
+
+                // 曲线历史直接写数组，不走 AddSample —— 否则每写一个点都会再读一次计数器。
                 for (int i = 0; i < MaxSamples; i++)
                 {
                     double down = 0.06 * mb + 0.05 * mb * Math.Sin(i / 3.0);
@@ -1902,9 +1948,15 @@ namespace NetSpeedBall
                         down = Math.Max(down, 4.6 * mb * Math.Exp(-(i - 31) / 2.2));
                     }
 
-                    double up = 0.012 * mb + 0.004 * mb * Math.Sin(i / 2.0);
-                    form.AddSample(new SpeedSample(down, up, true, 1.0, (long)down, (long)up));
+                    form.downloadHistory[i] = down;
+                    form.uploadHistory[i] = 0.012 * mb + 0.004 * mb * Math.Sin(i / 2.0);
                 }
+
+                form.sampleCount = MaxSamples;
+                form.historyPeak = 4.6 * mb;
+                form.currentSample = new SpeedSample(form.downloadHistory[MaxSamples - 1],
+                    form.uploadHistory[MaxSamples - 1], true, 1.0, 0, 0);
+                form.SyncResourcePanelHeight();
 
                 using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
                 {
@@ -2049,7 +2101,12 @@ namespace NetSpeedBall
 
         private void DrawResourcePanel(Graphics g)
         {
-            Rectangle panel = new Rectangle(16, 275, Width - 32, 76);
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+
+            // 有几块磁盘就画几行：U 盘插上来当场多一行，拔掉当场少一行。
+            int panelHeight = 8 + MetricRowHeight + diskCount * DiskRowHeight + 8;
+            Rectangle panel = new Rectangle(16, 275, Width - 32, panelHeight);
             using (Brush fill = new SolidBrush(Color.FromArgb(235, 245, 252)))
             using (Pen border = new Pen(Color.FromArgb(150, 190, 218), 1.0f))
             {
@@ -2057,26 +2114,63 @@ namespace NetSpeedBall
                 g.DrawRectangle(border, panel);
             }
 
+            int left = panel.Left + 8;
             DrawResourceMetric(g, "CPU", FormatPercent(resourceSnapshot.CpuPercent),
-                resourceSnapshot.CpuPercent, 20, Color.FromArgb(242, 126, 42));
+                resourceSnapshot.CpuPercent, left, panel.Top + 6, MetricWidth,
+                Color.FromArgb(242, 126, 42));
             DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(resourceSnapshot.MemoryPercent),
-                resourceSnapshot.MemoryPercent, 118, Color.FromArgb(35, 119, 238));
-            DrawResourceMetric(g, "C \u76d8", FormatPercent(resourceSnapshot.DiskPercent),
-                resourceSnapshot.DiskPercent, 216, Color.FromArgb(16, 178, 92));
+                resourceSnapshot.MemoryPercent, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
+                Color.FromArgb(35, 119, 238));
+
+            int y = panel.Top + 6 + MetricRowHeight;
+            for (int i = 0; i < diskCount; i++)
+            {
+                DrawDiskRow(g, disks[i], left, y, panel.Width - 16, i);
+                y += DiskRowHeight;
+            }
         }
 
+        /// <summary>CPU / 内存这种"一格一值"的指标：标签在上、数字在中、进度条在下。</summary>
         private void DrawResourceMetric(Graphics g, string label, string value, double percent,
-            int x, Color color)
+            int x, int y, int width, Color color)
         {
             using (Brush muted = new SolidBrush(Color.FromArgb(90, 108, 128)))
             using (Brush dark = new SolidBrush(Color.FromArgb(32, 44, 62)))
             using (Brush track = new SolidBrush(Color.FromArgb(210, 224, 235)))
             using (Brush bar = new SolidBrush(color))
             {
-                g.DrawString(label, smallFont, muted, x, 284);
-                g.DrawString(value, valueFont, dark, x, 297);
-                g.FillRectangle(track, x, 326, 88, 6);
-                g.FillRectangle(bar, x, 326, (int)Math.Round(88 * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0), 6);
+                g.DrawString(label, smallFont, muted, x, y);
+                g.DrawString(value, valueFont, dark, x, y + 13);
+                g.FillRectangle(track, x, y + 32, width, 6);
+                g.FillRectangle(bar, x, y + 32,
+                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0), 6);
+            }
+        }
+
+        /// <summary>
+        /// 一块物理磁盘占一行：左边"磁盘 0  C:"，右边活动百分比，下面一条通栏进度条。
+        /// 口径跟任务管理器那一列一样 —— 磁盘有多忙，不是磁盘用了多少空间。
+        /// </summary>
+        private void DrawDiskRow(Graphics g, DiskActivityRow disk, int x, int y, int width, int index)
+        {
+            Color color = index % 2 == 0
+                ? Color.FromArgb(16, 178, 92)
+                : Color.FromArgb(64, 148, 232);
+
+            using (Brush muted = new SolidBrush(Color.FromArgb(90, 108, 128)))
+            using (Brush dark = new SolidBrush(Color.FromArgb(32, 44, 62)))
+            using (Brush track = new SolidBrush(Color.FromArgb(210, 224, 235)))
+            using (Brush bar = new SolidBrush(color))
+            {
+                g.DrawString(disk.Label, smallFont, muted, x, y);
+
+                string value = FormatPercent(disk.Percent);
+                SizeF size = g.MeasureString(value, smallFont);
+                g.DrawString(value, smallFont, dark, x + width - size.Width, y);
+
+                g.FillRectangle(track, x, y + 15, width, 5);
+                g.FillRectangle(bar, x, y + 15,
+                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, disk.Percent)) / 100.0), 5);
             }
         }
 
@@ -2182,34 +2276,87 @@ namespace NetSpeedBall
         }
     }
 
+    /// <summary>
+    /// 一块物理磁盘的实时活动情况。
+    /// </summary>
+    internal struct DiskActivityRow
+    {
+        /// <summary>显示用名字，形如「磁盘 0  C: D:」。</summary>
+        public readonly string Label;
+        /// <summary>活动时间百分比（0~100），跟任务管理器「磁盘」那一列同口径。</summary>
+        public readonly double Percent;
+
+        public DiskActivityRow(string label, double percent)
+        {
+            Label = label;
+            Percent = percent;
+        }
+    }
+
     internal struct SystemResourceSnapshot
     {
         public readonly double CpuPercent;
         public readonly double MemoryPercent;
-        public readonly double DiskPercent;
         public readonly ulong MemoryUsedBytes;
         public readonly ulong MemoryTotalBytes;
+        /// <summary>每块物理磁盘一行，插拔 U 盘时这个数组会当场增减。</summary>
+        public readonly DiskActivityRow[] Disks;
 
-        public SystemResourceSnapshot(double cpuPercent, double memoryPercent, double diskPercent,
-            ulong memoryUsedBytes, ulong memoryTotalBytes)
+        public SystemResourceSnapshot(double cpuPercent, double memoryPercent,
+            ulong memoryUsedBytes, ulong memoryTotalBytes, DiskActivityRow[] disks)
         {
             CpuPercent = cpuPercent;
             MemoryPercent = memoryPercent;
-            DiskPercent = diskPercent;
             MemoryUsedBytes = memoryUsedBytes;
             MemoryTotalBytes = memoryTotalBytes;
+            Disks = disks;
         }
     }
 
     internal sealed class SystemResourceMonitor : IDisposable
     {
+        /// <summary>性能计数器里的物理磁盘分类。实例名形如「0 C:」「1 D: E:」。</summary>
+        private const string DiskCategory = "PhysicalDisk";
+
+        /// <summary>
+        /// 每隔几次采样重扫一遍磁盘列表。
+        /// 每次重扫要花约 45ms（读注册表里的实例名），放在 UI 线程上每秒扫一次会卡动画，
+        /// 所以 5 秒扫一次 —— 插上 U 盘最多 5 秒内出现在面板里。
+        /// </summary>
+        private const int DiskRescanInterval = 5;
+
+        private sealed class DiskCounter
+        {
+            public PerformanceCounter Idle;
+            public bool Primed;
+        }
+
+        private readonly Dictionary<string, DiskCounter> diskCounters =
+            new Dictionary<string, DiskCounter>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> diskInstances = new List<string>();
+        private readonly List<DiskActivityRow> diskRows = new List<DiskActivityRow>();
+
         private bool hasCpuBaseline;
         private long lastIdle;
         private long lastKernel;
         private long lastUser;
+        private int rescanCountdown;
 
         public void Dispose()
         {
+            foreach (DiskCounter counter in diskCounters.Values)
+            {
+                try
+                {
+                    counter.Idle.Dispose();
+                }
+                catch
+                {
+                }
+            }
+
+            diskCounters.Clear();
+            diskInstances.Clear();
         }
 
         public SystemResourceSnapshot Read()
@@ -2218,9 +2365,8 @@ namespace NetSpeedBall
             ulong totalMemory = 0;
             ulong availableMemory = 0;
             double memory = ReadMemoryPercent(ref totalMemory, ref availableMemory);
-            double disk = ReadDiskPercent();
             ulong usedMemory = totalMemory >= availableMemory ? totalMemory - availableMemory : 0;
-            return new SystemResourceSnapshot(cpu, memory, disk, usedMemory, totalMemory);
+            return new SystemResourceSnapshot(cpu, memory, usedMemory, totalMemory, ReadDisks());
         }
 
         private double ReadCpuPercent()
@@ -2273,59 +2419,170 @@ namespace NetSpeedBall
         }
 
         /// <summary>
-        /// C 盘空间占用率（已用 / 总容量）。
+        /// 读出每块物理磁盘的「活动时间」，口径就是任务管理器那一列：
+        /// 活动时间 = 100 − 空闲时间，不是磁盘用了多少空间。
         ///
-        /// 原来这里读的是 <c>PhysicalDisk\% Disk Time</c>，也就是「磁盘忙闲时间」——
-        /// 那个数跟「磁盘用了多少」没有半点关系：机器闲着的时候它常年 0~3%，
-        /// 而 C 盘可能已经快满了。界面上只写「磁盘 2.7%」，任何人都会读成
-        /// 「磁盘才用了 2.7%」，这就是口径和标签对不上，属于显示错误，不是理解问题。
+        /// 磁盘列表每秒重扫一次，所以插上 U 盘（或者拔掉）这里会当场多一行、少一行，
+        /// 不用重启程序，也不需要知道盘符 —— 计数器实例名里自带盘符。
         /// </summary>
-        private static double ReadDiskPercent()
+        private DiskActivityRow[] ReadDisks()
         {
+            if (--rescanCountdown <= 0)
+            {
+                rescanCountdown = DiskRescanInterval;
+                RescanDisks();
+            }
+
+            diskRows.Clear();
+            for (int i = 0; i < diskInstances.Count; i++)
+            {
+                string instance = diskInstances[i];
+                DiskCounter counter;
+                if (!diskCounters.TryGetValue(instance, out counter))
+                {
+                    continue;
+                }
+
+                double percent = 0;
+                try
+                {
+                    float idle = counter.Idle.NextValue();
+                    // 新建的计数器第一次调用没有时间差可算，返回的是 0，
+                    // 直接当"空闲 0%"会显示成 100% 活动，所以第一拍先跳过。
+                    if (counter.Primed && !float.IsNaN(idle) && !float.IsInfinity(idle))
+                    {
+                        percent = Math.Max(0.0, Math.Min(100.0, 100.0 - idle));
+                    }
+
+                    counter.Primed = true;
+                }
+                catch
+                {
+                    // 磁盘正好被拔掉时计数器会失效；这一拍按 0 显示，下一轮重扫会清掉它。
+                    percent = 0;
+                }
+
+                diskRows.Add(new DiskActivityRow(FriendlyDiskName(instance), percent));
+            }
+
+            return diskRows.ToArray();
+        }
+
+        /// <summary>重扫物理磁盘列表：新增的建计数器，消失的释放掉。</summary>
+        private void RescanDisks()
+        {
+            string[] names;
             try
             {
-                string root = Path.GetPathRoot(
-                    Environment.GetFolderPath(Environment.SpecialFolder.Windows));
-                if (!string.IsNullOrEmpty(root))
-                {
-                    DriveInfo system = new DriveInfo(root);
-                    if (system.IsReady && system.TotalSize > 0)
-                    {
-                        return Math.Max(0.0, Math.Min(100.0,
-                            100.0 * (system.TotalSize - system.AvailableFreeSpace) / system.TotalSize));
-                    }
-                }
+                names = new PerformanceCounterCategory(DiskCategory).GetInstanceNames();
             }
             catch
             {
-                // 系统盘读不到（极少见）就走下面的全盘汇总。
+                // 拿不到分类（极少数精简系统）就保持上一轮的样子，不清空。
+                return;
             }
 
-            long total = 0;
-            long free = 0;
-            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            List<string> found = new List<string>();
+            for (int i = 0; i < names.Length; i++)
+            {
+                string name = names[i];
+                if (string.IsNullOrEmpty(name) ||
+                    string.Equals(name, "_Total", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                found.Add(name);
+            }
+
+            // 按磁盘号排，插拔 U 盘时行序不会乱跳
+            found.Sort(CompareDiskInstances);
+
+            List<string> stale = new List<string>();
+            foreach (string key in diskCounters.Keys)
+            {
+                if (!found.Contains(key))
+                {
+                    stale.Add(key);
+                }
+            }
+
+            for (int i = 0; i < stale.Count; i++)
             {
                 try
                 {
-                    if (drive.DriveType != DriveType.Fixed || !drive.IsReady)
-                    {
-                        continue;
-                    }
-
-                    total += drive.TotalSize;
-                    free += drive.AvailableFreeSpace;
+                    diskCounters[stale[i]].Idle.Dispose();
                 }
                 catch
                 {
                 }
+
+                diskCounters.Remove(stale[i]);
             }
 
-            if (total <= 0)
+            for (int i = 0; i < found.Count; i++)
             {
-                return 0;
+                if (diskCounters.ContainsKey(found[i]))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    PerformanceCounter counter = new PerformanceCounter(
+                        DiskCategory, "% Idle Time", found[i], true);
+                    diskCounters[found[i]] = new DiskCounter { Idle = counter };
+                }
+                catch
+                {
+                    // 这块盘的活动时间读不到就跳过它，别把整个面板拖垮
+                }
             }
 
-            return Math.Max(0.0, Math.Min(100.0, 100.0 * (total - free) / total));
+            diskInstances.Clear();
+            for (int i = 0; i < found.Count; i++)
+            {
+                if (diskCounters.ContainsKey(found[i]))
+                {
+                    diskInstances.Add(found[i]);
+                }
+            }
+        }
+
+        private static int CompareDiskInstances(string a, string b)
+        {
+            int na = DiskNumber(a);
+            int nb = DiskNumber(b);
+            if (na != nb)
+            {
+                return na.CompareTo(nb);
+            }
+
+            return string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static int DiskNumber(string instance)
+        {
+            int space = instance.IndexOf(' ');
+            string head = space > 0 ? instance.Substring(0, space) : instance;
+            int value;
+            return int.TryParse(head, out value) ? value : int.MaxValue;
+        }
+
+        /// <summary>把「0 C:」这种实例名翻成「磁盘 0  C:」。</summary>
+        private static string FriendlyDiskName(string instance)
+        {
+            int space = instance.IndexOf(' ');
+            if (space <= 0)
+            {
+                return instance;
+            }
+
+            string number = instance.Substring(0, space);
+            string volumes = instance.Substring(space + 1).Trim();
+            return volumes.Length > 0
+                ? "\u78c1\u76d8 " + number + "  " + volumes
+                : "\u78c1\u76d8 " + number;
         }
     }
 
