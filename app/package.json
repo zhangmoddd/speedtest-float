@@ -1,0 +1,44 @@
+{
+  "name": "fuguang",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "浮光 - 轻量 Windows 桌面悬浮工具箱",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:dst": "node scripts/run-tests-in-tz.mjs America/New_York",
+    "test:all": "npm run test && npm run test:dst",
+    "check:commands": "node scripts/check-commands.mjs",
+    "check": "npm run check:commands && tsc -b && vitest run"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@lezer/highlight": "^1.2.5",
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-opener": "^2.2.5",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^5.0.2"
+  }
+}

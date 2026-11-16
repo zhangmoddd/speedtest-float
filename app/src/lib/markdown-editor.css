@@ -1,0 +1,146 @@
+/* ============================================================
+   markdown 编辑器（CodeMirror 6）的样式
+   ============================================================
+   这里的每条规则都要盖掉 CodeMirror 自带的 baseTheme，所以选择器统一多带一层
+   `.fg-md`（容器）——baseTheme 注入的样式优先级只有一层类名，多一层就赢，
+   不需要 `!important`。
+
+   颜色全部走 styles.css 里的变量：浅色主题一套，深色主题自动跟着变。
+   ============================================================ */
+
+.fg-md {
+  height: 100%;
+  display: flex;
+  overflow: hidden;
+}
+
+.fg-md .cm-editor {
+  flex: 1;
+  height: 100%;
+  background: transparent;
+  color: var(--text);
+  /* 不用等宽字体：这是笔记，不是代码。Obsidian 也是正文字体 */
+  font-family: var(--font);
+  font-size: var(--fs-md);
+}
+
+/* 聚焦时由外层容器画边框，编辑器自己不要再描一圈 */
+.fg-md .cm-editor.cm-focused {
+  outline: none;
+}
+
+.fg-md .cm-scroller {
+  font-family: var(--font);
+  line-height: 1.7;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.fg-md .cm-content {
+  padding: 6px 8px;
+  caret-color: var(--text);
+}
+
+.fg-md .cm-line {
+  padding: 0 2px;
+}
+
+.fg-md .cm-placeholder {
+  color: var(--text-faint);
+  font-style: normal;
+}
+
+/* ---- 选区与光标 ---- */
+
+.fg-md .cm-content ::selection {
+  background: rgba(29, 78, 216, 0.2);
+}
+
+.fg-md .cm-cursor,
+.fg-md .cm-dropCursor {
+  border-left-color: var(--text);
+}
+
+/* ---- markdown 渲染 ----
+   ⚠️ 标题**只能用 font-size / line-height 拉开层次，不能用 margin**。
+   CodeMirror 靠逐行测量真实高度来定位光标，margin 不被算进行盒，
+   一加就会让光标比文字"错开半个行"。 */
+
+.fg-md .cm-line.fg-md-h1 {
+  font-size: 1.4em;
+  font-weight: 700;
+  line-height: 1.55;
+}
+
+.fg-md .cm-line.fg-md-h2 {
+  font-size: 1.22em;
+  font-weight: 700;
+  line-height: 1.6;
+}
+
+.fg-md .cm-line.fg-md-h3 {
+  font-size: 1.1em;
+  font-weight: 600;
+  line-height: 1.65;
+}
+
+.fg-md .cm-line.fg-md-h4,
+.fg-md .cm-line.fg-md-h5,
+.fg-md .cm-line.fg-md-h6 {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.fg-md .cm-line .fg-md-strong {
+  font-weight: 700;
+}
+
+.fg-md .cm-line .fg-md-em {
+  font-style: italic;
+}
+
+.fg-md .cm-line .fg-md-strike {
+  text-decoration: line-through;
+  color: var(--text-dim);
+}
+
+.fg-md .cm-line .fg-md-code {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 3px;
+  padding: 0 2px;
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+  font-size: 0.94em;
+}
+
+/* 代码块：逐行上底色，左边加一道竖线代替围栏 */
+.fg-md .cm-line.fg-md-codeblock {
+  background: rgba(0, 0, 0, 0.045);
+  box-shadow: inset 2px 0 var(--border-strong);
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+  font-size: 0.94em;
+}
+
+.fg-md .cm-line.fg-md-quote {
+  color: var(--text-dim);
+  box-shadow: inset 2px 0 var(--border-strong);
+  padding-left: 8px;
+}
+
+/* ---- 编辑器容器：复用输入框的外观 ---- */
+
+.md-area {
+  display: flex;
+  /* 和 `.field__input--area` 一样填满外面那个可拖高度的壳子 */
+  flex: 1;
+  min-height: 0;
+  /* 内边距交给 CodeMirror 的 .cm-content，这里再来一层会双份 */
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 聚焦高亮。`div` 不会自己拿到 `:focus`（拿到焦点的是里面的 contenteditable），
+   所以必须用 `:focus-within` —— 否则点进正文后边框一直是灰的，
+   看起来像"没点中"。原来的 textarea 靠 `.field__input:focus` 就够了。 */
+.md-area:focus-within {
+  border-color: rgba(29, 78, 216, 0.55);
+}
