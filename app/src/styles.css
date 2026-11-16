@@ -1,0 +1,897 @@
+/* ============================================================
+   浮光 · 样式
+   设计取向：浅色、干净、低干扰。白底配深灰字（不用纯黑），
+   长时间看文档和搜索结果不刺眼；蓝色作为唯一强调色。
+   窗口是 transparent 的，所以所有圆角与投影都靠 CSS 画。
+   ============================================================ */
+
+:root {
+  /* 面板背景。
+     刻意接近不透明：浮光常驻在其他窗口之上，如果背景太透，
+     桌面上的文字、数字、图表会透过来和面板内容混在一起，搜索和阅读都很累。
+     留一点点透明度 + backdrop-filter 只为保住边缘的玻璃质感。 */
+  --bg: rgba(255, 255, 255, 0.985);
+  --bg-solid: #ffffff;
+
+  /* 抬起面与悬停面：浅色主题下用「加深」而不是「提亮」来表示层级。
+     深色主题里是白色低透明度叠加，这里必须换成黑色低透明度，否则看不出层次。
+     数值比深色主题略大：白底上 3% 的黑几乎不可见，按钮会显得没有实体感。 */
+  --bg-raised: rgba(0, 0, 0, 0.045);
+  --bg-hover: rgba(0, 0, 0, 0.078);
+  --border: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  /* 正文用深灰 #1f2430 而不是纯黑：纯黑在白底上对比过硬，看久了发涩。
+     三级文字层次（白底对比度）：正文 15.5 / 次要 6.2 / 弱化 4.8。 */
+  --text: #1f2430;
+  --text-dim: #5a6270;
+  --text-faint: #6b7280;
+
+  /* 强调蓝比深色主题下深得多：#5b9dff 这种浅蓝在白底上对比度不足，读不清。
+     #1d4ed8 在白底 6.7:1、在悬停面 5.6:1，两种背景上都满足正文可读性。
+     下面这些值不是随手挑的，都过了 WCAG 对比度检查：
+       危险 #d92d20 = 4.8:1   成功 #0b7a58 = 5.3:1
+     星标琥珀 #b8791a = 3.6:1（图标，门槛 3.0）
+     改色时请重新算一遍对比度，浅色主题下很容易配出「看着有颜色但读不清」的组合。 */
+  --accent: #1d4ed8;
+  --accent-soft: rgba(29, 78, 216, 0.1);
+  --danger: #d92d20;
+  --success: #0b7a58;
+  /* 琥珀 #b45309 = 4.9:1（正文，门槛 4.5）。
+     用在「操作成功了，但有东西没了」这类提示上（见 .snip__feedback--warn /
+     .palette__error--warn）。刻意不用 --danger 的红色：那会让用户以为操作失败了，
+     于是再按一次回车 —— 第二次会真的再粘一遍。 */
+  --warning: #b45309;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  --font: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+
+  /* ---------- 字号层级 ----------
+     所有字号都由 --fs-base 推导，用户在设置页改一档，整个界面按比例缩放。
+
+     为什么不直接改 `html { font-size }` 再全用 rem：
+     现有样式里字号是散落的 px，改成 rem 要同时确认每个值换算后不变形，
+     风险更大。用变量推导可以保持"当前这一档就是原样"，改动是可控的。
+
+     为什么不让用户随便填数字：
+     面板宽度固定 420px，字号开太大就会到处换行、按钮挤成一团。
+     给几档预设，每一档都是试过的。 */
+  --fs-base: 13px;
+  --fs-2xs: calc(var(--fs-base) - 4px);
+  --fs-xs: calc(var(--fs-base) - 2.5px);
+  --fs-sm: calc(var(--fs-base) - 1.5px);
+  --fs-md: calc(var(--fs-base) - 0.5px);
+  --fs-lg: calc(var(--fs-base) + 1px);
+  --fs-xl: calc(var(--fs-base) + 6px);
+  --fs-2xl: calc(var(--fs-base) + 13px);
+
+  /* 悬浮球标志的遮罩图。
+     只在这里定义一次 —— 下面有 4 处要用它（球体本身 + 设置页的配色缩略图，
+     每处都要写 -webkit- 与标准两个属性）。每写一次 url()，Vite 就会把这张图
+     内联一份；4 份会让 CSS 白白多出 15 KB。抽成变量后只剩一份。 */
+  --logo-mark-mask: url("./assets/logo-mark.png");
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  font-family: var(--font);
+  color: var(--text);
+  font-size: var(--fs-base);
+  /* 悬浮工具不该能选中文本，除非是输入框 */
+  user-select: none;
+  overflow: hidden;
+}
+
+input,
+textarea {
+  user-select: text;
+  font-family: inherit;
+}
+
+/* 细滚动条，避免粗滚动条破坏紧凑布局 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.16);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+
+/* ============================================================
+   悬浮球（测速球）
+   ============================================================ */
+
+.ball-root {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 小球的可点区域。
+   ⚠️ 这里的 122px 必须与 src-tauri/src/windows.rs 里的 BALL_DIAMETER 一致：
+   窗口比球体大（136），球体在窗口内居中，
+   Rust 侧要靠这个直径把球体的右边缘贴到屏幕边缘。改一处要改两处。
+
+   球本身的样子全部由 `windows/SpeedBall.tsx` 里的 SVG 画，
+   这里只负责尺寸、光标和按下反馈 —— 所以没有 background / border / box-shadow。 */
+.ball {
+  width: 122px;
+  height: 122px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  transition: transform 0.12s ease;
+  /* SVG 里的进度环、尾焰会画到 5px 的矩形边界上，别被容器裁掉 */
+  overflow: visible;
+}
+
+.ball:hover {
+  transform: scale(1.04);
+}
+
+.ball:active {
+  cursor: grabbing;
+  transform: scale(0.97);
+}
+
+.ball--busy {
+  opacity: 0.6;
+}
+
+/* 球面上的文字。
+   字号全部由 SpeedBall.tsx 按 C# 的磅值算好、以属性形式挂在 <text> 上，
+   这里只管字体族和数字等宽 —— 在 CSS 里写 font-size 会盖掉那些属性。 */
+.speedball {
+  display: block;
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  /* 拖动小球时不该选中里面的文字 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 等宽数字：不加这条，1.24 变成 11.2 时整行会左右抖，看着像在闪 */
+.speedball__num {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ball,
+  .ball:hover,
+  .ball:active {
+    transition: none;
+  }
+}
+
+
+/* ============================================================
+   主面板
+   ============================================================ */
+
+.panel {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  /* ⚠️ 这一行有个不明显的副作用：`backdrop-filter`（和 `filter`、`transform`、
+     `perspective`、`contain: paint` 一样）会让这个元素成为**后代里
+     `position: fixed` 的包含块**。也就是说面板里那些"相对窗口定位"的浮层
+     （跟手的拖拽浮层 `.drag-ghost`、格子菜单 `.linkmenu`）其实是相对
+     `.panel` 的 padding box 定位的 —— 而 `.panel` 有 1px 边框，
+     所以用 `getBoundingClientRect()`（视口坐标）算出来的位置会整体差 1px。
+     实测确认过，视觉上看不出来，但**别**因为"差了 1px"去改坐标计算：
+     那是这一行带来的，不是算错了。 */
+  backdrop-filter: blur(18px);
+}
+
+.panel__titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.panel__brand {
+  font-weight: 600;
+  font-size: var(--fs-base);
+  letter-spacing: 0.5px;
+  color: var(--accent);
+}
+
+.panel__crumb {
+  color: var(--text-faint);
+  font-size: var(--fs-md);
+  /* 标题栏现在有四个按钮，而 crumb 是这一行里唯一可以变短的东西。
+     不给它 ellipsis 的话，长标题（或用户把字号调到最大档）会把按钮
+     挤出 420px 的窗口 —— 而按钮一旦被挤出去就再也点不到了。 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 「新建窗口失败」这类一次性提示。挂在这一行的中间，
+   宽度让给 crumb，所以同样要能省略。 */
+.panel__notice {
+  font-size: var(--fs-xs);
+  color: var(--warning);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel__window-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  /* 按钮永远不参与压缩：宁可让 crumb 变短（它有 ellipsis），
+     也不能把 ✕ 挤到窗口外面去 */
+  flex-shrink: 0;
+}
+
+/* 通用小图标按钮。
+   24×24 是给**内容区里**那些按钮用的（片段行、计时卡片、文件夹格子…），
+   标题栏那一组另有 28×28 的覆盖，见下面 `.panel__window-actions`。
+   不直接把这里改成 28：`.iconbtn` 被十几个调用点共用（`features/*` 与
+   `folders-ui.tsx`），其中文件夹格子的两个操作按钮挤在 86px 宽的卡片里，
+   而这一轮没有 GUI 可以逐个核对改完的观感 —— 需求要的也只是"右上角搜索键"。
+
+   尺寸与图标：图标大小写在 JSX 的 `size={n}` 上（lucide 会把它写成 svg 的
+   width/height 属性），**不要**在这里再写一份 `svg { width }`：
+   同一个数字写两处，迟早对不上。 */
+.iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* 标题栏右上角那一组（搜索 / 新建窗口 / 图钉 / ✕）。
+   提到 28×28，与备忘页日期条上的翻页按钮同一个规格 ——
+   它是面板里最高频的几个点击目标，24px 在桌面触控板上偏小（用户这一轮
+   提的就是"右上角搜索键有点小"）。 */
+.panel__window-actions .iconbtn {
+  width: 28px;
+  height: 28px;
+}
+
+.iconbtn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.iconbtn--danger:hover {
+  background: rgba(217, 45, 32, 0.12);
+  color: var(--danger);
+}
+
+/* 搜索键是标题栏那一组里**唯一的动作**（其余三个是窗口按钮：
+   新建 / 置顶 / 收起），给它一个看得见的修饰：淡强调底 + 强调色图标。
+   刻意克制：不加边框、不加阴影、不改尺寸 —— 四个按钮里只要一个看起来
+   "是个动作"，其余三个仍然是安静的窗口按钮。 */
+.iconbtn--search {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 悬停时保持强调色。
+   `.iconbtn--search`（0,1,0）压不过 `.iconbtn:hover`（0,2,0），
+   所以这一条必须写在 `.iconbtn:hover` **之后**、并且带上 `:hover`
+   （两条特异性都是 0,2,0，靠书写顺序定胜负）。
+   不写的话，鼠标一移上去"搜索是个动作"这个提示就消失了。 */
+.iconbtn--search:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  /* 用内描边表示悬停，而不是换成 --bg-hover —— 那会盖掉强调底 */
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* 页签栏 */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tabs__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--text-dim);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  position: relative;
+}
+
+.tabs__item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tabs__item--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tabs__wip {
+  font-size: var(--fs-2xs);
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text-faint);
+}
+
+.panel__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ============================================================
+   通用控件
+   ============================================================ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--accent-soft);
+  border-color: rgba(29, 78, 216, 0.42);
+  color: var(--accent);
+}
+
+.btn--primary:hover {
+  background: rgba(29, 78, 216, 0.16);
+}
+
+/* ============================================================
+   文本片段
+   ============================================================ */
+
+.snip {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.snip__searchbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.snip__searchicon {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.snip__search {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  font-size: var(--fs-base);
+}
+
+.snip__search::placeholder {
+  color: var(--text-faint);
+}
+
+.snip__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  flex-shrink: 0;
+}
+
+.snip__count {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+}
+
+.snip__toolbar .btn {
+  margin-left: auto;
+}
+
+.snip__feedback {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 10px 6px;
+  padding: 6px 9px;
+  background: rgba(11, 122, 88, 0.1);
+  border: 1px solid rgba(11, 122, 88, 0.28);
+  border-radius: var(--radius-sm);
+  color: var(--success);
+  font-size: var(--fs-md);
+  flex-shrink: 0;
+}
+
+/* 「操作成功了，但有东西没了」这类提示。
+   不能沿用上面的绿色对勾：那是在说"一切正常"，而这条在说"你的剪贴板原文被替换了"。
+   改成警示色，并且留 8 秒（见 index.tsx 里的 ttl）—— 六十来字读不完就消失等于没说。 */
+.snip__feedback--warn {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.35);
+  color: var(--warning);
+  align-items: flex-start;
+  line-height: 1.45;
+}
+
+.snip__error {
+  margin: 0 10px 6px;
+  padding: 6px 9px;
+  background: rgba(217, 45, 32, 0.08);
+  border: 1px solid rgba(217, 45, 32, 0.26);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: var(--fs-md);
+  flex-shrink: 0;
+}
+
+/* 列表密度。`--density` 由文本片段页按 Ctrl+滚轮的档位写在 .snip 根节点上，
+   默认 1。只缩放「间距与内边距」，不动字号——字号是设置页里那个
+   「界面字号」，两套混在一起用户就说不清自己调的是哪个了。 */
+.snip__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: calc(7px * var(--density, 1));
+}
+
+.snip__empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--fs-md);
+  line-height: 1.7;
+}
+
+/* 空状态里那句"别处还有 N 条命中，回顶层搜"上的链接按钮。
+   它要看起来**能点**（不然用户不知道那是出路），但又不能抢走空状态本身的注意力，
+   所以只上强调色 + 下划线，不加按钮底。 */
+.snip__empty-link {
+  padding: 0 2px;
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* 片段卡片 */
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: calc(8px * var(--density, 1)) calc(10px * var(--density, 1));
+}
+
+.card:hover {
+  border-color: var(--border-strong);
+}
+
+.card__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: calc(4px * var(--density, 1));
+}
+
+.card__star {
+  color: #b8791a;
+  flex-shrink: 0;
+}
+
+.card__title {
+  font-weight: 600;
+  font-size: var(--fs-md);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card__tag {
+  font-size: var(--fs-xs);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.055);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.card__content {
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+  line-height: 1.5;
+  word-break: break-all;
+  margin-bottom: calc(5px * var(--density, 1));
+}
+
+.card__note {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  line-height: 1.5;
+  padding-left: calc(7px * var(--density, 1));
+  border-left: 2px solid var(--border-strong);
+  margin-bottom: calc(6px * var(--density, 1));
+}
+
+.card__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.card__uses {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+/* ============================================================
+   编辑器
+   ============================================================ */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.editor__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+}
+
+/* 自动保存状态。
+   刻意比标题轻一档：它是"让你安心"的信息，不是内容本身。
+   刚改完那两秒变绿 → 用 --success 表示"这一下真的写进去了"，
+   随后淡回灰色常驻文案，提醒一直都在、但不抢眼。 */
+.editor__autosave {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-weight: 400;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  transition: color 0.2s ease;
+}
+
+.editor__autosave--just-saved {
+  color: var(--success);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field--grow {
+  flex: 0 0 auto;
+  /* 默认高度**必须是个确定值**，不能靠 `flex-grow` 撑满。两个理由：
+     1. 撑满靠的是 `flex-grow`，而它会盖掉用户拖出来的高度 ——
+        往小了拖会被撑回去，"可以自行控制大小"就落空了；
+     2. 更要紧：父级高度是 flex 分配出来的时候，子元素的 `height: 100%`
+        解析不出来，浏览器会退回**内容高度**并溢出容器。那正是
+        「正文框压住备注框、连缩放把手都点不到」那个 bug 的根因。
+     给一个确定值之后，用户拖出来的行内 `height` 直接盖掉它，两边都成立。
+     280px 是按 640px 高的面板定的：够看十来行，又不至于把下面几个输入框顶出去。 */
+  height: 280px;
+  min-height: 90px;
+  /* 让用户可以拖着改高度（右下角那两条小斜杠） */
+  resize: vertical;
+  /* `resize` 只在 overflow 不是 visible 时才画把手 */
+  overflow: hidden;
+}
+
+.field__label {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.field__hint {
+  font-style: normal;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.field__input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-size: var(--fs-md);
+  outline: none;
+}
+
+.field__input:focus {
+  border-color: rgba(29, 78, 216, 0.55);
+}
+
+.field__input--area {
+  /* 多行输入框。高度由外层 `.field--grow` 说了算（那上面有缩放把手），
+     这里只负责**填满**它，自己不参与 resize —— 两个元素都能拖会打架：
+     拖外层时内层不动、拖内层时外层不动，用户根本分不清哪个是哪个。
+     `min-height: 0` 是必须的：不给的话 flex 项的自动最小尺寸会把输入框
+     顶出外层，又变成"压住下面的输入框"。 */
+  flex: 1;
+  min-height: 0;
+  resize: none;
+  line-height: 1.55;
+}
+
+.editor__flags {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.check input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.editor__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+/* ============================================================
+   占位（未实现功能）
+   ============================================================ */
+
+.placeholder {
+  padding: 22px 18px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  overflow-y: auto;
+  height: 100%;
+}
+
+.placeholder svg {
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.placeholder h3 {
+  font-size: var(--fs-base);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.placeholder p {
+  font-size: var(--fs-md);
+  margin-bottom: 10px;
+}
+
+.placeholder ul {
+  padding-left: 18px;
+  font-size: var(--fs-md);
+  color: var(--text-faint);
+}
+
+.placeholder li {
+  margin-bottom: 3px;
+}
+
+/* ============================================================
+   提醒弹窗
+   ============================================================ */
+
+/* 布局从"横向一行"改成"上图标+标题 / 中间内容 / 右下按钮"。
+   原因：错过提醒的汇总最多会列 8 条，横向布局装不下，
+   而且横向时内容区没有明确的滚动边界。 */
+.alert {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+}
+
+.alert__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.alert__icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+/* 内容区可滚动：汇总提醒可能很长，不能把按钮顶出窗口 */
+.alert__content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.alert__title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.alert__body {
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+  line-height: 1.7;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.alert__actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.alert__ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 16px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(29, 78, 216, 0.42);
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.alert__ok:hover {
+  background: rgba(29, 78, 216, 0.16);
+}
+
+/* 「稍后 5 分钟」：和「知道了」并排，但**更弱**。
+   它是次要动作（大多数人会直接关掉），抢了主按钮的注意力反而不好点。 */
+.alert__snooze {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.alert__snooze:hover {
+  background: var(--bg-raised);
+  color: var(--text);
+}

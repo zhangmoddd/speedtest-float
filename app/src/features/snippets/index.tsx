@@ -629,19 +629,27 @@ export function SnippetsPanel() {
    *
    * 现在的规则是：**敲进去的就是存下来的**。每改一下都进数据，
    * 由 `usePersistentState` 的 400ms 防抖写盘负责落盘（窗口隐藏 / 卸载前
-   * 还会强制落盘）。编辑器只剩「完成」和「撤销改动」两个出口。
+   * 还会强制落盘）。编辑器只剩「关闭」和「撤销改动」两个出口。
    *
-   * 正文为空时**不写**：和原来「保存」按钮的 `disabled` 是同一条规矩 ——
-   * 不存空正文的片段。所以清空正文再退出，数据里仍是上一次的内容。
+   * 正文为空时**不写** —— 和原来「保存」按钮的 `disabled` 是同一条规矩。
+   * 但"空"的判据比「正文非空」宽：**只写了标题、备注或标签也算有内容**。
+   * 原来只判正文，于是「新建笔记 → 填个标题 → 关掉」这条最常见的路径
+   * 什么都不存，用户看着标题明明在框里，回来却是空列表。
    *
-   * ⚠️ 有了图片之后，判据从"正文非空"换成 **"正文非空 或 有图片"**
-   * （`hasAnyContent`）。不换的话，一条**只有图片**的笔记会被这一句
-   * 悄悄拦掉：用户贴了一张图、点「完成」，回来发现图没了 ——
-   * 而且没有任何提示，因为"没写"和"写了"在界面上长得一样。
-   * 同时**不能**把"真的空"（没文字也没图片）也放行，那会重新引入空壳条目。
+   * ⚠️ 有了图片之后，判据还包含 **有图片**（`hasAnyContent`）。
+   * 不包含的话，一条**只有图片**的笔记会被这一句悄悄拦掉：用户贴了一张图、
+   * 关掉编辑器，回来发现图没了 —— 而且没有任何提示，
+   * 因为"没写"和"写了"在界面上长得一样。
+   * 同时**不能**把"真的空"（没字、没图、没标题、没备注、没标签）也放行，
+   * 那会重新引入空壳条目。
    */
   const onDraftChange = (draft: Snippet) => {
-    if (!hasAnyContent(draft.content, draft.images)) return;
+    const hasSomething =
+      hasAnyContent(draft.content, draft.images) ||
+      draft.title.trim().length > 0 ||
+      (draft.note ?? "").trim().length > 0 ||
+      (draft.tags ?? []).length > 0;
+    if (!hasSomething) return;
     dirtyRef.current = true;
     const cleaned: Snippet = {
       ...draft,
@@ -673,7 +681,7 @@ export function SnippetsPanel() {
   };
 
   /**
-   * 「完成」：数据早就写进去了，这里只负责关掉编辑器。
+   * 「关闭」：数据早就写进去了，这里只负责关掉编辑器。
    *
    * 仍然要 `await flush()` 之后再报「已保存」—— `update()` 只是排了一次
    * 400ms 的防抖写盘，磁盘满 / 数据目录只读时它不会成功，而无条件说
@@ -1260,6 +1268,36 @@ function SnippetEditor({
   const [tagInput, setTagInput] = useState(draft.tags.join(", "));
 
   /**
+   * 刚存过一次的短暂提示（头部右侧那行小字）。
+   *
+   * # 为什么要专门做个提示
+   *
+   * 数据其实**每敲一下就写进去了**（见上层 `onDraftChange`），但界面上只有
+   * 「完成」「撤销改动」两个按钮 —— 用户看到「完成」就以为不点会丢，
+   * 每次改完都战战兢兢去找那个按钮，忘了点还会怀疑自己丢东西。
+   * 这行字是把"已经存了"这件事**说出来**，而不是让人去猜。
+   *
+   * 2.2 秒后回到常驻文案「改动自动保存」：一直挂着"已保存"会变成背景噪音，
+   * 它只在"刚改完"这一刻有信息量。
+   */
+  const [justSaved, setJustSaved] = useState(false);
+  const savedTimer = useRef<number | null>(null);
+
+  const flashSaved = () => {
+    setJustSaved(true);
+    if (savedTimer.current !== null) window.clearTimeout(savedTimer.current);
+    savedTimer.current = window.setTimeout(() => setJustSaved(false), 2200);
+  };
+
+  // 编辑器关掉时把计时器一起收了，不然它会在组件已卸载后再 setState
+  useEffect(
+    () => () => {
+      if (savedTimer.current !== null) window.clearTimeout(savedTimer.current);
+    },
+    [],
+  );
+
+  /**
    * 图片附件：三路导入（按钮 / 拖放 / Ctrl+V）+ 网格 + 大图 + 图片右键菜单。
    *
    * `images` 传函数而不是值：导入 / 删除之后要拿到**最新**的那一份列表，
@@ -1294,12 +1332,14 @@ function SnippetEditor({
    * 改一个字段。
    *
    * 本地 `form` 保证打字跟手（受控输入框不能等一次 IPC 往返），
-   * 同时把整条推给数据。两边是同一份内容，不存在"本地改了但没存"的中间态。
+   * 同时把整条推给数据。两边是同一份内容，不存在"本地改了但没存"的中间态 ——
+   * 所以这里顺手闪一下「已自动保存」，让用户看见这件事真的发生了。
    */
   const patch = (p: Partial<Snippet>) => {
     const next = { ...form, ...p };
     setForm(next);
     onChange(next);
+    flashSaved();
   };
 
   return (
@@ -1321,6 +1361,21 @@ function SnippetEditor({
             代码注释里的「片段」是内部用词，也**不改**（批量改会产生几百行
             纯文本 diff，把真正的改动埋掉）。 */}
         <span>{draft.title ? "编辑笔记" : "新建笔记"}</span>
+        {/* 自动保存状态。常驻文案是「改动自动保存」，刚改完闪成「已自动保存」——
+            用户不需要知道防抖的 400ms，他只需要知道"不用点任何东西" */}
+        <span
+          className={`editor__autosave${justSaved ? " editor__autosave--just-saved" : ""}`}
+          title="每改一下就写进数据，不点「关闭」也不会丢"
+        >
+          {justSaved ? (
+            <>
+              <Check size={11} />
+              已自动保存
+            </>
+          ) : (
+            "改动自动保存"
+          )}
+        </span>
       </div>
 
       <label className="field">
@@ -1417,17 +1472,14 @@ function SnippetEditor({
         <button
           className="btn btn--primary"
           onClick={onDone}
-          // ⚠️ 判据是「正文非空 **或** 有图片」：只有图片的笔记是合法的，
-          // 而只判正文的话那条笔记会被这句 `disabled` 拦在「完成」外面 ——
-          // 用户贴了图却按不动完成，而且不知道为什么。
-          // 「真的空」（没文字也没图片）仍然禁用，空壳条目不写。
-          disabled={!hasAnyContent(form.content, form.images)}
-          title={
-            hasAnyContent(form.content, form.images) ? "" : "正文和图片至少要有一个"
-          }
+          // 不再按"内容是否为空"禁用：这个按钮现在**只是关窗口**，改动早就
+          // 自动存进去了。原来禁用是为了拦住空壳条目，那件事已经由
+          // `onDraftChange` 的 `hasSomething` 把关 —— 两处都判会打架：
+          // 内容一旦变空，用户连关都关不掉，只能去点「撤销改动」。
+          title="改动已自动保存，这里只是收起编辑器"
         >
           <Check size={13} />
-          完成
+          关闭
         </button>
       </div>
     </div>
