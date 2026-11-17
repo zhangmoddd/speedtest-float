@@ -762,6 +762,15 @@ pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
 /// 两条路的候选合在一张表里返回，各自带 `how` 说明凭什么，前端分开显示。
 /// 身份号命中的排前面，并且**同路径不重复列**：同一个文件被两条路都找到时，
 /// 用户看到两行一模一样的东西只会以为有两个。
+///
+/// # ⚠️ 快捷方式（`.lnk`）要搜的是它**内部指向的那个东西**
+///
+/// 这是实测撞上的：一条 `.lnk` 链接失效，因为快捷方式本身好好的、
+/// 只是它里面写的目标路径过期了（文件夹被改名）。这时候拿 `.lnk` 自己的
+/// 路径去找同名文件，找到的是**它自己** —— 用户点一下，target 换成同一个
+/// `.lnk`，什么也没变，界面照样报"快捷方式失效"。
+///
+/// 用户要的从来不是那个 `.lnk` 文件，是它指着的程序。
 #[tauri::command]
 pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::SameNameCandidate> {
     let found = {
@@ -778,27 +787,52 @@ pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::Sa
 
     let want_dir = kind == LinkKind::Folder;
     tauri::async_runtime::spawn_blocking(move || {
+        // 先核对一次：既要知道该搜哪个路径，也要知道指纹还有没有意义。
+        let status = launcher::probe(&target, kind);
+        let is_lnk_broken = status.state == launcher::TargetState::LnkBroken;
+
+        // 快捷方式坏了 → 搜它内部写着的那个目标。搜不到内部目标
+        // （读不出来）就退回原路径，至少还能给出点东西。
+        let wanted = if is_lnk_broken {
+            status.lnk_target.clone().unwrap_or_else(|| target.clone())
+        } else {
+            target.clone()
+        };
+
         let mut out: Vec<launcher::SameNameCandidate> = Vec::new();
 
         // 一、按身份找。找到了就是它，不用再猜。
-        if let Some(trace) = fingerprint {
-            for hit in crate::trace::find_by_trace(&trace, &target, want_dir) {
-                out.push(launcher::SameNameCandidate {
-                    path: hit.path,
-                    bytes: hit.bytes,
-                    modified_ms: hit.modified_ms,
-                    how: match hit.how {
-                        crate::trace::TraceMatch::SameFile => launcher::CandidateMatch::SameFile,
-                        crate::trace::TraceMatch::SameContent => {
-                            launcher::CandidateMatch::SameContent
-                        }
-                    },
-                });
+        //
+        // ⚠️ 快捷方式坏了的时候**跳过**这一步：指纹记的是那个 `.lnk` 文件
+        // 自己的身份，而 `.lnk` 并没有消失（坏的是它里面的内容）。
+        // 按它去找，找回来的还是那个 `.lnk` —— 用户点一下等于什么都没做。
+        if !is_lnk_broken {
+            if let Some(trace) = fingerprint {
+                for hit in crate::trace::find_by_trace(&trace, &wanted, want_dir) {
+                    out.push(launcher::SameNameCandidate {
+                        path: hit.path,
+                        bytes: hit.bytes,
+                        modified_ms: hit.modified_ms,
+                        how: match hit.how {
+                            crate::trace::TraceMatch::SameFile => {
+                                launcher::CandidateMatch::SameFile
+                            }
+                            crate::trace::TraceMatch::SameContent => {
+                                launcher::CandidateMatch::SameContent
+                            }
+                        },
+                    });
+                }
             }
         }
 
         // 二、按名字补。已经按身份找到的路径不再重复。
-        for candidate in launcher::find_same_name(&target, want_dir) {
+        for candidate in launcher::find_same_name(&wanted, want_dir) {
+            // 排除链接现在就指着的那个路径：把它自己列出来当候选，
+            // 用户点了之后 target 一字未变，只会以为"修了但没用"。
+            if candidate.path.eq_ignore_ascii_case(&target) {
+                continue;
+            }
             if out
                 .iter()
                 .any(|h| h.path.eq_ignore_ascii_case(&candidate.path))

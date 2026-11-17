@@ -510,7 +510,16 @@ namespace NetSpeedBall
                     return;
                 }
 
-                ProcessStartInfo startInfo = new ProcessStartInfo(exe, "--panel-only");
+                // 把本进程的 PID 交给浮光，让它盯着我们：球一退，面板跟着退。
+                //
+                // 为什么不是"球退出时去 kill 浮光"：球是普通权限（asInvoker），
+                // 浮光一旦曾被以管理员身份启动过，这里就杀不掉它，而且失败是
+                // 静默的 —— 用户只会觉得"关了还留着，关不掉"。让浮光自己盯着
+                // 父进程，只需要 SYNCHRONIZE 一个访问位，不用任何提权。
+                int selfPid = Process.GetCurrentProcess().Id;
+                ProcessStartInfo startInfo = new ProcessStartInfo(
+                    exe,
+                    "--panel-only --parent-pid " + selfPid);
                 startInfo.UseShellExecute = true;
                 startInfo.WorkingDirectory = Path.GetDirectoryName(exe);
                 Process.Start(startInfo);

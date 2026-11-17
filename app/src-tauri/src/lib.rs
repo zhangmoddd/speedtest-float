@@ -60,6 +60,70 @@ pub(crate) fn is_panel_only() -> bool {
     PANEL_ONLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 从命令行里取「启动我的那个进程」的 PID（球传的 `--parent-pid N`）。
+///
+/// 两种写法都认：`--parent-pid 1234` 和 `--parent-pid=1234`。
+/// 取不到就返回 `None` —— 那表示浮光是被用户单独启动的，不该跟着谁退出。
+fn parent_pid_arg() -> Option<u32> {
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if arg == "--parent-pid" {
+            return args.next().and_then(|v| v.trim().parse().ok());
+        }
+        if let Some(v) = arg.strip_prefix("--parent-pid=") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// 盯着父进程（球），它一结束就跟着退出。
+///
+/// # 为什么由浮光**自己**盯，而不是球退出时去 kill
+///
+/// **权限。** 球是普通权限（`asInvoker`），一旦浮光曾被以管理员身份启动过，
+/// 球就杀不掉它 —— 而这个失败是静默的，用户永远不知道"为什么关了还留着"。
+/// 反过来，浮光盯自己的父进程只需要 `SYNCHRONIZE` 一个访问位，
+/// 不需要任何提权，行为稳定。
+///
+/// # 为什么用 `std::process::exit`
+///
+/// 这段跑在一个裸线程上，拿不到 `AppHandle`。而这个应用的状态是
+/// **每次改动立刻落盘**的（见 `src/lib/store.ts` 的写盘策略），
+/// 没有"退出前必须保存"的东西 —— 直接退不会丢数据。
+///
+/// 用户的心智模型是"球是主程序，浮光是它的面板"。关掉球之后浮光还赖在托盘里，
+/// 从用户角度看就是"我明明关了这个软件，它还在后台跑"；更糟的是下次双击球时，
+/// 单实例逻辑会把那个幽灵窗口叫回来，看起来像"关不掉"。
+#[cfg(windows)]
+fn watch_parent(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    // `SYNCHRONIZE` 在 windows-sys 里挂在 FileSystem 模块下（它原本是文件访问权，
+    // 进程句柄复用同一套位），而 `OpenProcess` 的入参在 Threading 下 ——
+    // 两边都是 `u32` 别名，直接传即可。
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE};
+
+    std::thread::spawn(move || {
+        // SAFETY: 只请求 SYNCHRONIZE 权限，不解引用任何指针。
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // 球在我们来得及打开句柄之前就退了（或者根本不是这个进程）。
+            // 这种情况不退出 —— 宁可留着面板，也不要因为一次查询失败就自杀。
+            return;
+        }
+        // 阻塞直到对方结束。父进程活着的话这个调用会等很久，
+        // 所以必须在独立线程上跑，主线程要留着跑窗口消息循环。
+        // SAFETY: 句柄有效，`INFINITE` 表示一直等。
+        unsafe {
+            WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
+        }
+        crate::diag!("[浮光] 球已退出，面板跟着关");
+        std::process::exit(0);
+    });
+}
+
 /// 应用入口。由 `main.rs` 调用。
 pub fn run() {
     // 已经有一个实例在跑：通知它把面板显示出来，然后本进程直接退出。
@@ -195,6 +259,12 @@ pub fn run() {
                 // 避免开机同时拉起面板和球两个进程。
                 if let Err(err) = autostart::set_enabled(false) {
                     crate::diag!("[浮光] 清理旧开机启动项失败：{err}");
+                }
+
+                // 由球启动的（带了 `--parent-pid`）→ 盯着球，球退出就跟着退。
+                // 手动单独启动的浮光不受影响：不带这个参数，就没有任何监视。
+                if let Some(pid) = parent_pid_arg() {
+                    watch_parent(pid);
                 }
 
                 // 面板模式：起一个线程等「显示面板」信号，然后直接把面板开出来。
