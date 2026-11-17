@@ -1,0 +1,691 @@
+/* ============================================================
+   快捷链接
+   设计取向：一面「格子墙」。面板只有 420px 宽，所以格子走紧凑路线：
+   4 列、图标 40px、名字最多两行，扫一眼就能认出是哪个。
+   颜色全部取自 styles.css 的 :root 变量，这里不出现任何硬编码色值，
+   以后换主题（比如加深色）只需要改变量。
+   ============================================================ */
+
+.links {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---- 添加栏 ---- */
+
+.links__addbar {
+  display: flex;
+  gap: 5px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* 四个入口平分一行：等宽比按内容撑开更好点，误点率低 */
+.links__addbar .btn {
+  flex: 1;
+  justify-content: center;
+  padding: 5px 6px;
+}
+
+/* ---- 网址表单 ---- */
+
+.links__urlform {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.links__urlform-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* ---- 提示条 ---- */
+
+.links__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 8px 10px 0;
+  padding: 6px 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--success);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.links__notice svg {
+  flex-shrink: 0;
+  /* 提示可能两行，图标跟着第一行文字对齐 */
+  margin-top: 1px;
+}
+
+.links__notice span {
+  word-break: break-word;
+}
+
+/* 错误用中性底 + 危险色文字/描边。
+   底色刻意不做成红色调：浅色主题里大面积浅红会显得很脏，
+   而且这条提示常常要停留很久（等用户读完原因）。 */
+.links__notice--error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ---- 网格 ---- */
+
+.links__grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 9px 10px 10px;
+  display: grid;
+  /* auto-fill + minmax：420px 的面板正好排 4 列，窗口被拉伸时自动变多，
+     不需要写任何 JS 去算列数。
+
+     86px 这个基数乘上 --tile-scale 就是「图标大小」缩放：
+     该变量由 index.tsx 按 Ctrl+滚轮的档位写在 .links 根节点上，
+     默认 1（不缩放）。文件夹卡片的高度也用同一个变量，
+     这样两者永远一样大。 */
+  grid-template-columns: repeat(auto-fill, minmax(calc(86px * var(--tile-scale, 1)), 1fr));
+
+  /* ⚠️ 这一行不能删，它是「名字第二行不被裁掉」的另一半。
+     格子的高度只给了下限（见 .links__tile 的说明），可是**光有下限不够**：
+     网格内容比容器高的时候（也就是格子墙开始滚动时），
+     Chrome 会把 auto 行压到格子的 `min-height` 那个下限上 ——
+     于是行高从「内容需要的高度」掉回 92px × 档位，第二行又被裁掉。
+     实测 20 个链接（5 行，必滚）在 7 档字号 × 10 档缩放的矩阵里
+     有 212 处半行裁切，且默认档位就中招。
+     `min-content` 把行的下限钉在「内容需要的高度」，容器装不下就老老实实滚动。 */
+  grid-auto-rows: min-content;
+
+  gap: 6px;
+  align-content: start;
+}
+
+/* 拖拽悬停：整块区域变蓝，明确告诉用户「松手就加进来」。
+   没有这个反馈的话，拖到一半的用户不知道这里收不收文件。 */
+.links__grid--drop {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* 空状态与加载提示：grid 子项默认只占一格，必须显式跨满整行 */
+.links__empty,
+.links__hint {
+  grid-column: 1 / -1;
+  padding: 30px 14px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--fs-md);
+  line-height: 1.7;
+}
+
+.links__empty svg {
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.links__empty p {
+  margin-bottom: 4px;
+}
+
+/* ---- 格子 ---- */
+
+.links__tile {
+  position: relative;
+  display: flex;
+  /* 高度只给**下限**，由内容自己撑开。
+     这里刻意不写死高度：格子里有两个互相独立的缩放因子 ——
+     图标 / 间距 / 内边距按 --tile-scale（Ctrl+滚轮）缩放，
+     名字的字号却由设置页的「界面字号」决定（见 styles.css 的 --fs-base）。
+     写死 92px 时，默认档位下留给名字的只有
+     92 − 上下内边距 20 − 图标 40 − 间距 7 = 25px，
+     而两行 11.5px × 1.35 的文字要 31px，第二行直接被 overflow 裁掉。
+     真事故：「清内存-双击这个」在默认档位下只显示「清内存-双击这」，
+     把缩放拉到最大才完整（那时格子高 147px，装得下）。
+     min-height 之后行高由内容决定：同一行的格子被 grid 拉成一样高，
+     行与行之间允许差几像素，而文字在任何「字号 × 档位」组合下都不会被裁。
+     ⚠️ 这一条要配合 .links__grid 的 `grid-auto-rows: min-content` 才成立 ——
+     只改这里的话，网格一开始滚动，行又会被压回这个 min-height。 */
+  min-height: calc(92px * var(--tile-scale, 1));
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.links__tile:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* 空位：被拖的那一格"提起来"之后留在落点上的虚框（虚框样式在 drag-drop.css）。
+   高度只给下限、和格子用同一个基数：这一层只剩一条链接时，整行就只有它，
+   不给下限的话行会塌成一条线，松手时落点也跟着变。 */
+.links__gap {
+  min-height: calc(92px * var(--tile-scale, 1));
+}
+
+/* 跟手的浮层要长得和原来那一格一样，所以复用格子的排版变量 */
+.links__ghost {
+  gap: calc(7px * var(--tile-scale, 1));
+  padding: calc(10px * var(--tile-scale, 1)) calc(6px * var(--tile-scale, 1));
+  background: var(--bg-solid);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+/* 正在启动：压暗表示「已经在处理了」，抑制连点 */
+.links__tile--busy {
+  opacity: 0.55;
+}
+
+.links__tile-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* 间距与内边距同样跟着缩放：只放大图标而留着原来的内边距，
+     小档位下文字会被挤出格子 */
+  gap: calc(7px * var(--tile-scale, 1));
+  padding: calc(10px * var(--tile-scale, 1)) calc(6px * var(--tile-scale, 1));
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* 只有可点的那层给手型光标；重命名时这层是普通容器，不该看起来能点 */
+.links__open {
+  cursor: pointer;
+}
+
+.links__open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.links__glyph {
+  /* 这就是「图标大小」本身 */
+  width: calc(40px * var(--tile-scale, 1));
+  height: calc(40px * var(--tile-scale, 1));
+  object-fit: contain;
+  flex-shrink: 0;
+  /* 图标不该吃掉点击：整块格子才是热区 */
+  pointer-events: none;
+}
+
+/* 内置图标比真实图标「重」，缩一圈视觉重量才相当（box-sizing 是 border-box，padding 往内收） */
+.links__glyph--builtin {
+  padding: calc(7px * var(--tile-scale, 1));
+  color: var(--text-dim);
+}
+
+.links__name {
+  max-width: 100%;
+  font-size: var(--fs-sm);
+  line-height: 1.35;
+  text-align: center;
+  /* 两行截断：中文文件夹名和 "Visual Studio Code" 这类名字一行放不下，
+     给两行能多一倍信息；超过两行才省略号，格子高度也就不会参差 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+/* ---- 就地编辑（重命名 / 启动参数）----
+   占满一整行而不是挤在格子里：默认档位一格只有 86~95px 宽，
+   稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
+   整行宽有 400px，而且位置就在原来那一格上，不会找不到自己在改哪一条。 */
+
+.links__editor {
+  grid-column: 1 / -1;
+  display: flex;
+  /* 图标对齐第一行输入框的**顶边**：字段有三行，居中的话图标会飘在中间 */
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-solid);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+.links__editor .links__glyph {
+  /* 编辑器是横排的，图标不该跟着格子的缩放档位变大变小 */
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  /* 和第一行输入框的垂直中心对齐（输入框 5px 内边距 + 1px 边框 + 一行文字） */
+  margin-top: 3px;
+}
+
+/* 三个字段竖排。整行宽（400px）是这一版的重点：
+   原来挤在 86~95px 的格子里，稍长的名字根本看不全。 */
+.links__editfields {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.links__editrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 「名字 / 目标 / 参数」三个标签等宽，输入框左边才对得齐 */
+.links__editlabel {
+  width: 30px;
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.links__editinput {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  outline: none;
+}
+
+.links__editinput:focus {
+  border-color: var(--accent);
+}
+
+/* 「回车保存 · Esc 取消」这句提示：不说的话，光标停在框里不动会让人以为卡住了。
+   用 `margin-left` 而不是 `padding-left` 对齐输入框：`em` 是行内元素，
+   行内元素的 padding 不影响它的 border-box 左边缘，量出来会差一截
+   （视觉上其实是对齐的，但"看起来对"和"量出来对"应该是一回事）。 */
+.links__edithint {
+  font-style: normal;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  margin-left: 36px; /* 和输入框左边缘对齐（标签 30 + 间距 6） */
+}
+
+/* ---- 「⋯」更多操作 ---- */
+
+/* 只占右上角 20px。原来这里是一排四个图标按钮（加起来 83px），
+   而格子默认只有 86~95px 宽 —— 悬停时按钮铺满整格，把图标和名字压在下面。 */
+.links__more {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: calc(20px * var(--tile-scale, 1));
+  height: calc(20px * var(--tile-scale, 1));
+  /* 压在图标上，必须有实底，否则和图标叠在一起看不清 */
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  opacity: 0;
+  /* 用 visibility 而不是 display 来隐藏：
+     display 切换会让布局变化，鼠标下方的元素一变，:hover 判定就可能抖动。 */
+  visibility: hidden;
+  transition: opacity 0.1s ease;
+}
+
+.links__tile:hover .links__more,
+.links__tile:focus-within .links__more {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* 覆盖通用 .iconbtn:hover 的透明底：这里要实底，否则会透出下面的图标 */
+.links__more:hover {
+  background: var(--bg-hover);
+}
+
+/* lucide 的尺寸是写死在 svg 属性上的，CSS 能覆盖它 */
+.links__more svg {
+  width: calc(13px * var(--tile-scale, 1));
+  height: calc(13px * var(--tile-scale, 1));
+}
+
+/* ---- 「⋯」菜单 ----
+   贴住按钮定位，但用 `position: fixed`：面板里到处都是 `overflow: auto`
+   的滚动容器，absolute 会被祖先裁掉（`FolderPicker` 用居中浮层是同一个原因）。 */
+
+.linkmenu {
+  position: fixed;
+  z-index: 60;
+  min-width: 186px;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+/* 完整名字。格子里的名字最多两行、会被截断，这里是唯一能看到全名的地方 */
+.linkmenu__title {
+  padding: 5px 8px 6px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-dim);
+  /* 长名字要能换行显示全，而不是截断 —— 显示全名正是它存在的理由 */
+  word-break: break-all;
+}
+
+.linkmenu__row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.linkmenu__row:hover {
+  background: var(--bg-hover);
+}
+
+.linkmenu__row svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+
+.linkmenu__row--danger,
+.linkmenu__row--danger svg {
+  color: var(--danger);
+}
+
+.linkmenu__row--danger:hover {
+  background: rgba(217, 45, 32, 0.12);
+}
+
+/* 行尾的说明（例如当前填的启动参数）。不该把整行撑宽，所以允许收缩省略 */
+.linkmenu__aside {
+  margin-left: auto;
+  min-width: 0;
+  font-style: normal;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 底部说明 ---- */
+
+.links__footer {
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+/* ============================================================
+   失效的链接
+   目标不在了：文件被挪走、U 盘拔了、快捷方式指向的程序卸了。
+   处理原则是**标记，但不拦着** —— 图标压暗 + 左上角一个小标签说清
+   是哪种失效；点下去开「修好它」面板，而不是去撞一次必然的失败。
+   描边用琥珀（--warning）而不是红色：红色是"操作失败了"，
+   而这里只是"它现在不在那儿"，事情还有救。
+   ============================================================ */
+
+.links__tile--broken,
+.links__tile--broken:hover {
+  /* hover 那条规则是 `.links__tile:hover`，特异性 (0,2,0) 比单类高 ——
+     **跟源码顺序无关，它一定会赢**。所以这里必须把 `:hover` 也写出来，
+     否则鼠标一放上去描边就被改回中性灰，而 hover 正是用户想细看这一格的时刻：
+     文件被改回来了？还是仍然坏着？描边不该在这时闭嘴。 */
+  border-color: var(--warning);
+}
+
+.links__tile--broken .links__glyph {
+  /* 压暗 + 去色：扫一眼就能看出这一格和别的不一样 */
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+
+.links__tile--broken:hover .links__glyph {
+  opacity: 0.7;
+}
+
+/* 左上角的短标签。右上角被「⋯」占了，所以放左上。
+   字号用最小那一档：格子默认只有 86px 宽，写长了会把名字挤走。
+   `pointer-events: none` 是必须的 —— 整块格子才是热区，
+   标签浮在上面把点击吃掉的话，用户点它反而没反应。 */
+.links__tile-warn {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100% - 24px);
+  padding: 1px 4px;
+  background: var(--bg-solid);
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+  color: var(--warning);
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* ---- 「⋯」菜单里的「修好它…」 ---- */
+
+.linkmenu__row--warn,
+.linkmenu__row--warn svg {
+  color: var(--warning);
+}
+
+.linkmenu__row--warn:hover {
+  background: rgba(180, 83, 9, 0.12);
+}
+
+/* ============================================================
+   「修好它」面板
+   贴底的浮层，**不用整屏遮罩**：遮罩会把格子墙压暗，用户就没法
+   对照"还有哪些链接"，而这一层的信息量并不大（一句原因 + 几个按钮）。
+   点面板外面 / 按 Esc 就关，和「⋯」菜单是同一套交互。
+   z-index 70：在「⋯」菜单（60）之上、全应用右键菜单（100）之下。
+   ============================================================ */
+
+.repair {
+  position: fixed;
+  z-index: 70;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  max-height: 78%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
+}
+
+.repair__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warning);
+}
+
+.repair__head svg {
+  flex-shrink: 0;
+}
+
+.repair__title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair__why {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+/* 路径单独一行、并且**可选中**：用户经常要把它复制出去自己找 */
+.repair__path {
+  max-height: 62px;
+  overflow-y: auto;
+  padding: 5px 7px;
+  background: var(--bg-raised);
+  border-radius: 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  word-break: break-all;
+  user-select: text;
+}
+
+.repair__path--sub {
+  color: var(--text-faint);
+}
+
+.repair__hint {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.repair__candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.repair__candidate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  background: var(--bg-raised);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.repair__candidate:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* 「就是它」那一档：按文件身份号核对上的，不是靠名字猜的。
+   给一层更实的底和左边一道竖线，和下面那摞"同名，不一定"在视觉上分开 ——
+   两摞并排长得一样，用户会以为把握也一样。 */
+.repair__candidate--exact {
+  background: var(--bg-active, var(--bg-hover));
+  border-color: var(--border-strong);
+  box-shadow: inset 2px 0 0 var(--accent, #4a9eff);
+}
+
+.repair__candidate--exact svg {
+  color: var(--accent, #4a9eff);
+}
+
+.repair__candidate svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  /* 两行文字时图标跟着第一行对齐 */
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+.repair__candidate-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* 候选路径最多显示两行、允许换行。
+   刻意不用省略号：候选之间的区别常常在**中间那一层**目录
+   （同级目录下的同名文件），截掉哪一头都可能正好把区别截掉。 */
+.repair__candidate-text {
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 大小与修改时间。**这是候选列表里唯一能帮用户分辨"哪个才是我要的"的信息**：
+   几个候选文件名完全一样，只有时间和大小不同。 */
+.repair__candidate-meta {
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  white-space: nowrap;
+}
+
+.repair__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* 四个动作平分一行；窄档位下自动折行，不硬挤 */
+.repair__actions .btn {
+  flex: 1;
+  min-width: 92px;
+  justify-content: center;
+}
+
+.repair__danger {
+  color: var(--danger);
+}
+
+.repair__danger:hover {
+  border-color: var(--danger);
+}
+

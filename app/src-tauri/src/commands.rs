@@ -535,14 +535,30 @@ pub async fn links_list(app: AppHandle) -> Vec<Link> {
 }
 
 /// 新增或更新一个快捷链接。
+///
+/// # 指纹（`fingerprint`）只由后端维护
+///
+/// 它是"这个目标在磁盘上的身份号"，只有真的读一次文件才拿得到。
+/// 前端保存时会 `{ ...link }` 整条展开，而它的类型定义里可以没有这个字段 ——
+/// 那就等于**每次改名字都顺手把身份号抹掉**，功能在用户不知不觉中失效。
+/// 所以这里不看前端传了什么，按 id 找回旧条目自己决定：
+/// 目标路径没变就沿用，变了（用户重新指定了别的文件）就作废重记。
 #[tauri::command]
 pub async fn link_save(app: AppHandle, link: Link) -> Result<(), String> {
     let store = app.state::<Store>();
+    let mut next = link;
     {
         let mut st = store.lock();
-        match st.links.iter_mut().find(|l| l.id == link.id) {
-            Some(slot) => *slot = link,
-            None => st.links.push(link),
+        if let Some(old) = st.links.iter().find(|l| l.id == next.id) {
+            next.fingerprint = if old.target == next.target {
+                old.fingerprint.clone()
+            } else {
+                None
+            };
+        }
+        match st.links.iter_mut().find(|l| l.id == next.id) {
+            Some(slot) => *slot = next,
+            None => st.links.push(next),
         }
     }
     state::persist(&app, || store.lock().links.clone(), state::save_links)
@@ -642,6 +658,15 @@ pub async fn link_launch_elevated(app: AppHandle, id: String) -> Result<(), Stri
 /// 几十次 IPC 往返 + 几十次状态更新，而每次更新都会重渲染整面格子墙。
 /// 一次拿回整张表，界面只更新一次。
 ///
+/// # 顺便在这里「盖脚印」
+///
+/// 核对时目标正好在、而这条链接还没记过身份号 —— 这就是**唯一**能记的时刻：
+/// 等文件被挪走了再想记，已经没得记了。所以核对的副产品是"把身份证存下来"。
+///
+/// 这一步只对 `Ok` 的目标做，不是偷懒：`Network`（UNC / 映射盘）是
+/// **故意不碰**的，对一个陌生 UNC 路径做 `CreateFileW` 就是零点击的
+/// NetNTLM 外发，和 `probe` 里拦的是同一件事。`Missing` 想记也没得记。
+///
 /// # 为什么绝不访问网络
 ///
 /// 这个核对是**面板一打开就自动跑的、不需要任何点击**，而链接目标是完全
@@ -650,37 +675,83 @@ pub async fn link_launch_elevated(app: AppHandle, id: String) -> Result<(), Stri
 /// 拦截在 `launcher::probe` 里（见那里的说明），这里只负责批量。
 #[tauri::command]
 pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
-    let items: Vec<(String, String, LinkKind)> = {
+    let items: Vec<(String, String, LinkKind, bool)> = {
         let store = app.state::<Store>();
         let st = store.lock();
         st.links
             .iter()
-            .map(|l| (l.id.clone(), l.target.clone(), l.kind))
+            .map(|l| {
+                (
+                    l.id.clone(),
+                    l.target.clone(),
+                    l.kind,
+                    l.fingerprint.is_none(),
+                )
+            })
             .collect()
     };
 
     // 读文件属性可能撞上慢盘（几万条的目录、要转起来的机械盘），
     // 放到阻塞线程池上，不占异步运行时的线程
-    tauri::async_runtime::spawn_blocking(move || {
+    let probed = tauri::async_runtime::spawn_blocking(move || {
         items
             .into_iter()
-            .map(|(id, target, kind)| LinkStatus {
-                id,
-                target: launcher::probe(&target, kind),
+            .map(|(id, target, kind, wants_trace)| {
+                let target = launcher::probe(&target, kind);
+                // 只在「确实够着了、确实是本地的东西」时才记脚印
+                let trace = if wants_trace && target.state == launcher::TargetState::Ok {
+                    crate::trace::trace_of(&target.resolved)
+                } else {
+                    None
+                };
+                (LinkStatus { id, target }, trace)
             })
-            .collect()
+            .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    // 把这一轮新记下的身份写回数据文件。
+    //
+    // ⚠️ 只在**真有新增**时写。这个核对是"打开链接页就自动跑"的，
+    // 无条件落盘等于每切一次页签就重写一遍 links.json ——
+    // 而写盘走的是全局写锁，会把同一时刻的自动保存一起堵在后面。
+    let mut gained = false;
+    let store = app.state::<Store>();
+    {
+        let mut st = store.lock();
+        for (status, trace) in &probed {
+            let Some(trace) = trace else { continue };
+            if let Some(link) = st.links.iter_mut().find(|l| l.id == status.id) {
+                if link.fingerprint.is_none() {
+                    link.fingerprint = Some(trace.clone());
+                    gained = true;
+                }
+            }
+        }
+    }
+    if gained {
+        let _ = state::persist(&app, || store.lock().links.clone(), state::save_links);
+    }
+
+    probed.into_iter().map(|(status, _)| status).collect()
 }
 
-/// 在目标原来所在的文件夹附近找同名文件，作为「重新定位」的候选。
+/// 找「目标现在可能在哪」的候选：先按身份号，再按文件名。
 ///
-/// **不改任何数据**：同名不等于同一个东西，改不改由用户点。
-/// 候选里带上大小和修改时间 —— 只给路径的话用户没法在几个同名文件之间分辨，
-/// 点错一个链接就永久指向无关的文件，而且它照样"打开成功"、不会有人发现。
+/// **不改任何数据**：改不改由用户点。
 ///
-/// 搜不动（网络路径、目标没有文件名、原来那个文件夹也没了）就返回空表。
+/// # 为什么是两条路，而不是一条
+///
+/// - **身份号**（`(卷号, 文件索引号)`）是**确定的**：同名可以是巧合，
+///   身份号不会。文件改名、被拖进别的文件夹，这一对号都不变。
+/// - **文件名**是兜底：指纹是后加的功能，老链接根本没存过；
+///   跨盘移动、U 盘插拔之后身份号也会重来。这时候只能靠名字找，
+///   但结果必须标成「同名，不一定是它」—— 同名的旧版本、模板太多了。
+///
+/// 两条路的候选合在一张表里返回，各自带 `how` 说明凭什么，前端分开显示。
+/// 身份号命中的排前面，并且**同路径不重复列**：同一个文件被两条路都找到时，
+/// 用户看到两行一模一样的东西只会以为有两个。
 #[tauri::command]
 pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::SameNameCandidate> {
     let found = {
@@ -689,16 +760,48 @@ pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::Sa
         st.links
             .iter()
             .find(|l| l.id == id)
-            .map(|l| (l.target.clone(), l.kind))
+            .map(|l| (l.target.clone(), l.kind, l.fingerprint.clone()))
     };
-    let Some((target, kind)) = found else {
+    let Some((target, kind, fingerprint)) = found else {
         return Vec::new();
     };
 
     let want_dir = kind == LinkKind::Folder;
-    tauri::async_runtime::spawn_blocking(move || launcher::find_same_name(&target, want_dir))
-        .await
-        .unwrap_or_default()
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out: Vec<launcher::SameNameCandidate> = Vec::new();
+
+        // 一、按身份找。找到了就是它，不用再猜。
+        if let Some(trace) = fingerprint {
+            for hit in crate::trace::find_by_trace(&trace, &target, want_dir) {
+                out.push(launcher::SameNameCandidate {
+                    path: hit.path,
+                    bytes: hit.bytes,
+                    modified_ms: hit.modified_ms,
+                    how: match hit.how {
+                        crate::trace::TraceMatch::SameFile => launcher::CandidateMatch::SameFile,
+                        crate::trace::TraceMatch::SameContent => {
+                            launcher::CandidateMatch::SameContent
+                        }
+                    },
+                });
+            }
+        }
+
+        // 二、按名字补。已经按身份找到的路径不再重复。
+        for candidate in launcher::find_same_name(&target, want_dir) {
+            if out
+                .iter()
+                .any(|h| h.path.eq_ignore_ascii_case(&candidate.path))
+            {
+                continue;
+            }
+            out.push(candidate);
+        }
+
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// 提取某个路径的图标。

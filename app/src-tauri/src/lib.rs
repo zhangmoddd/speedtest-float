@@ -40,6 +40,7 @@ mod platform;
 mod scheduler;
 mod state;
 mod storage;
+mod trace;
 mod tray;
 mod windows;
 

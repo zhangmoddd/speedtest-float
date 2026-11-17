@@ -1,0 +1,2237 @@
+/**
+ * 快捷链接功能。
+ *
+ * 解决的问题：常用的软件、文件夹、文档、网址散落在桌面、开始菜单、浏览器收藏夹里，
+ * 每次找都要十几秒。这里把它们集中成一面「格子墙」，点一下就在外部打开。
+ *
+ * 核心设计决策（记录「为什么」，避免以后被改回去）：
+ *
+ * 1. **纯启动器，绝不把外部程序窗口嵌进面板**。
+ *    内嵌窗口是「体积膨胀 + 一堆兼容问题」的来源，用户已明确否决。
+ *    所以点击只做一件事：交给 Rust 侧的 `ShellExecuteW` 在外部打开。
+ *
+ * 2. **悬停小按钮，不做右键菜单**。
+ *    `main.tsx` 在 document 的捕获阶段全局 `preventDefault` 了 contextmenu
+ *    （为了掐掉 WebView2 自带的「刷新/检查」菜单），自绘菜单要额外和这套逻辑较劲；
+ *    而且这里只有「重命名 / 删除」两项，藏进右键反而更难发现。
+ *    悬停显示两个小按钮更直接，也不依赖那套被全局拦截的机制。
+ *
+ * 3. **图标缓存放在模块作用域，不放在组件里**。
+ *    提取图标要跨进程调 Rust + 走 Shell/GDI，一次几十毫秒。缓存跟着组件走的话，
+ *    每次切页签回来（组件卸载又重挂）都要重来一遍，用户会看到「图标晚一拍才冒出来」。
+ *    模块级 Map 在整个 WebView 生命周期内有效，切来切去都是瞬开。
+ *    代价是缓存不自动失效——但链接图标是装软件时定下来的，基本不会变。
+ *
+ * 4. **图标是装饰品，提取失败一律静默降级**成按 kind 区分的内置图标。
+ *    Rust 侧也约定「任何失败都返回 null，绝不 panic」，两边口径一致。
+ */
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import type { LucideIcon } from "lucide-react";
+import {
+  AppWindow,
+  Check,
+  Copy,
+  ExternalLink,
+  FileText,
+  Folder,
+  FolderInput,
+  FolderSearch,
+  Globe,
+  Link2,
+  MoreHorizontal,
+  Pencil,
+  RotateCw,
+  ShieldCheck,
+  Trash2,
+  TriangleAlert,
+  Wrench,
+  X,
+} from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+
+import {
+  api,
+  newId,
+  onStateChanged,
+  type Folder as FolderItem,
+  type IconData,
+  type LinkItem,
+  type LinkKind,
+  type LinkStatus,
+  type SameNameCandidate,
+} from "../../lib/api";
+import {
+  brokenReason,
+  formatBytes,
+  formatWhen,
+  healthBadge,
+  healthOf,
+  mergeStatuses,
+  parentOf,
+  pickerStartDir,
+  probeSignature,
+  pruneStatuses,
+  shortenFrom,
+  wantsDirectory,
+} from "../../lib/link-health";
+import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
+import {
+  isContextMenuOpen,
+  scrollIntoViewSoon,
+  useContextMenu,
+  useFocusHighlight,
+  type ContextMenuItem,
+} from "../../lib/context-menu";
+import { allPaths } from "../../lib/dialog";
+import { useEscapeToClose } from "../../lib/escape";
+import { previewOrder, useDragSort } from "../../lib/drag-drop";
+import { focusDomId, folderToEnter, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
+import { placeMenu } from "../../lib/menu-position";
+import { usePendingFocus } from "../../lib/navigation";
+import { useZoom } from "../../lib/zoom";
+import type { FeatureModule } from "../registry";
+
+import "./links.css";
+
+/** 定位高亮用的 DOM id 前缀。见 `lib/focus-highlight.ts` 的 `focusDomId`。 */
+const FOCUS_DOM_PREFIX = "link-focus";
+
+/** 认作「程序」的扩展名。与「添加程序」文件选择框里的过滤器保持一致。 */
+const PROGRAM_EXTENSIONS = new Set(["exe", "lnk", "bat", "cmd"]);
+
+/**
+ * 提示条里最多列几条失败原因。
+ *
+ * 多选之后一次可以失败几十上百条（数据目录不可写、磁盘满），
+ * 全部拼进同一个提示条会把它撑到几千像素高，而它是 `flex-shrink: 0`，
+ * 被挤没的是下面那面格子墙。剩下的只报数量。
+ */
+const MAX_LISTED_FAILURES = 3;
+
+/** kind → 内置图标。提取不到真实图标（或本来就是网址）时用它兜底。 */
+const KIND_ICON: Record<LinkKind, LucideIcon> = {
+  program: AppWindow,
+  folder: Folder,
+  file: FileText,
+  url: Globe,
+};
+
+// ===============================================================
+// 图标提取与缓存
+// ===============================================================
+
+/**
+ * target → PNG data URL。
+ *
+ * 刻意放在模块作用域而不是 useRef：见文件头「设计决策 3」。
+ */
+const iconCache = new Map<string, string>();
+
+/**
+ * 正在飞的提取请求。
+ *
+ * 网格一次渲染会挂出很多格子，重渲染时同一个 target 可能被请求多次；
+ * 用这张表把并发请求合并成一次，避免白白打一串 invoke 出去。
+ */
+const iconPending = new Map<string, Promise<string | null>>();
+
+/**
+ * 图标加载完的订阅者。
+ *
+ * # 为什么必须有订阅，不能只在挂载时读一次缓存
+ *
+ * 第一版是"挂载时读缓存 + effect 里 `loadIcon().then(setSrc)`"。它有一个
+ * **用户实测报出来的**漏洞：网格一次挂出几十个格子，提取是异步的，
+ * 而加载完成时那一格**可能已经卸载了** —— `alive` 闸门把这次结果丢掉
+ * （缓存却已经写进去了）。之后这个格子再也不会自己去读缓存，
+ * 它就永远停在通用占位图标上，**直到用户拖动它**
+ * （拖动会让它重新挂载，那时才从缓存里读到真图标）。
+ *
+ * 用户的原话就是：「图标怎么消失了？我移动图标才会恢复正常」。
+ *
+ * 换成"缓存 + 订阅"之后，任何一个图标加载完都会通知**所有还挂着的**格子
+ * 重新读一次。订阅是跟着组件挂载走的，所以"挂在屏幕上但拿不到更新"
+ * 这条路被彻底堵死了 —— 不管丢更新的原因是什么。
+ */
+const iconListeners = new Set<() => void>();
+
+/** 订阅图标缓存的变化（`useSyncExternalStore` 用）。 */
+function subscribeIcon(fn: () => void): () => void {
+  iconListeners.add(fn);
+  return () => {
+    iconListeners.delete(fn);
+  };
+}
+
+/** 读缓存。返回 `null` 表示还没加载出来（用内置图标兜底）。 */
+function readIcon(target: string): string | null {
+  return iconCache.get(target) ?? null;
+}
+
+/** 通知所有挂着的格子重新读缓存。 */
+function notifyIcons(): void {
+  for (const fn of iconListeners) fn();
+}
+
+/**
+ * 把 Rust 给的 RGBA 像素画成 PNG data URL。
+ *
+ * Rust 侧刻意不引 PNG 编码依赖（本项目对发布体积敏感），
+ * 编码这件事交给浏览器 canvas 做最划算。
+ */
+function encodeIcon(icon: IconData): string | null {
+  try {
+    const raw = atob(icon.rgbaBase64);
+    const need = icon.width * icon.height * 4;
+    // 长度对不上就别画了：画出来是花屏，不如老实用内置图标
+    if (icon.width <= 0 || icon.height <= 0 || raw.length < need) return null;
+
+    const rgba = new Uint8ClampedArray(need);
+    for (let i = 0; i < need; i += 1) rgba[i] = raw.charCodeAt(i);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = icon.width;
+    canvas.height = icon.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.putImageData(new ImageData(rgba, icon.width, icon.height), 0, 0);
+    return canvas.toDataURL("image/png");
+  } catch {
+    // atob 遇到非法 base64 会抛，canvas 也可能因为内存不足失败。
+    // 图标只是装饰，任何失败都退回内置图标，不该让整个面板崩掉。
+    return null;
+  }
+}
+
+/** 取图标（带缓存 + 并发去重）。失败返回 null，由调用方用内置图标兜底。 */
+function loadIcon(target: string): Promise<string | null> {
+  const cached = iconCache.get(target);
+  if (cached) return Promise.resolve(cached);
+
+  const pending = iconPending.get(target);
+  if (pending) return pending;
+
+  const task = api
+    .linkIcon(target)
+    .then((icon) => {
+      const url = icon ? encodeIcon(icon) : null;
+      if (url) {
+        iconCache.set(target, url);
+        // 广播：**所有**挂着的格子都重读一次，而不是只通知发起这次请求的那一个。
+        // 发起者可能已经卸载了（见 iconListeners 的说明）。
+        notifyIcons();
+      }
+      return url;
+    })
+    // Rust 侧已经约定失败返回 null，这里再兜一层序列化 / 命令名之类的意外
+    .catch(() => null)
+    .finally(() => {
+      iconPending.delete(target);
+    });
+
+  iconPending.set(target, task);
+  return task;
+}
+
+/** 格子里的图标：优先用提取到的真实图标，拿不到就用按类型区分的内置图标。 */
+function LinkGlyph({ link }: { link: LinkItem }) {
+  /**
+   * 直接**订阅缓存**，而不是"挂载时读一次 + effect 里 setState"。
+   *
+   * 后者丢过一次更新就再也补不回来（用户实测：「图标怎么消失了？
+   * 我移动图标才会恢复正常」）—— 详见 `iconListeners` 的说明。
+   */
+  const cached = useSyncExternalStore(subscribeIcon, () => readIcon(link.target));
+
+  useEffect(() => {
+    // 网址没有可提取的图标（对 http:// 调 SHGetFileInfoW 只会拿到浏览器或默认图标），
+    // 直接跳过这次跨进程调用，用 Globe 表达「这是个网址」更贴切。
+    if (link.kind === "url") return;
+    if (iconCache.has(link.target)) return;
+
+    // 结果走缓存 + 广播，这里不需要（也不该）自己 setState：
+    // 本组件可能在这条 promise 落地之前就卸载了。
+    void loadIcon(link.target);
+  }, [link.target, link.kind]);
+
+  if (cached) {
+    return <img className="links__glyph" src={cached} alt="" draggable={false} />;
+  }
+
+  const Fallback = KIND_ICON[link.kind];
+  return (
+    <Fallback className="links__glyph links__glyph--builtin" size={26} strokeWidth={1.6} />
+  );
+}
+
+// ===============================================================
+// 小工具
+// ===============================================================
+
+/** 把 invoke 抛出来的东西转成能显示的文本。Rust 侧 `Err(String)` 到前端就是纯字符串。 */
+function errorText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/** 路径最后一段去掉扩展名。加链接时的默认名字，绝大多数情况够用了。 */
+function baseName(target: string): string {
+  // 同时按两种分隔符切：拖进来的可能是 `C:\a\b.exe`，网址里则是 `/`
+  const parts = target.split(/[\\/]/).filter(Boolean);
+  const last = parts[parts.length - 1] ?? target;
+  // 只对最后一段去扩展名，避免把 `a.b\c` 这种目录名误伤
+  const dot = last.lastIndexOf(".");
+  return dot > 0 ? last.slice(0, dot) : last;
+}
+
+/** 从网址取一个可读的默认名字（主机名）。 */
+function urlName(url: string): string {
+  try {
+    return new URL(url).hostname || url;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * 补全用户输入的网址。
+ *
+ * 用户往往只打 `example.com`，而 `ShellExecuteW` 对没有协议的字符串会当成**文件路径**
+ * 去找（然后报「找不到文件」），所以必须补上协议。
+ */
+function normalizeUrl(input: string): string {
+  const text = input.trim();
+  if (!text) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return text;
+
+  // `mailto:` / `steam:` / `ms-settings:` 这类自定义协议也是合法的启动目标，别硬塞 https。
+  // 判据是冒号前不能有点号：`example.com:8080` 里点号在冒号前，那是主机名加端口，不是协议。
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(text);
+  if (scheme && !scheme[1].includes(".")) return text;
+
+  return `https://${text}`;
+}
+
+/** 从路径猜种类（拖拽用）。 */
+function kindOfPath(path: string): LinkKind {
+  const name = path.split(/[\\/]/).pop() ?? path;
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+  if (PROGRAM_EXTENSIONS.has(ext)) return "program";
+
+  // 前端拿不到「这是不是目录」：Tauri 2 的拖放事件只给路径字符串，不查文件系统就没有目录信息。
+  // 这里按约定简化——扩展名对不上就当普通文件。
+  // 取舍代价很小：kind 只决定「用哪个默认图标」，不影响打开行为
+  // （ShellExecuteW 对文件夹和文档走的是同一套默认关联）。
+  return "file";
+}
+
+/** 与 Rust 侧 `links_list` 保持一致的排序：order 小的在前，同 order 按创建时间。 */
+function sortLinks(list: LinkItem[]): LinkItem[] {
+  return [...list].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+}
+
+/**
+ * 按 id 顺序重排一批条目。
+ *
+ * `orderById` 和 `previewOrder`（在 `lib/drag-drop.ts`）是一对：
+ * 前者只负责"按给定 id 顺序取出来"，后者只负责"算出新顺序"。
+ * 分开是因为 `previewOrder` 是纯字符串运算、可以单测，
+ * 而这里要跟具体的数据类型打交道。
+ *
+ * id 对不上的（数据刚变过、被删了）直接跳过，不会渲染出一个空壳。
+ */
+function orderById<T extends { id: string }>(items: T[], ids: string[]): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  return ids
+    .map((id) => byId.get(id))
+    .filter((item): item is T => item !== undefined);
+}
+
+/** 一次添加请求。拖拽可以一次进来好几个文件，所以按批处理。 */
+interface Draft {
+  target: string;
+  kind: LinkKind;
+  /** 用户手动起的名字；留空则按路径/网址推导。 */
+  name?: string;
+}
+
+/** 一条提示。成功提示会自动消失，错误提示留着让用户读完。 */
+interface Notice {
+  kind: "ok" | "error";
+  text: string;
+}
+
+// ===============================================================
+// 主界面
+// ===============================================================
+
+export function LinksPanel() {
+  const [links, setLinks] = useState<LinkItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  /** 读盘失败。和操作提示分开：它表示「数据都没拿到」，性质不同。 */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  /** 正在启动的那一条。用来压暗格子，避免用户以为「点了没反应」而连点。 */
+  const [busyId, setBusyId] = useState<string | null>(null);
+  /**
+   * 正在就地编辑的那条链接，以及它的草稿。
+   *
+   * 三个字段一起编辑（名字 / 目标 / 启动参数）：原来分成"重命名"和"启动参数"
+   * 两个独立的小编辑器，而**目标路径根本没有入口** —— 路径写错只能删了重加。
+   * 别的页签的铅笔都是"打开完整编辑面"，这里也统一成一样。
+   */
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState({ name: "", target: "", args: "" });
+  /** 网址是「名称 + 网址」两个字段，用内联表单而不是 window.prompt：
+   *  prompt 在 WebView2 里是浏览器样式的弹框，和面板风格完全不搭，也无法校验。 */
+  const [urlOpen, setUrlOpen] = useState(false);
+  const [urlForm, setUrlForm] = useState({ name: "", url: "" });
+  /** 拖拽能力是否可用。不可用时要把界面上的拖拽提示撤掉，免得用户以为坏了。 */
+  const [dragAvailable, setDragAvailable] = useState(true);
+  /** 拖拽悬停中，用来高亮整块区域。 */
+  const [dragActive, setDragActive] = useState(false);
+  /** 文件夹弹层。`target` 为 `null` 表示新建，否则是改名/改备注。 */
+  const [folderEditor, setFolderEditor] = useState<{
+    open: boolean;
+    target: FolderItem | null;
+  }>({ open: false, target: null });
+  /** 正在「移动到…」的那条链接。 */
+  const [movingId, setMovingId] = useState<string | null>(null);
+  /**
+   * 右上角「⋯」菜单：是哪一条、以及那个按钮的矩形（用来把菜单贴着它展开）。
+   *
+   * 存矩形而不是存"上/下"两个坐标：面板宽度固定 420，但格子可能在任意一行，
+   * 菜单要按按钮的实际位置决定往上还是往下翻。
+   */
+  const [menu, setMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
+
+  /**
+   * 正在「修好它」的那条链接。
+   *
+   * 确认打不开的链接**点下去不再去撞一次必然的失败**，而是直接开这个面板：
+   * 里面有原因、有「重新定位」、有「附近找到的同名文件」、有「删除」。
+   * 原来用户唯一能得到的反馈是一句错误提示，然后就没有下一步了。
+   */
+  const [repairId, setRepairId] = useState<string | null>(null);
+  /** 修复面板里找同名文件的结果。 */
+  const [sameName, setSameName] = useState<{
+    loading: boolean;
+    items: SameNameCandidate[];
+  }>({ loading: false, items: [] });
+  /** 修复面板里「重新检查」正在跑。 */
+  const [rechecking, setRechecking] = useState(false);
+  /**
+   * 当前面板属于哪一条、以及是第几轮（ref 版）。
+   *
+   * 找同名文件是异步的，回来时用户可能已经关了面板、或者换了一条 ——
+   * 没有这个闸门就会把上一条的结果贴到下一条上。
+   *
+   * 用"令牌"而不是只比 id：**同一条链接关了又开**时 id 是一样的，
+   * 只比 id 会让第一轮的旧结果通过检查，把第二轮的加载态提前结束。
+   * 每一轮 `openRepair` 都换一个新令牌，旧的自然作废。
+   */
+  const repairRef = useRef<{ id: string; token: number } | null>(null);
+  const repairToken = useRef(0);
+
+  /**
+   * 这次编辑是否已被取消（按了 Esc）。
+   *
+   * 取消会让输入框卸载、紧接着触发一次 blur，而 blur 的语义是「保存」。
+   * 没有这个闸门的话，「Esc 取消」会被随后的 blur 又存回去。
+   */
+  const editAborted = useRef(false);
+  /** 正在编辑的 id（ref 版）。Enter 提交后紧跟的 blur 要靠它判断「已经结束了，别再存一次」。 */
+  const editRef = useRef<string | null>(null);
+
+  // ---- 数据 ----
+
+  const reload = useCallback(async () => {
+    try {
+      const list = await api.linksList();
+      setLinks(sortLinks(list));
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorText(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  /**
+   * 订阅后端的「数据变了」广播。
+   *
+   * # 为什么链接页必须有这个（RV2 报的 F1）
+   *
+   * `import_all` 会**整份替换** `links.json`（`backup.rs`），
+   * 而本页原来**只在挂载时读一次盘** —— 于是"设置页导入备份之后，
+   * 别的窗口里的链接页还显示导入前那一份"，而且它下一次保存会把
+   * 刚恢复的备份**整份盖回旧值**（`lib/store.ts` 的注释里把这条
+   * 当成已知风险写着，却漏了链接页这一处订阅）。
+   *
+   * # 为什么 `folders` 不用在这里处理
+   *
+   * 文件夹有它自己的订阅（`lib/folders-ui.tsx:160-180`，按
+   * `what.includes("folders")` 重拉）。两处各管各的数据，不重复拉。
+   *
+   * 照抄备忘 / 计时器那两处的卸载退订：订阅是异步的，回调到达时
+   * 组件可能已经卸载，那就立刻退订，否则监听器会一直挂在后端上。
+   */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+
+    void onStateChanged((what) => {
+      if (disposed || !what.includes("links")) return;
+      void reload();
+    })
+      .then((off) => {
+        if (disposed) off();
+        else unlisten = off;
+      })
+      .catch(() => {
+        /* 订阅不上只影响跨窗口同步，不该影响界面 */
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [reload]);
+
+  // ---- 目标核对（「这条链接现在还能不能用」）----
+
+  /**
+   * 每条链接的目标核对结果。
+   *
+   * 表里**没有**的 id 一律按「没确认」处理，界面不会因此打上失效标记 ——
+   * 核不出来和确定坏了是两件事，混在一起就会冤枉一批好好的链接。
+   */
+  const [statuses, setStatuses] = useState<Map<string, LinkStatus>>(() => new Map());
+
+  /**
+   * 正在飞的核对请求的序号。
+   *
+   * 面板会被频繁唤出（每次重新获得焦点都可能触发一次核对），两次核对叠在
+   * 一起时**后发的结果才是对的**。没有这个闸门的话，先发的那次晚回来会把
+   * 新结果盖掉，表现是"标记闪一下又变回去"。
+   */
+  const probeSeq = useRef(0);
+  /** 上次核对是什么时候（节流用）。 */
+  const probeAt = useRef(0);
+
+  const probeAll = useCallback(async (): Promise<LinkStatus[] | null> => {
+    const seq = ++probeSeq.current;
+    probeAt.current = Date.now();
+    try {
+      const list = await api.linksProbe();
+      if (seq === probeSeq.current) {
+        setStatuses((prev) => mergeStatuses(prev, list));
+      }
+      return list;
+    } catch {
+      /**
+       * 核对失败返回 `null`，而不是空数组。
+       *
+       * 两者在调用方那里意思完全不同：空数组是"核对跑成功了，一条都没有"，
+       * `null` 是"核对根本没跑起来"。混成一个的话，「重新检查」会把
+       * "检查失败"说成"还是没查到这条链接的状态"，用户以为链接有问题，
+       * 其实是这次检查没成。
+       *
+       * 表里保留上一次的结果（那仍然是我们知道的最后一件事），
+       * 不打标记、不拦点击 —— 这类失败少的是一个提示，不是功能坏了。
+       */
+      return null;
+    }
+  }, []);
+
+  /**
+   * 什么时候重新核对。
+   *
+   * 用 `probeSignature`（id + 类型 + 目标）而不是 `links` 数组本身：
+   * 数组每次 `reload()` 都是新对象，直接当依赖会让核对跟着每一次渲染跑。
+   *
+   * 指纹**与数组顺序无关**（`probeSignature` 内部先按 id 排序），
+   * 所以拖动排序不会白跑一遍逐条 `stat` —— 这一点是实测抓出来的：
+   * 原来指纹是直接按数组顺序拼的，而拖动排序产出的正是"内容一样、
+   * 顺序不同"的新数组，于是每拖一次都要重核一遍、所有格子重渲染一次。
+   */
+  const healthSignature = useMemo(() => probeSignature(links), [links]);
+
+  useEffect(() => {
+    if (loading) return;
+    void probeAll();
+  }, [loading, healthSignature, probeAll]);
+
+  /**
+   * 窗口重新获得焦点时再核一次。
+   *
+   * 用户很可能刚在资源管理器里把文件删了/挪了，回来一点就报错 ——
+   * 那正是要消灭的体验。核对本身很便宜（读一次文件属性），
+   * 但面板会被频繁唤出，所以节流到 10 秒。
+   */
+  useEffect(() => {
+    const onFocus = () => {
+      if (Date.now() - probeAt.current < 10_000) return;
+      void probeAll();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [probeAll]);
+
+  /** 链接删掉之后，它的核对结果也要跟着丢，否则这张表只会一直涨。 */
+  useEffect(() => {
+    setStatuses((prev) => {
+      const kept = pruneStatuses(prev, links);
+      // 没变化就返回原对象：否则每次 links 变一下都要多渲染一轮
+      return kept.size === prev.size ? prev : kept;
+    });
+  }, [links]);
+
+  /** 这条链接现在是不是"确定打不开"。没核对过的返回 `false`（不冤枉）。 */
+  const isBroken = useCallback(
+    (link: LinkItem) => {
+      const status = statuses.get(link.id);
+      return status ? healthOf(status.state) === "broken" : false;
+    },
+    [statuses],
+  );
+
+  // ---- 文件夹与缩放 ----
+
+  /**
+   * 把本页签在 `from` 文件夹下的链接改挂到 `to`。
+   *
+   * 只在删除文件夹时被调用。条目为什么由前端搬而不是 Rust 一起做，
+   * 见 `lib/folders-ui.tsx` 与 `commands::folder_remove` 的说明。
+   */
+  const moveItems = useCallback(
+    async (from: string, to: string | null) => {
+      const updated = links
+        .filter((l) => l.folderId === from)
+        .map((l) => ({ ...l, folderId: to }));
+      for (const link of updated) await api.linkSave(link);
+      if (updated.length === 0) return;
+      setLinks((prev) => prev.map((l) => updated.find((u) => u.id === l.id) ?? l));
+    },
+    [links],
+  );
+
+  const folders = useFolders("links", { moveItems });
+  const zoom = useZoom("links");
+
+  /** 右键菜单（和右上角「⋯」菜单是两套，互不干扰）。 */
+  const ctx = useContextMenu();
+  /** 定位高亮：短暂 + 一交互就灭，见 lib/context-menu.tsx 的 useFocusHighlight。 */
+  const focus = useFocusHighlight();
+  const { target: pending, done: focusDone } = usePendingFocus("links");
+
+  /**
+   * 当前文件夹里该显示的链接。
+   *
+   * `folderId` 指向一个**不存在**的文件夹时按顶层处理：删文件夹中途失败、
+   * 或用户手改过 JSON 都会留下这种条目。不兜的话它们会从界面上消失，
+   * 而数据其实还在。
+   */
+  const visible = useMemo(() => {
+    const known = new Set(folders.mine.map((f) => f.id));
+    return links.filter((l) => {
+      const folder = l.folderId && known.has(l.folderId) ? l.folderId : null;
+      return folder === folders.currentId;
+    });
+  }, [links, folders.mine, folders.currentId]);
+
+  /** 每个文件夹里有几条链接，显示在文件夹卡片上（只算直接子级）。 */
+  const folderCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const l of links) {
+      if (l.folderId) counts[l.folderId] = (counts[l.folderId] ?? 0) + 1;
+    }
+    return counts;
+  }, [links]);
+
+  /**
+   * 把 `draggedId` 插到 `targetId` 前面或后面，并给这一层重新编号。
+   *
+   * `order` 只在**同一层内**比较，所以直接重排成 `0..n-1` 就行——
+   * 不同文件夹之间即使 order 撞车也不会同时显示，看不出问题。
+   */
+  const reorderLinks = async (draggedId: string, targetId: string, before: boolean) => {
+    if (draggedId === targetId) return;
+
+    const list = [...visible];
+    const from = list.findIndex((l) => l.id === draggedId);
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    const at = list.findIndex((l) => l.id === targetId);
+    if (at < 0) return;
+    list.splice(before ? at : at + 1, 0, moved);
+
+    // 只写 order 真的变了的那些：整层重写一遍会产生一堆无意义的磁盘写入
+    const changed = list
+      .map((link, order) => ({ link, order }))
+      .filter(({ link, order }) => link.order !== order);
+    if (changed.length === 0) return;
+
+    try {
+      for (const { link, order } of changed) await api.linkSave({ ...link, order });
+      /**
+       * ⚠️ 必须**重新排序数组**，不能只改每条 link 的 `order` 字段。
+       *
+       * 这里原来只写了 `prev.map(...)`（原地替换那几条的 order），而 `visible`
+       * 是直接 `filter(links)` —— 数组顺序没变，界面上的顺序也就没变。
+       * 表现是：拖动时空位会动（那是渲染时的预览顺序），一松手格子**弹回原位**，
+       * 看起来就是"拖了没反应"。要等切页签/重启重新 `reload()` 才会看到新顺序。
+       *
+       * 用 `sortLinks` 而不是手动拼：它和 Rust 侧 `links_list` 的排序规则
+       * （order 小的在前，同 order 按 createdAt）是同一套，不会出现
+       * "界面一个顺序、重启后另一个顺序"。
+       */
+      setLinks((prev) =>
+        sortLinks(
+          prev.map((l) => {
+            const hit = changed.find((c) => c.link.id === l.id);
+            return hit ? { ...l, order: hit.order } : l;
+          }),
+        ),
+      );
+      setNotice({ kind: "ok", text: "已重新排序" });
+    } catch (err) {
+      setNotice({ kind: "error", text: `排序失败：${errorText(err)}` });
+    }
+  };
+
+  /**
+   * 拖拽：条目之间排序，或者把条目放进文件夹；文件夹自己也能同级排序。
+   *
+   * 链接页是网格，所以"插到前面还是后面"看**横轴**（见 `useDragSort` 的 axis）。
+   * 用的是指针事件自绘，不是 HTML5 拖放——原因见 `lib/drag-drop.ts`。
+   */
+  const drag = useDragSort({
+    axis: "horizontal",
+    onDrop: (draggedId, draggedKind, spot) => {
+      if (draggedKind === "folder") {
+        // 拖文件夹时候选全是 item 类型（见 useDragSort 的 collect），
+        // 落点就是"插到那个文件夹的前面/后面"
+        if (spot.kind === "item") void folders.reorder(draggedId, spot.id, spot.before);
+        return;
+      }
+      if (spot.kind === "folder") {
+        const link = links.find((l) => l.id === draggedId);
+        if (link) void moveTo(link, spot.id);
+        return;
+      }
+      void reorderLinks(draggedId, spot.id, spot.before);
+    },
+    // 只排除那一排悬停操作按钮和就地编辑框。
+    // 页面这一层只是**追加**排除项，真正兜底的是 drag-drop 里的控件底线
+    // （见 CONTROL_SELECTOR）：格子本体是个按钮、但显式标了拖拽抓手，
+    // 所以它仍然能拖；「⋯」和输入框没有抓手，老老实实是控件。
+    ignoreSelector: ".links__more, input",
+  });
+
+  // 成功提示看一眼就够，2.4 秒自动消失；
+  // 错误提示不自动消失——Rust 返回的「找不到文件，可能已被移动或删除」需要时间读完。
+  useEffect(() => {
+    if (notice?.kind !== "ok") return;
+    const t = window.setTimeout(() => setNotice(null), 2400);
+    return () => window.clearTimeout(t);
+  }, [notice]);
+
+  /** 落盘并同步界面。所有写操作都走这里，保证「界面看到的」和「磁盘上存的」一致。 */
+  const persist = useCallback(async (link: LinkItem, okText: string) => {
+    try {
+      await api.linkSave(link);
+      setLinks((prev) => {
+        const exists = prev.some((l) => l.id === link.id);
+        return exists ? prev.map((l) => (l.id === link.id ? link : l)) : [...prev, link];
+      });
+      setNotice({ kind: "ok", text: okText });
+    } catch (err) {
+      setNotice({ kind: "error", text: `保存失败：${errorText(err)}` });
+    }
+  }, []);
+
+  /**
+   * 批量新增。
+   *
+   * 拖拽一次可能丢进来好几个文件，必须一次性算 order：
+   * 逐个算的话，后面的调用读到的还是旧的 links（React 状态要等重渲染才更新），
+   * 会拿到同一个 order，最后只能按 createdAt 排——而它们的时间戳可能是同一毫秒，顺序就乱了。
+   */
+  const addMany = useCallback(
+    async (items: Draft[]) => {
+      if (items.length === 0) return;
+
+      const base = links.reduce((max, l) => Math.max(max, l.order), -1) + 1;
+      const now = Date.now();
+      const drafts: LinkItem[] = items.map((item, i) => ({
+        id: newId(),
+        // 名字默认取路径最后一段（去掉扩展名）或网址主机名，用户手动填了就用用户的
+        name:
+          item.name?.trim() ||
+          (item.kind === "url" ? urlName(item.target) : baseName(item.target)),
+        target: item.target,
+        args: null,
+        kind: item.kind,
+        // 新加的链接落在**当前所在的那个文件夹**里。
+        // 这是下钻浏览的自然语义：进去了再添加，东西就该在那一层。
+        folderId: folders.currentId,
+        // 同一次批量里依次 +1，保证顺序稳定（时间戳可能同毫秒，排不出先后）
+        order: base + i,
+        createdAt: now + i,
+      }));
+
+      const saved: LinkItem[] = [];
+      const failures: string[] = [];
+      for (const draft of drafts) {
+        try {
+          await api.linkSave(draft);
+          saved.push(draft);
+        } catch (err) {
+          failures.push(`「${draft.name}」${errorText(err)}`);
+        }
+      }
+
+      if (saved.length > 0) {
+        setLinks((prev) => sortLinks([...prev, ...saved]));
+      }
+
+      if (failures.length > 0) {
+        // 只列前几条。多选之后一次可以失败几十上百条，全拼进提示条会把它撑成
+        // 几千像素高 —— 而提示条是 `flex-shrink: 0`，被挤没的正是下面那面格子墙。
+        const shown = failures.slice(0, MAX_LISTED_FAILURES);
+        const more = failures.length - shown.length;
+        setNotice({
+          kind: "error",
+          text: `有 ${failures.length} 条没存上：${shown.join("；")}${more > 0 ? `；…… 还有 ${more} 条` : ""}`,
+        });
+      } else {
+        setNotice({
+          kind: "ok",
+          text: saved.length === 1 ? `已添加「${saved[0].name}」` : `已添加 ${saved.length} 个链接`,
+        });
+      }
+    },
+    [links, folders.currentId],
+  );
+
+  // ---- 拖拽添加 ----
+
+  /**
+   * 拖进来的路径：先让 Rust 判类型，再加。
+   *
+   * 原来只按扩展名猜，于是拖进来的**文件夹一律被当成「文件」**，图标不对
+   * （README 的已知限制里记着这条）。判类型要读文件系统属性，只有 Rust 能做。
+   */
+  const addPaths = useCallback(
+    async (paths: string[]) => {
+      if (paths.length === 0) return;
+      try {
+        const kinds = await api.classifyPaths(paths);
+        await addMany(paths.map((p, i) => ({ target: p, kind: kinds[i] ?? "file" })));
+      } catch {
+        // 判类型失败不该拦住添加：退回按扩展名猜，行为和以前完全一样
+        await addMany(paths.map((p) => ({ target: p, kind: kindOfPath(p) })));
+      }
+    },
+    [addMany],
+  );
+
+  /**
+   * 拖放处理器放在 ref 里，只让「注册监听」的 effect 依赖空数组。
+   *
+   * 处理器需要用到最新的 links（算 order）。如果把它写进 effect 的依赖，
+   * 每次数据变化都要重新订阅一次，中间那几十毫秒里拖进来的文件会被丢掉。
+   */
+  const dropRef = useRef<(paths: string[]) => void>(() => {});
+  // 每次渲染后刷新 ref，处理器永远是最新那份闭包
+  useEffect(() => {
+    dropRef.current = (paths: string[]) => {
+      void addPaths(paths);
+    };
+  });
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let disposed = false;
+
+    void (async () => {
+      try {
+        // 用 Tauri 的拖放事件，不用 HTML5 的 drop：
+        // 后者在 Tauri 里拿不到真实文件路径（`dataTransfer.files` 里是空壳对象），
+        // 拿不到路径这个功能就没法做。
+        const stop = await getCurrentWebview().onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === "enter" || payload.type === "over") {
+            setDragActive(true);
+          } else if (payload.type === "drop") {
+            setDragActive(false);
+            dropRef.current(payload.paths);
+          } else {
+            // leave：拖到一半又拖出去了
+            setDragActive(false);
+          }
+        });
+
+        // 竞态：await 期间组件可能已经卸载了，那就当场退订，别把监听漏在外面
+        if (disposed) stop();
+        else unlisten = stop;
+      } catch (err) {
+        // 拿不到拖放能力（旧版 Tauri、或配置里关了 dragDrop）就退化成「只能点按钮加」。
+        // 界面上的拖拽提示必须撤掉：留着提示但拖进来没反应，比没有提示更糟。
+        setDragAvailable(false);
+        console.warn("文件拖放不可用，已退化为按钮添加", err);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      // 组件卸载必须退订，否则面板反复开关会累积一堆监听器
+      unlisten?.();
+    };
+  }, []);
+
+  // ---- 文件选择框 ----
+
+  /**
+   * 统一兜住选择框本身的失败。
+   *
+   * 插件命令是要过 Tauri 权限表的，权限没配时 `open()` 会直接 reject。
+   * 不 catch 的话用户点「添加程序」会毫无反应，那是最难排查的一种故障。
+   */
+  const runPicker = async (run: () => Promise<void>) => {
+    try {
+      await run();
+    } catch (err) {
+      setNotice({ kind: "error", text: `打开文件选择框失败：${errorText(err)}` });
+    }
+  };
+
+  const addProgram = () =>
+    runPicker(async () => {
+      const picked = allPaths(
+        await open({
+          multiple: true,
+          directory: false,
+          filters: [{ name: "程序", extensions: ["exe", "lnk", "bat", "cmd"] }],
+        }),
+      );
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "program" })));
+    });
+
+  const addFolder = () =>
+    runPicker(async () => {
+      const picked = allPaths(await open({ directory: true, multiple: true }));
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "folder" })));
+    });
+
+  const addFile = () =>
+    runPicker(async () => {
+      const picked = allPaths(await open({ multiple: true }));
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "file" })));
+    });
+
+  const submitUrl = async () => {
+    const target = normalizeUrl(urlForm.url);
+    if (!target) return;
+    await addMany([{ target, kind: "url", name: urlForm.name }]);
+    setUrlForm({ name: "", url: "" });
+    setUrlOpen(false);
+  };
+
+  // ---- 对单条链接的操作 ----
+
+  /**
+   * 打开「修好它」面板。
+   *
+   * 打开的同时就去附近找同名文件 —— 用户挪文件的习惯很集中
+   * （把桌面上的脚本收进「临时」、把项目挪进 `archive`），
+   * 这一步能直接把"自己去翻文件夹"省掉。
+   */
+  const openRepair = async (link: LinkItem) => {
+    const token = ++repairToken.current;
+    repairRef.current = { id: link.id, token };
+    setRepairId(link.id);
+    setSameName({ loading: true, items: [] });
+
+    let items: SameNameCandidate[] = [];
+    try {
+      items = await api.linkFindSameName(link.id);
+    } catch {
+      items = [];
+    }
+
+    // 这一轮已经不作数了（用户关了面板、换了一条、或者又开了一次同一条）：
+    // 晚到的结果不能贴上去
+    if (repairRef.current?.token !== token) return;
+    setSameName({ loading: false, items });
+  };
+
+  const closeRepair = () => {
+    // 只作废，不重置令牌计数：下一次 openRepair 拿到的一定是新令牌
+    repairRef.current = null;
+    setRepairId(null);
+    setSameName({ loading: false, items: [] });
+  };
+
+  const launch = async (link: LinkItem, force = false) => {
+    /**
+     * 已经确认打不开的，别去撞一次必然的失败。
+     *
+     * 这不是"拦住用户"：面板里有「仍然尝试打开」，也有「重新检查」。
+     * 直接开修复面板是因为**用户点这一下的目的是"用它"**，
+     * 而一句"找不到文件"给不出下一步。
+     *
+     * `force` 用在"重新检查之后确认已经好了"这条路上 —— 那时状态还是旧的闭包值。
+     */
+    if (!force && isBroken(link)) {
+      void openRepair(link);
+      return;
+    }
+
+    setBusyId(link.id);
+    try {
+      await api.linkLaunch(link.id);
+      // 打开成功就没什么好说的：面板马上就失焦了，再留个绿条反而碍事
+      setNotice(null);
+    } catch (err) {
+      // Rust 侧给的就是中文人话（「打开「xxx」失败：找不到文件，可能已被移动或删除」），
+      // 直接用，不要再包一层「操作失败」把原因挤掉
+      setNotice({ kind: "error", text: errorText(err) });
+      /**
+       * 启动失败说明状态已经变了（刚被删、刚被拔、刚断网）。
+       * 立刻重核一次，让格子上出现标记 —— 否则用户得再点一次才发现，
+       * 而且下次点还是同一句错误。
+       */
+      void probeAll();
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /**
+   * 以管理员身份运行。
+   *
+   * 只在用户显式选的时候做。自动提权等于**替用户按下了 UAC 确认框**，
+   * 而这个应用的定位是启动器：用户点一个格子时预期的是"打开它"，
+   * 不是"给这个东西管理员权限"。
+   *
+   * 已经确认打不开的同样直接开修复面板：否则用户会先被打扰一次 UAC，
+   * 再收到一句"找不到文件" —— 和左键的行为分叉，而且两步都是白费的。
+   */
+  const elevate = async (link: LinkItem) => {
+    if (isBroken(link)) {
+      void openRepair(link);
+      return;
+    }
+
+    setBusyId(link.id);
+    try {
+      await api.linkLaunchElevated(link.id);
+      setNotice(null);
+    } catch (err) {
+      setNotice({ kind: "error", text: errorText(err) });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /**
+   * 给一条链接换目标：重新判一次类型再落盘。
+   *
+   * 「重新定位」和「用附近找到的同名文件」走的是同一条路 ——
+   * 两条路各写一遍的话，总有一条会忘了重判类型，图标和"怎么启动"就跟实际对不上。
+   */
+  const applyTarget = async (link: LinkItem, target: string, okText: string) => {
+    let kind = link.kind;
+    try {
+      kind = (await api.classifyPaths([target]))[0] ?? link.kind;
+    } catch {
+      // 判不出来就保留原类型：图标不准总比"改不了"好
+    }
+    closeRepair();
+    await persist({ ...link, target, kind }, okText);
+  };
+
+  /** 重新定位：让用户挑一个新目标，从坏掉的那个位置开始翻。 */
+  const relocate = async (link: LinkItem, status: LinkStatus) => {
+    const picked = allPaths(
+      await open({
+        directory: wantsDirectory(link.kind),
+        multiple: false,
+        defaultPath: pickerStartDir(status),
+      }),
+    );
+    const target = picked[0];
+    if (!target) return;
+    await applyTarget(link, target, `已重新定位到「${baseName(target)}」`);
+  };
+
+  /**
+   * 重新检查一条链接，好了就直接打开它。
+   *
+   * 点「重新检查」的意图就是"再试一次"，所以状态恢复时不该再让用户点第三下。
+   */
+  const recheck = async (link: LinkItem) => {
+    setRechecking(true);
+    const list = await probeAll();
+    setRechecking(false);
+
+    // `null` = 核对根本没跑起来（不是"没查到这一条"）。这两件事要分开说：
+    // 前者是浮光这边的问题，后者才可能是链接的问题。
+    if (list === null) {
+      setNotice({ kind: "error", text: "重新核对没跑起来，稍后再试（链接本身不一定有问题）" });
+      return;
+    }
+
+    const fresh = list.find((s) => s.id === link.id);
+    if (!fresh || healthOf(fresh.state) === "broken") {
+      setNotice({
+        kind: "error",
+        text: fresh ? brokenReason(fresh, link.name) : "这次核对里没有这一条，稍后再试",
+      });
+      return;
+    }
+    closeRepair();
+    void launch(link, true);
+  };
+
+  const remove = async (link: LinkItem) => {
+    try {
+      await api.linkRemove(link.id);
+      setLinks((prev) => prev.filter((l) => l.id !== link.id));
+      // 图标缓存不删：删掉再加回来是很常见的操作（比如路径记错了），留着能秒出图标
+      setNotice({ kind: "ok", text: `已删除「${link.name}」` });
+    } catch (err) {
+      setNotice({ kind: "error", text: `删除失败：${errorText(err)}` });
+    }
+  };
+
+  /**
+   * 把一条链接移到别的文件夹。`null` 表示移到顶层。
+   *
+   * 有了这个，「分类」才是完整的：不然新链接只能落在建它时所在的文件夹里，
+   * 想把已有的东西归类只能删了重加。
+   */
+  const moveTo = async (link: LinkItem, folderId: string | null) => {
+    setMovingId(null);
+    // 选的就是它现在待的那一层：什么都不做，也省一次白写的磁盘
+    if ((link.folderId ?? null) === folderId) return;
+    await persist({ ...link, folderId }, `已移动「${link.name}」`);
+  };
+
+  /**
+   * 一条链接在右键菜单里的动作。
+   *
+   * 和右上角那个「⋯」菜单的关系：两者**内容有重叠**（编辑 / 移动到 / 删除），
+   * 这是刻意的。「⋯」是鼠标悬停就出现、位置贴着格子的固定入口（用户知道
+   * 那儿有菜单），右键是"在任何位置都能就地操作"的第二条路 ——
+   * 只有 420px 宽的面板里，格子可能被拖到最右边，专门去够那个「⋯」
+   * 反而费事。
+   *
+   * 多了「打开」和「复制地址」两项：右键是"我要对这一条做点什么"，
+   * 而这两个正是链接最常用的动作（「⋯」菜单里没有，因为它原来只有
+   * "改和删"这一类管理动作）。
+   *
+   * 「修好它…」只在**确认打不开**时才出现，「以管理员身份运行」只在
+   * 非网址时出现 —— 两个都是"按当前情况才成立"的项，常驻只会让菜单变长。
+   * 这两项在「⋯」菜单里也有：用户在哪一边找都得能找到。
+   */
+  const linkMenu = (link: LinkItem): ContextMenuItem[] => [
+    {
+      id: "open",
+      label: "打开",
+      icon: <LinkGlyph link={link} />,
+      onSelect: () => void launch(link),
+    },
+    // 确认打不开的，把「修好它」放到最上面：这时用户点右键的目的
+    // 十有八九就是"把它弄好"，而不是"再打开一次"
+    ...(isBroken(link)
+      ? [
+          {
+            id: "repair",
+            label: "修好它…",
+            icon: <Wrench size={13} />,
+            onSelect: () => void openRepair(link),
+          },
+        ]
+      : []),
+    {
+      id: "copy-target",
+      label: "复制地址",
+      icon: <Copy size={13} />,
+      hint: "Ctrl+C",
+      onSelect: () => {
+        void api.copyText(link.target).then((ok) => {
+          setNotice({
+            kind: ok ? "ok" : "error",
+            text: ok ? "已复制到剪贴板" : "复制失败，剪贴板可能被占用",
+          });
+        });
+      },
+    },
+    // 网址没有"以管理员身份"这回事
+    ...(link.kind === "url"
+      ? []
+      : [
+          {
+            id: "elevate",
+            label: "以管理员身份运行",
+            icon: <ShieldCheck size={13} />,
+            onSelect: () => void elevate(link),
+          },
+        ]),
+    {
+      id: "edit",
+      label: "编辑",
+      icon: <Pencil size={13} />,
+      dividerBefore: true,
+      onSelect: () => startEdit(link),
+    },
+    {
+      id: "move",
+      label: "移动到…",
+      icon: <FolderInput size={13} />,
+      onSelect: () => setMovingId(link.id),
+    },
+    {
+      id: "delete",
+      label: "删除",
+      icon: <Trash2 size={13} />,
+      danger: true,
+      dividerBefore: true,
+      onSelect: () => void remove(link),
+    },
+  ];
+
+  /**
+   * 收到搜索定位请求：进文件夹 → 滚到可见 → 高亮 →（需要时）打开编辑器。
+   *
+   * 链接页的"打开编辑器"是**就地编辑**（格子里直接变成输入框），
+   * 不是另开一层表单 —— 所以 `pending.open` 走 `startEdit`，
+   * 和用户点「⋯」→「编辑」是同一条路。
+   *
+   * # ⚠️ 为什么必须等 `folders.loading` **和** `loading`
+   *
+   * 从别的页签按回车跳过来时本页是刚挂载的：`links` 初值 `[]`、
+   * 文件夹列表还在异步路上。不等就消费请求的话，`links.find(...)` 拿到
+   * `undefined` → **就地编辑器打不开**，而且 `focusDone()` 已经把请求
+   * 消费掉，数据回来也不会再跑 —— 症状就是"按了回车没反应"。
+   * 两个守卫都必须在 `done()` 之前，而且都要进依赖。
+   */
+  useEffect(() => {
+    if (!pending) return;
+    if (folders.loading || loading) return;
+
+    const folder = folderToEnter(pending);
+    if (folder.known) folders.enter(folder.folderId);
+
+    focus.show(highlightFrom(pending));
+    scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
+
+    if (pending.open) {
+      const found = links.find((l) => l.id === pending.id);
+      if (found) startEdit(found);
+    }
+
+    focusDone();
+    // 理由同片段页：`folders` 每次渲染都是新对象，进依赖会让 effect 每渲染跑一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, folders.loading, loading]);
+
+  // ---- 就地编辑（名字 / 目标 / 启动参数）----
+
+  const startEdit = (link: LinkItem) => {
+    setMenu(null);
+    editAborted.current = false;
+    editRef.current = link.id;
+    setEditId(link.id);
+    setEditDraft({ name: link.name, target: link.target, args: link.args ?? "" });
+  };
+
+  const cancelEdit = () => {
+    editAborted.current = true;
+    editRef.current = null;
+    setEditId(null);
+  };
+
+  /** 编辑框里的键盘约定：回车保存、Esc 取消。三个输入框共用。 */
+  const onEditKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") {
+      // 主面板把 Esc 当「收起面板」的全局快捷键（见 PanelWindow.tsx）。
+      // 这里按 Esc 的意图只是取消这次编辑，所以别让它冒泡到 window。
+      e.stopPropagation();
+      cancelEdit();
+    }
+    // 回车交给 `onBlur` 走同一条路：在这里直接提交的话，
+    // 输入框卸载又会触发一次 blur，两次提交要靠 `editRef` 那个闸门挡，
+    // 与其两处都写一遍，不如只留 blur 一条路（它在回车时也会被触发）。
+  };
+
+  const commitLinkEdit = async (link: LinkItem) => {
+    // Enter 提交之后输入框会卸载并触发 blur，这里挡掉第二次提交
+    if (editRef.current !== link.id) return;
+    editRef.current = null;
+    setEditId(null);
+
+    if (editAborted.current) {
+      editAborted.current = false;
+      return;
+    }
+
+    const name = editDraft.name.trim() || link.name;
+    const rawTarget = editDraft.target.trim() || link.target;
+    const argsText = editDraft.args.trim();
+    // 空串存成 null：模型里 null 表示「没有参数」。
+    // 存空串会让「到底有没有参数」变得没法判断，界面上也说不清。
+    const args = argsText === "" ? null : argsText;
+
+    /**
+     * 目标变了要**重新判一次类型**，否则图标和"怎么启动"会跟实际对不上：
+     * 把一条 .txt 改成 .exe 之后，它仍然按「文件」显示内置图标。
+     *
+     * 网址不走文件系统判定：`classify_paths` 对 `https://…` 只会拿到
+     * 浏览器的默认图标，而且网址还得补全协议。
+     */
+    let target = rawTarget;
+    let kind = link.kind;
+    if (rawTarget !== link.target) {
+      if (link.kind === "url") {
+        target = normalizeUrl(rawTarget);
+      } else {
+        try {
+          kind = (await api.classifyPaths([rawTarget]))[0] ?? link.kind;
+        } catch {
+          // 判不出来就保留原来的类型：图标不准总比"改不了"好
+        }
+      }
+    }
+
+    if (name === link.name && target === link.target && args === (link.args ?? null)) return;
+    await persist({ ...link, name, target, args, kind }, "已保存");
+  };
+
+  // ---- 渲染 ----
+
+  /**
+   * 「⋯」菜单要操作的那条链接。
+   *
+   * 每次都从 `links` 里现查，而不是把整条存进 `menu`：存下来的话，
+   * 菜单开着的时候数据一变（重命名提交、图标提取回来）它就成了一份陈旧快照。
+   * 查不到（被删了）就当菜单没开。
+   */
+  const menuLink = menu ? links.find((l) => l.id === menu.id) ?? null : null;
+
+  /**
+   * 「修好它」面板要显示的那条链接，以及它的核对结果。
+   *
+   * 状态**可能还没有**（面板是用户点出来的，核对却可能是几秒前的事，
+   * 也可能那条链接刚被别处改过）。这时用一份中性的占位状态把面板撑起来 ——
+   * 让面板整个消失是最糟的：用户刚点了一下，界面却什么都没发生。
+   */
+  const repairLink = repairId ? links.find((l) => l.id === repairId) ?? null : null;
+  const repairStatus: LinkStatus | null = repairLink
+    ? statuses.get(repairLink.id) ?? {
+        id: repairLink.id,
+        state: "unknown",
+        resolved: repairLink.target,
+        lnkTarget: null,
+      }
+    : null;
+
+  /**
+   * 让位之后的渲染顺序。
+   *
+   * 被拖的那个**也在数组里** —— 渲染时把它画成一个空位（虚框），
+   * 其余格子让开，这就是手机桌面拖图标的样子。
+   *
+   * 用 `drag.over` 而不是"最近一次命中的落点"：落点判定（`resolveSortSpot`）
+   * 现在是**离指针最近的那一条**、而且每次都按当前布局重新量，
+   * 所以指针在哪，空位就在哪，不会出现"指到这儿、空位在别处"。
+   */
+  const orderedFolders = useMemo(
+    () =>
+      orderById(
+        folders.children,
+        previewOrder(
+          folders.children.map((f) => f.id),
+          drag.draggingId ?? "",
+          drag.over,
+        ),
+      ),
+    [folders.children, drag.draggingId, drag.over],
+  );
+
+  const orderedLinks = useMemo(
+    () =>
+      orderById(
+        visible,
+        previewOrder(
+          visible.map((l) => l.id),
+          drag.draggingId ?? "",
+          drag.over,
+        ),
+      ),
+    [visible, drag.draggingId, drag.over],
+  );
+
+  /** 跟手浮层里的那一条：链接或文件夹，取决于正在拖的是什么。 */
+  const ghostLink = drag.draggingId
+    ? visible.find((l) => l.id === drag.draggingId) ?? null
+    : null;
+  const ghostFolder = drag.draggingId
+    ? folders.children.find((f) => f.id === drag.draggingId) ?? null
+    : null;
+
+  return (
+    <div
+      className="links"
+      // 滚轮监听挂在整页根节点上而不是只挂网格：鼠标停在文件夹卡片、
+      // 添加栏上时也应该能缩放。普通滚轮不受影响（见 lib/zoom.ts）。
+      ref={zoom.ref}
+      style={{ "--tile-scale": String(zoom.percent / 100) } as CSSProperties}
+    >
+      {/* 添加栏：四个入口平分一行 */}
+      <div className="links__addbar">
+        <button
+          className="btn"
+          onClick={() => void addProgram()}
+          title="选择程序，可按住 Ctrl / Shift 一次选多个（.exe / .lnk / .bat / .cmd）"
+        >
+          <AppWindow size={12} />
+          程序
+        </button>
+        <button
+          className="btn"
+          onClick={() => void addFolder()}
+          title="选择文件夹，可按住 Ctrl / Shift 一次选多个"
+        >
+          <Folder size={12} />
+          文件夹
+        </button>
+        <button
+          className="btn"
+          onClick={() => void addFile()}
+          title="选择任意文件（文档、图片…），可按住 Ctrl / Shift 一次选多个"
+        >
+          <FileText size={12} />
+          文件
+        </button>
+        <button className="btn" onClick={() => setUrlOpen(true)} title="手动填一个网址">
+          <Globe size={12} />
+          网址
+        </button>
+      </div>
+
+      {urlOpen && (
+        <div className="links__urlform">
+          <label className="field">
+            <span className="field__label">
+              名称
+              <em className="field__hint">留空就用网址本身</em>
+            </span>
+            <input
+              className="field__input"
+              autoFocus
+              value={urlForm.name}
+              placeholder="例如：公司内网"
+              onChange={(e) => setUrlForm((f) => ({ ...f, name: e.target.value }))}
+            />
+          </label>
+
+          <label className="field">
+            <span className="field__label">网址</span>
+            <input
+              className="field__input"
+              value={urlForm.url}
+              placeholder="example.com，或者 https://…"
+              onChange={(e) => setUrlForm((f) => ({ ...f, url: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void submitUrl();
+                if (e.key === "Escape") {
+                  // 同重命名输入框：Esc 只用来关掉这个表单，别触发主面板的「收起面板」
+                  e.stopPropagation();
+                  setUrlOpen(false);
+                }
+              }}
+            />
+          </label>
+
+          <div className="links__urlform-actions">
+            <button className="btn" onClick={() => setUrlOpen(false)}>
+              <X size={12} />
+              取消
+            </button>
+            <button
+              className="btn btn--primary"
+              disabled={!urlForm.url.trim()}
+              onClick={() => void submitUrl()}
+            >
+              <Check size={12} />
+              添加
+            </button>
+          </div>
+        </div>
+      )}
+
+      {notice && (
+        <div className={`links__notice${notice.kind === "error" ? " links__notice--error" : ""}`}>
+          {notice.kind === "error" ? <TriangleAlert size={13} /> : <Check size={13} />}
+          <span>{notice.text}</span>
+        </div>
+      )}
+
+      {loadError && (
+        <div className="links__notice links__notice--error">
+          <TriangleAlert size={13} />
+          <span>数据读取失败：{loadError}</span>
+        </div>
+      )}
+
+      {/* 当前路径。放在内容区正上方：先看到「我在哪」，再看这一层有什么 */}
+      <div className="folderzone">
+        <FolderBar
+          trail={folders.trail}
+          onEnter={folders.enter}
+          onCreate={() => setFolderEditor({ open: true, target: null })}
+        />
+
+        {folderEditor.open && (
+          <FolderEditor
+            target={folderEditor.target}
+            onSubmit={(name, note) =>
+              folderEditor.target
+                ? folders.update(folderEditor.target, name, note)
+                : folders.create(name, note)
+            }
+            onClose={() => setFolderEditor({ open: false, target: null })}
+          />
+        )}
+      </div>
+
+      {folders.error && (
+        <div className="links__notice links__notice--error">
+          <TriangleAlert size={13} />
+          <span>文件夹出错：{folders.error}</span>
+        </div>
+      )}
+
+      <div className={`links__grid${dragActive ? " links__grid--drop" : ""}`}>
+        {/* 子文件夹排在链接前面，和资源管理器一致。
+            FolderTiles 返回的是一排卡片、不带外层容器，所以能直接当网格子项用 */}
+        <FolderTiles
+          folders={orderedFolders}
+          counts={folderCounts}
+          dropTargetId={drag.over?.kind === "folder" ? drag.over.id : null}
+          dragProps={(id) => drag.handleProps(id, "folder")}
+          onEnter={folders.enter}
+          onEdit={(f) => setFolderEditor({ open: true, target: f })}
+          onRemove={(f) => void folders.remove(f)}
+          variant="grid"
+          gapId={drag.draggingId}
+        />
+
+        {loading && <div className="links__hint">正在读取数据…</div>}
+
+        {!loading && links.length === 0 && (
+          <div className="links__empty">
+            <Link2 size={26} />
+            <p>还没有任何链接。</p>
+            <p>
+              点上面的按钮挑程序、文件夹或文件（都可以一次选多个）
+              {dragAvailable ? "，也可以直接把它们拖进这个面板。" : "。"}
+            </p>
+          </div>
+        )}
+
+        {/* 有链接、但当前这一层是空的：要说清"是这一层空"而不是"一条都没有"，
+            否则用户会以为数据丢了 */}
+        {!loading &&
+          links.length > 0 &&
+          visible.length === 0 &&
+          folders.children.length === 0 && (
+            <div className="links__empty">
+              <Folder size={26} />
+              <p>{folders.currentId ? "这个文件夹里还没有链接。" : "这一层还没有链接。"}</p>
+              <p>用上面的按钮添加，或者点文件夹卡片进去。</p>
+            </div>
+          )}
+
+        {orderedLinks.map((link) => {
+          // 正在被拖的那个：留一个虚框，其余格子让开。
+          // 它不再是投放目标，也不该被点中 —— 用户手里正拎着它。
+          if (link.id === drag.draggingId) {
+            return <div className="links__gap drag-gap" key={link.id} aria-hidden />;
+          }
+
+          /**
+           * 这条链接的目标现在还能不能用。
+           *
+           * 表里没有就按「没确认」处理：不打标记、正常打开。
+           * **不能**把"没核对过"当成"坏了" —— 那会在面板刚打开、
+           * 核对还在路上的一瞬间把所有格子标成失效。
+           */
+          const status = statuses.get(link.id);
+          const broken = status !== undefined && healthOf(status.state) === "broken";
+
+          /**
+           * 就地编辑：**整行宽**，而且能改**全部**可改字段（名字 / 目标 / 启动参数）。
+           *
+           * 两个理由：
+           * 1. 原来是挤在格子里的小输入框 —— 默认档位一格只有 86~95px 宽，
+           *    稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
+           *    整行宽之后有 400px 可用，位置还在原来那一格上。
+           * 2. 原来「重命名」只能改名字、**目标路径根本没有编辑入口** ——
+           *    路径写错（这功能最常见的输入错误）只能删了重加，
+           *    而重加要走一次文件选择框。别的页签的铅笔都是"打开完整编辑面"，
+           *    这里也该是。
+           */
+          if (editId === link.id) {
+            return (
+              <div className="links__editor" key={link.id}>
+                <LinkGlyph link={link} />
+
+                <div className="links__editfields">
+                  <label className="links__editrow">
+                    <span className="links__editlabel">名字</span>
+                    <input
+                      className="links__editinput"
+                      autoFocus
+                      value={editDraft.name}
+                      placeholder={link.name}
+                      onChange={(e) =>
+                        setEditDraft((d) => ({ ...d, name: e.target.value }))
+                      }
+                      onKeyDown={onEditKeyDown}
+                      onBlur={() => void commitLinkEdit(link)}
+                    />
+                  </label>
+
+                  <label className="links__editrow">
+                    <span className="links__editlabel">目标</span>
+                    <input
+                      className="links__editinput"
+                      value={editDraft.target}
+                      title={link.target}
+                      // 把 `%VAR%` 这条路说出来：它是唯一能让链接**跟着环境走**
+                      // 的写法（换个用户名、换台机器照样能用），但光看一个空输入框
+                      // 没人会知道可以这么写。
+                      placeholder="C:\…\a.exe，也可以用 %USERPROFILE% 这类变量"
+                      onChange={(e) =>
+                        setEditDraft((d) => ({ ...d, target: e.target.value }))
+                      }
+                      onKeyDown={onEditKeyDown}
+                      onBlur={() => void commitLinkEdit(link)}
+                    />
+                  </label>
+
+                  {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
+                  {link.kind !== "url" && (
+                    <label className="links__editrow">
+                      <span className="links__editlabel">参数</span>
+                      <input
+                        className="links__editinput"
+                        value={editDraft.args}
+                        placeholder="留空表示不带参数，例如 --profile work"
+                        onChange={(e) =>
+                          setEditDraft((d) => ({ ...d, args: e.target.value }))
+                        }
+                        onKeyDown={onEditKeyDown}
+                        onBlur={() => void commitLinkEdit(link)}
+                      />
+                    </label>
+                  )}
+
+                  <em className="links__edithint">回车保存 · Esc 取消</em>
+                </div>
+              </div>
+            );
+          }
+
+          return (
+            <article
+              key={link.id}
+              id={focusDomId(FOCUS_DOM_PREFIX, link.id)}
+              className={[
+                "links__tile",
+                busyId === link.id ? "links__tile--busy" : "",
+                broken ? "links__tile--broken" : "",
+                isHighlighted(focus.highlight, link.id) ? "links__tile--focus" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              // 悬停时优先说"为什么打不开"：这时用户最需要的就是这个，
+              // 而不是再重复一遍他已经知道的路径
+              title={
+                broken && status
+                  ? brokenReason(status, link.name)
+                  : link.args
+                    ? `${link.target}\n参数：${link.args}`
+                    : link.target
+              }
+              // 右键：打开 / 修好它 / 复制地址 / 以管理员身份运行 / 编辑 / 移动到… / 删除。
+              // 和右上角「⋯」菜单内容有重叠是刻意的（见 linkMenu 的说明）。
+              onContextMenu={(e) => ctx.open(e, () => linkMenu(link))}
+              {...drag.itemProps(link.id)}
+            >
+              <button
+                // 拖拽抓手：这个按钮就是链接格子的可拖区域。
+                // **必须显式标出来** —— drag-drop 里有一条内置的控件底线会拦掉
+                // 所有按钮（就是为了防"点删除变成拖卡片"），不标的话链接页
+                // 整个就拖不动了。属性名与 lib/drag-drop.ts 的 DRAG_HANDLE_ATTR 一致。
+                data-drag-handle
+                className="links__tile-body links__open"
+                disabled={busyId === link.id}
+                onClick={() => {
+                  // 拖完松手会紧跟一次 click。不吞掉的话，把链接拖进文件夹之后
+                  // 会顺手把它打开——用户完全预料不到。
+                  if (drag.consumeClick()) return;
+                  void launch(link);
+                }}
+                title={broken ? `修好「${link.name}」` : `打开：${link.target}`}
+              >
+                <LinkGlyph link={link} />
+                <span className="links__name">{link.name}</span>
+              </button>
+
+              {/* 失效标记。压在左上角（右上角被「⋯」占了），
+                  只写短标签 —— 完整原因在 tooltip 和「修好它」面板里。
+                  没有这个标记的话，用户只能靠"点下去报错"来发现链接坏了。 */}
+              {broken && status && (
+                <span className="links__tile-warn">
+                  <TriangleAlert size={10} />
+                  {healthBadge(status.state)}
+                </span>
+              )}
+
+              {/* 悬停才出现。**只占右上角 20px**：
+                  原来这里是一排四个图标按钮（加起来 83px），而格子默认只有
+                  86~95px 宽 —— 鼠标一移上去按钮就铺满整格，把图标和名字压在
+                  下面（用户反馈「放上去第一个字都有点看不清」）。
+                  收成一个「⋯」之后，格子的内容始终看得见。 */}
+              <button
+                className="iconbtn links__more"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMenu({ id: link.id, rect: e.currentTarget.getBoundingClientRect() });
+                }}
+                title="更多操作"
+              >
+                <MoreHorizontal size={13} />
+              </button>
+            </article>
+          );
+        })}
+      </div>
+
+      {dragAvailable && !loading && links.length > 0 && (
+        <div className="links__footer">把文件或文件夹拖进面板也能添加</div>
+      )}
+
+      {/* 跟手的浮层：被拖的那一格"提起来"跟着指针走。
+          尺寸用按下那一刻量好的（`sourceSize`），因为原处已经被换成空位了。
+          它不吃指针事件（见 .drag-ghost 的说明），所以落点判定不受影响。 */}
+      {drag.draggingId && drag.pointer && drag.sourceSize && (
+        <div
+          className="links__ghost drag-ghost"
+          style={{
+            left: drag.pointer.x,
+            top: drag.pointer.y,
+            width: drag.sourceSize.width,
+            height: drag.sourceSize.height,
+          }}
+        >
+          {ghostLink ? (
+            <>
+              <LinkGlyph link={ghostLink} />
+              <span className="links__name">{ghostLink.name}</span>
+            </>
+          ) : ghostFolder ? (
+            <>
+              <Folder size={24} strokeWidth={1.6} className="links__glyph links__glyph--builtin" />
+              <span className="links__name">{ghostFolder.name}</span>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {movingId && (
+        <FolderPicker
+          folders={folders.mine}
+          current={links.find((l) => l.id === movingId)?.folderId ?? null}
+          onPick={(id) => {
+            const link = links.find((l) => l.id === movingId);
+            if (link) void moveTo(link, id);
+            else setMovingId(null);
+          }}
+          onClose={() => setMovingId(null)}
+        />
+      )}
+
+      {menu && menuLink && (
+        <LinkMenu
+          link={menuLink}
+          anchor={menu.rect}
+          broken={isBroken(menuLink)}
+          repairOpen={repairId !== null}
+          onClose={() => setMenu(null)}
+          onMove={() => {
+            setMenu(null);
+            setMovingId(menuLink.id);
+          }}
+          onEdit={() => startEdit(menuLink)}
+          onElevate={() => {
+            setMenu(null);
+            void elevate(menuLink);
+          }}
+          onRepair={() => {
+            setMenu(null);
+            void openRepair(menuLink);
+          }}
+          onRemove={() => {
+            setMenu(null);
+            void remove(menuLink);
+          }}
+        />
+      )}
+
+      {/* 「修好它」面板。确认打不开的链接点下去开的就是这个 ——
+          原因 + 重新定位 + 附近找到的同名文件 + 删除，四件事一步到位。 */}
+      {repairLink && repairStatus && (
+        <LinkRepair
+          link={repairLink}
+          status={repairStatus}
+          sameName={sameName}
+          rechecking={rechecking}
+          onRelocate={() => void relocate(repairLink, repairStatus)}
+          onUseCandidate={(path) =>
+            void applyTarget(repairLink, path, `已改用「${baseName(path)}」`)
+          }
+          onRecheck={() => void recheck(repairLink)}
+          onOpenAnyway={() => {
+            const target = repairLink;
+            closeRepair();
+            void launch(target, true);
+          }}
+          onRemove={() => {
+            const target = repairLink;
+            closeRepair();
+            void remove(target);
+          }}
+          onClose={closeRepair}
+        />
+      )}
+
+      {/* 右键菜单。和上面的「⋯」菜单是两套，同时最多只该开一个：
+          `ctx.open` 里会先关掉自己那一套，而点「⋯」时 `startEdit` / 移动 / 删除
+          都会把 `menu` 清掉（见各自的 onSelect）。 */}
+      {ctx.menu}
+    </div>
+  );
+}
+
+// ===============================================================
+// 「⋯」菜单
+// ===============================================================
+
+/**
+ * 格子右上角那个「⋯」点开的小菜单。
+ *
+ * # 为什么不再是一排四个图标按钮
+ *
+ * 链接页默认档位一格只有 86~95px 宽，而四个 20px 的按钮加起来 83px ——
+ * 鼠标一移上去，按钮几乎铺满整格，把图标和名字压在下面（用户反馈
+ * 「放上去第一个字都有点看不清」）。收成一个「⋯」之后悬停只占右上角 20px。
+ *
+ * # 为什么菜单里写文字而不是只放图标
+ *
+ * 图标按钮的问题是**得先悬停看 tooltip 才知道是什么**，而那个 tooltip 又会
+ * 盖住格子的名字。写成「移动到文件夹 / 启动参数 / 重命名 / 删除」之后一眼就
+ * 知道有什么可用 —— 用户原来就问过「这个启动参数是什么」。
+ *
+ * # 为什么不用整屏遮罩
+ *
+ * 四个动作的小菜单用遮罩把面板压暗太重了（`FolderPicker` 用遮罩是因为它
+ * 是"选一个目标"的模态选择）。这里改成在 document 上挂一个捕获阶段的
+ * `pointerdown`，点到菜单外面就关 —— 和 `FolderEditor` 同一个做法。
+ * 挂监听是在渲染之后的 effect 里，所以**不会**被"点开菜单的那一次 pointerdown"
+ * 立刻关掉。
+ */
+function LinkMenu({
+  link,
+  anchor,
+  broken,
+  repairOpen,
+  onClose,
+  onMove,
+  onEdit,
+  onElevate,
+  onRepair,
+  onRemove,
+}: {
+  link: LinkItem;
+  anchor: DOMRect;
+  /** 这条链接是不是确认打不开（决定要不要给「修好它」这一行）。 */
+  broken: boolean;
+  /** 「修好它」面板是不是正开着（决定 Esc 该谁认领）。 */
+  repairOpen: boolean;
+  onClose: () => void;
+  onMove: () => void;
+  onEdit: () => void;
+  onElevate: () => void;
+  onRepair: () => void;
+  onRemove: () => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const box = boxRef.current;
+      if (box && !box.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [onClose]);
+
+  /**
+   * Esc 只关这一层，别连带把整个面板收起来。
+   *
+   * # 为什么用 `useEscapeToClose` 而不是自己挂监听（t26 扫出来的同类）
+   *
+   * 原来这里内联一个 `document` 捕获监听器，`stopPropagation()` 之后直接
+   * `onClose()` —— **没有"先判认领"这一步**。而这个「⋯」菜单的 z-index 是 60
+   * （`links.css`），全应用那个右键菜单是 100（`context-menu.css`）——
+   * 菜单在上面，所以"Esc 关最上面那一层"要求这一层在菜单开着时**让位**。
+   *
+   * ⚠️ 说实话：**这条路现在也撞不上** —— 上面那个 `onDown` 会在任何外部
+   * `pointerdown` 时把「⋯」菜单关掉（右键也发 `pointerdown`），而且
+   * `t13` 还给菜单根节点加了 `onContextMenu` 拦截（右键菜单不会叠在它上面）。
+   * 这条改动是**把规则补成一致的**，不是修一个现成能复现的 bug。
+   * 详见 `lib/escape.ts` 的 `shouldClaim`。
+   *
+   * # 为什么要连 `repairOpen` 一起判
+   *
+   * 「修好它」面板的 z-index 是 70，比这个菜单高。两层同时开着时按 Esc，
+   * 认领顺序是按**挂载顺序**走的（`document` 上的捕获监听器谁先注册谁先跑），
+   * 而这个菜单通常注册得更早 —— 于是一次 Esc 把两层一起关了。
+   * 规则是"只关最上面那一层"，所以菜单在上面那层开着时不该认领。
+   * （场景：面板贴在底部，上面半屏还露着，用户可以在那儿开「⋯」菜单。）
+   */
+  useEscapeToClose(onClose, () => !isContextMenuOpen() && !repairOpen);
+
+  /**
+   * 贴住「⋯」按钮定位，但不许出面板。
+   *
+   * 必须**量完之后**再摆：菜单高度取决于有没有「启动参数」那一行
+   * （网址没有），写死高度会让最后一行的菜单翻错方向。
+   * 用 `useLayoutEffect` 是为了在浏览器绘制之前就摆好，用户看不到闪一下。
+   * 坐标怎么算是纯函数（`lib/menu-position.ts`），有单测兜着边缘情况。
+   */
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const rect = box.getBoundingClientRect();
+    setPos(
+      placeMenu(
+        anchor,
+        { width: rect.width, height: rect.height },
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    );
+  }, [anchor]);
+
+  return (
+    <div
+      className="linkmenu"
+      ref={boxRef}
+      // 量之前先藏起来，避免"先出现在左上角再跳过去"
+      style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, visibility: pos ? "visible" : "hidden" }}
+      // 菜单内部的点击不该冒泡到别处（例如格子的"点开"）
+      onClick={(e) => e.stopPropagation()}
+      // 在这个菜单上再右键**不要**把第二个菜单（全应用共用的那个右键菜单）
+      // 也弹出来。不拦的话会出现两个菜单同时开着，而 Esc 只会关掉这一个
+      // （它的 document 捕获监听器先跑并 stopPropagation，另一个菜单的
+      // React 处理器就收不到事件了）—— 另一个只能靠点别处关掉。
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      {/* 把整条名字显示出来：格子里的名字最多两行、会被截断，
+          这里是用户唯一能看到全名的地方 */}
+      <div className="linkmenu__title" title={link.target}>
+        {link.name}
+      </div>
+
+      {/* 确认打不开时，这一项排在最前面：这时用户打开菜单的目的
+          十有八九就是"把它弄好"，而不是"再打开一次" */}
+      {broken && (
+        <button type="button" className="linkmenu__row linkmenu__row--warn" onClick={onRepair}>
+          <Wrench size={13} />
+          修好它…
+        </button>
+      )}
+
+      <button type="button" className="linkmenu__row" onClick={onMove}>
+        <FolderInput size={13} />
+        移动到文件夹
+      </button>
+
+      {/* 一个「编辑」打开**全部可改字段**（名字 / 目标 / 启动参数）。
+          原来拆成「重命名」和「启动参数」两项，而**目标路径根本没有入口** ——
+          路径写错只能删了重加。别的页签的铅笔都是"打开完整编辑面"，这里统一。 */}
+      <button type="button" className="linkmenu__row" onClick={onEdit}>
+        <Pencil size={13} />
+        编辑
+        <em className="linkmenu__aside">
+          {link.kind === "url" ? "名字 / 网址" : "名字 / 路径 / 参数"}
+        </em>
+      </button>
+
+      {/* 网址没有"以管理员身份"这回事，给了只会让人以为点了有用 */}
+      {link.kind !== "url" && (
+        <button type="button" className="linkmenu__row" onClick={onElevate}>
+          <ShieldCheck size={13} />
+          以管理员身份运行
+        </button>
+      )}
+
+      <button
+        type="button"
+        className="linkmenu__row linkmenu__row--danger"
+        onClick={onRemove}
+      >
+        <Trash2 size={13} />
+        删除
+      </button>
+    </div>
+  );
+}
+
+/**
+ * 「修好它」面板。
+ *
+ * # 为什么要有这一层
+ *
+ * 链接坏掉时，用户原来只能得到一句「找不到文件」。那句话既没说清是
+ * **哪种**找不到（文件被挪走？整个文件夹没了？U 盘没插？快捷方式指向的程序卸了？），
+ * 也没给出下一步 —— 用户只能自己去翻文件夹，翻到了还要回来编辑那条链接。
+ * 这个面板把"为什么"和"怎么办"一次给全。
+ *
+ * # 为什么「重新定位」和「用找到的同名文件」都要有
+ *
+ * 用户挪文件的习惯很集中（桌面上的脚本收进「临时」、项目挪进 `archive`），
+ * 所以"在原来那个文件夹附近找同名文件"命中率很高，一步就能修好；
+ * 但改名、换盘、换目录的情况它覆盖不到，那时还是得让用户自己挑。
+ *
+ * # 为什么不自动改用找到的同名文件
+ *
+ * 同名不等于同一个东西。自动改有可能把链接指向一个完全无关的文件，
+ * 而用户不会发现 —— 所以只列出来，改不改由用户点。
+ */
+function LinkRepair({
+  link,
+  status,
+  sameName,
+  rechecking,
+  onRelocate,
+  onUseCandidate,
+  onRecheck,
+  onOpenAnyway,
+  onRemove,
+  onClose,
+}: {
+  link: LinkItem;
+  status: LinkStatus;
+  sameName: { loading: boolean; items: SameNameCandidate[] };
+  rechecking: boolean;
+  onRelocate: () => void;
+  onUseCandidate: (path: string) => void;
+  onRecheck: () => void;
+  onOpenAnyway: () => void;
+  onRemove: () => void;
+  onClose: () => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  // 点面板外面就关掉，和 `FolderEditor` 同一个做法：挂监听是在渲染之后的
+  // effect 里，所以不会被"打开面板的那一次 pointerdown"立刻关掉
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const box = boxRef.current;
+      if (box && !box.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [onClose]);
+
+  // Esc 只关这一层。和「⋯」菜单一样让位给全应用那个右键菜单（见 lib/escape.ts）
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
+
+  /**
+   * 候选分两摞：按**文件身份号**命中的（就是它），和靠名字 / 大小猜的（可能是它）。
+   *
+   * 混在一起显示是危险的。这两摞的把握差着量级 —— 一摞是"核对过身份证"，
+   * 另一摞是"名字碰巧一样"。并排摆着，用户要么以为都能信（点错就永久指向
+   * 一个无关文件，而且它照样能打开，不会有人发现），要么谁都不敢信。
+   */
+  const exact = sameName.items.filter((item) => item.how === "sameFile");
+  const fuzzy = sameName.items.filter((item) => item.how !== "sameFile");
+
+  return (
+    <div
+      className="repair"
+      ref={boxRef}
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      <div className="repair__head">
+        <TriangleAlert size={13} />
+        <span className="repair__title">打不开「{link.name}」</span>
+        <button className="iconbtn" onClick={onClose} title="关闭">
+          <X size={13} />
+        </button>
+      </div>
+
+      <p className="repair__why">{brokenReason(status, link.name)}</p>
+
+      <div className="repair__path" title={status.resolved}>
+        {status.resolved}
+      </div>
+
+      {/* 快捷方式的情况必须把**真实目标**单独列出来：
+          用户看到"快捷方式在"，会以为坏的是那个 .lnk 文件 */}
+      {status.lnkTarget && (
+        <div className="repair__path repair__path--sub" title={status.lnkTarget}>
+          快捷方式指向：{status.lnkTarget}
+        </div>
+      )}
+
+      {sameName.loading && <div className="repair__hint">正在找它现在在哪…</div>}
+
+      {!sameName.loading && exact.length > 0 && (
+        <>
+          <div className="repair__hint">
+            <strong>找到了，就是它</strong>
+            。文件本身没变，只是改了名或者被挪到了别处：
+          </div>
+          <div className="repair__candidates">
+            {exact.map((item) => (
+              <button
+                key={item.path}
+                type="button"
+                className="repair__candidate repair__candidate--exact"
+                title={item.path}
+                onClick={() => onUseCandidate(item.path)}
+              >
+                <ShieldCheck size={12} />
+                <span className="repair__candidate-main">
+                  <span className="repair__candidate-text">
+                    {shortenFrom(parentOf(status.resolved), item.path)}
+                  </span>
+                  <span className="repair__candidate-meta">
+                    {[formatWhen(item.modifiedMs), formatBytes(item.bytes)]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {!sameName.loading && fuzzy.length > 0 && (
+        <>
+          <div className="repair__hint">
+            {exact.length > 0 ? "另外还" : "附近"}
+            找到 {fuzzy.length} 个同名文件。<strong>同名不等于同一个东西</strong>
+            ，看清楚大小和时间再点：
+          </div>
+          <div className="repair__candidates">
+            {fuzzy.map((item) => (
+              <button
+                key={item.path}
+                type="button"
+                className="repair__candidate"
+                title={item.path}
+                onClick={() => onUseCandidate(item.path)}
+              >
+                {item.how === "sameContent" ? (
+                  <Copy size={12} />
+                ) : (
+                  <FolderSearch size={12} />
+                )}
+                <span className="repair__candidate-main">
+                  {/* 缩成相对「原来那个文件夹」的形式：候选全都同名、
+                      又都在同一个父目录下面，照原样显示的话真正有区别的
+                      那一段会被长长的公共前缀挤到看不见 */}
+                  <span className="repair__candidate-text">
+                    {shortenFrom(parentOf(status.resolved), item.path)}
+                  </span>
+                  {/* 大小和时间是**唯一**能让用户分辨"哪个才是我要的"的东西。
+                      `sameContent` 那档多一句说明：它不是靠名字对上来的，
+                      是靠"大小 + 修改时间都一致"，所以可能是个副本。 */}
+                  <span className="repair__candidate-meta">
+                    {[
+                      item.how === "sameContent" ? "大小和时间都相同，可能是副本" : "",
+                      formatWhen(item.modifiedMs),
+                      formatBytes(item.bytes),
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="repair__actions">
+        <button type="button" className="btn btn--primary" onClick={onRelocate}>
+          <FolderSearch size={12} />
+          重新定位…
+        </button>
+        <button type="button" className="btn" onClick={onRecheck} disabled={rechecking}>
+          <RotateCw size={12} />
+          {rechecking ? "检查中…" : "重新检查"}
+        </button>
+        <button type="button" className="btn" onClick={onOpenAnyway}>
+          <ExternalLink size={12} />
+          仍然尝试打开
+        </button>
+        <button type="button" className="btn repair__danger" onClick={onRemove}>
+          <Trash2 size={12} />
+          删除
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 注册到功能表。 */
+export const LinksFeature: FeatureModule = {
+  id: "links",
+  title: "链接",
+  description: "常用软件、文件夹、网址，一点就开",
+  icon: Link2,
+  order: 40,
+  component: LinksPanel,
+};
