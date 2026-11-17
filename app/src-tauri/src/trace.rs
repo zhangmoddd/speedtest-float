@@ -57,10 +57,54 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetLogicalDrives, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+
+/// `GetDriveTypeW` 的返回值。常量在 windows-sys 里门控在别的模块下，
+/// 为两个数字引一整个绑定模块不划算。
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+
+/// 所有**本地**盘的根（固定盘 + 可移动盘）。
+///
+/// # 为什么跨盘也要扫
+///
+/// 文件被拖到另一个盘时，它的身份号在那边是个**全新的号**（跨盘移动
+/// 在文件系统层面就是"复制 + 删除"），按身份对不上。但**大小和修改时间
+/// 会被复制过程保留下来** —— 那是唯一还能跨盘工作的线索。
+///
+/// 不扫别的盘，就等于"文件一挪到 C 盘，这个功能就废了"，
+/// 而用户完全不知道自己触发了这个边界。
+///
+/// # 为什么**明确排除**网络盘和光驱
+///
+/// - **网络盘**（`DRIVE_REMOTE`）：对一个陌生 UNC / 映射盘做目录枚举
+///   就是把当前用户的 NetNTLM 响应发出去，可以离线破解。
+///   这条路径是"用户点一下修复"触发的，不该有任何网络动作 ——
+///   和 `launcher::probe` 里拦的是同一件事。
+/// - **光驱**：没放盘时 `is_dir()` / 枚举会卡到超时，几秒钟白等。
+fn local_drive_roots() -> Vec<PathBuf> {
+    // SAFETY: `GetLogicalDrives` 只读一个位图，没有参数也没有副作用。
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{letter}:\\");
+        let w = wide(&root);
+        // SAFETY: `w` 以 NUL 结尾且在本轮内有效。
+        let kind = unsafe { GetDriveTypeW(w.as_ptr()) };
+        if kind == DRIVE_FIXED || kind == DRIVE_REMOVABLE {
+            out.push(PathBuf::from(root));
+        }
+    }
+    out
+}
 
 /// 一次搜索最多看多少个目录项。
 ///
@@ -424,6 +468,15 @@ fn roots_for(hint: &str) -> Vec<PathBuf> {
         roots.insert(0, root);
     }
 
+    // 4. 其他本地盘的根，排在最后。
+    //
+    //    这一档只服务"跨盘移动"（身份号会变，只剩大小 + 时间那条线索），
+    //    命中率比上面几档低，所以放最后 —— 上面的根扫完没结果才轮到它。
+    //    成本很低：每个盘的**第一层**只有几十个目录项。
+    for root in local_drive_roots() {
+        push(root, &mut roots);
+    }
+
     roots
 }
 
@@ -454,20 +507,23 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
     //
     // 合并成一个队列之后，`D:\` 的第一层会和 `D:\Project\workbuddy` 的第一层
     // 一起被扫。**便宜的根先出结果，贵的根不会把它挡在后面。**
-    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    // 队列第三项：这个根和目标**是不是同一个卷**。
+    //
+    // - 同卷 → 可以按身份号判（`SameFile`，确定）
+    // - 跨卷 → 身份号没有可比性（同一对数字在另一个卷上可能指向
+    //   一个完全无关的文件），只允许"大小 + 修改时间"这条弱线索，
+    //   而且**不进子目录**：跨盘只扫每个盘根的第一层，
+    //   否则就是拿 C 盘做全盘搜索了。
+    let mut queue: VecDeque<(PathBuf, usize, bool)> = VecDeque::new();
     for root in roots_for(hint) {
-        // 卷不一样就不可能命中：索引号只在**本卷内**唯一，
-        // 拿 A 盘的号去 B 盘比，撞上一个无关文件的风险是真实存在的。
         let Some(root_trace) = trace_of(&root.to_string_lossy()) else {
             continue;
         };
-        if root_trace.volume_serial != trace.volume_serial {
-            continue;
-        }
-        queue.push_back((root, 0usize));
+        let same_volume = root_trace.volume_serial == trace.volume_serial;
+        queue.push_back((root, 0usize, same_volume));
     }
 
-    'scan: while let Some((dir, depth)) = queue.pop_front() {
+    'scan: while let Some((dir, depth, same_volume)) = queue.pop_front() {
         if seen >= MAX_ENTRIES || started.elapsed() > BUDGET || !exact.is_empty() {
             break;
         }
@@ -501,7 +557,7 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
             }
 
             if entry.is_dir == want_dir {
-                let how = if entry.file_id == trace.file_id {
+                let how = if same_volume && entry.file_id == trace.file_id {
                     Some(TraceMatch::SameFile)
                 } else if !want_dir
                     && trace.bytes > 0
@@ -537,14 +593,16 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
                 }
             }
 
-            if entry.is_dir && depth < MAX_DEPTH {
+            // 跨卷的根（别的盘）**不进子目录**：进去了就是全盘搜索，
+            // 而这条线索（大小 + 时间）本来就不够硬，不值得为它付那个代价。
+            if entry.is_dir && depth < MAX_DEPTH && same_volume {
                 children.push(dir.join(&entry.name));
             }
             true
         });
 
         for child in children {
-            queue.push_back((child, depth + 1));
+            queue.push_back((child, depth + 1, same_volume));
         }
         if !keep_going {
             break 'scan;

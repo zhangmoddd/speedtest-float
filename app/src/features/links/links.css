@@ -82,8 +82,43 @@
   color: var(--danger);
 }
 
-/* ---- 网格 ---- */
+/* 批量修复条：只在"这一层确实有打不开的"时候出现。
+   用暖色描边而不是危险红：它不是错误，是"这里有点需要处理的事"。 */
+.links__fixbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 10px 0;
+  padding: 5px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
+}
 
+.links__fixbar svg {
+  flex-shrink: 0;
+  color: var(--danger);
+}
+
+/* 文字占满剩余空间，把两个按钮推到右边 */
+.links__fixbar-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.links__fixbar .btn {
+  padding: 2px 8px;
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
+}
+
+/* ---- 网格 ---- */
 .links__grid {
   flex: 1;
   min-height: 0;

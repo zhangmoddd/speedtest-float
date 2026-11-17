@@ -657,6 +657,62 @@ export function LinksPanel() {
     return counts;
   }, [links]);
 
+  /** 这一层有几条是**确定**坏的。只用来决定"要不要显示批量修复条"。 */
+  const brokenHere = useMemo(
+    () => visible.filter((l) => isBroken(l)).length,
+    [visible, isBroken],
+  );
+
+  /** 批量修复正在跑。跑的时候按钮要禁用 —— 连点会同时开好几轮全盘扫描。 */
+  const [repairing, setRepairing] = useState(false);
+
+  /**
+   * 批量扫一遍坏掉的链接，**身份号对上的直接改好**。
+   *
+   * # 为什么这里敢"自动改"，而单条修复面板只肯"提议"
+   *
+   * 判据不一样。单条面板列出的候选里混着"同名，不知道是不是"和
+   * "身份号一致，肯定是"；自动修复只认后者 —— 卷号 + 文件索引号完全一致，
+   * 那不是猜，是同一个东西的两条记录。同名的、大小相同的**一条都不动**。
+   *
+   * # 为什么修完必须把三种结果都说出来
+   *
+   * 只报"修好 N 条"的话，剩下那些用户不知道为什么没动：
+   * 是没找到？是老链接没身份号？还是快捷方式本来就修不了？
+   * 不说清楚，他们只会反复点这个按钮。
+   */
+  const runAutoRepair = useCallback(
+    async (scope: "here" | "all") => {
+      if (repairing) return;
+      setRepairing(true);
+      try {
+        const result = await api.linksAutoRepair(
+          scope === "all" ? null : folders.currentId,
+        );
+        await reload();
+
+        const parts: string[] = [];
+        if (result.repaired.length > 0) parts.push(`修好 ${result.repaired.length} 条`);
+        if (result.stillBroken > 0) parts.push(`${result.stillBroken} 条没找到下落`);
+        if (result.noTrace > 0) {
+          parts.push(`${result.noTrace} 条是没记过身份的老链接，只能手动定位`);
+        }
+        setNotice({
+          kind: "ok",
+          text:
+            parts.length > 0
+              ? `扫了 ${result.checked} 条：${parts.join("，")}。`
+              : `扫了 ${result.checked} 条，没有失效的。`,
+        });
+      } catch (err) {
+        setNotice({ kind: "error", text: `扫描失败：${errorText(err)}` });
+      } finally {
+        setRepairing(false);
+      }
+    },
+    [repairing, folders.currentId, reload],
+  );
+
   /**
    * 把 `draggedId` 插到 `targetId` 前面或后面，并给这一层重新编号。
    *
@@ -1521,6 +1577,36 @@ export function LinksPanel() {
         <div className="links__notice links__notice--error">
           <TriangleAlert size={13} />
           <span>文件夹出错：{folders.error}</span>
+        </div>
+      )}
+
+      {/* 批量修复条：只在**这一层**确实有破的时候出现。
+          没坏东西就完全不占地方 —— 常驻一个"自动修复"按钮会让人以为
+          它是必须定期点的维护动作，而它其实只是坏消息的处理入口。 */}
+      {brokenHere > 0 && (
+        <div className="links__fixbar">
+          <TriangleAlert size={12} />
+          <span className="links__fixbar-text">
+            这个文件夹里有 {brokenHere} 条打不开
+          </span>
+          <button
+            type="button"
+            className="btn"
+            disabled={repairing}
+            onClick={() => void runAutoRepair("here")}
+            title="只扫这一层：按文件身份号核对，能确定是同一个文件的直接改过来，同名的一律不动"
+          >
+            {repairing ? "正在扫描…" : "修复这里"}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={repairing}
+            onClick={() => void runAutoRepair("all")}
+            title="把所有文件夹里的失效链接都扫一遍（不只看当前这一层）"
+          >
+            全部修复
+          </button>
         </div>
       )}
 

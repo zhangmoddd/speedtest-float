@@ -541,8 +541,19 @@ pub async fn links_list(app: AppHandle) -> Vec<Link> {
 /// 它是"这个目标在磁盘上的身份号"，只有真的读一次文件才拿得到。
 /// 前端保存时会 `{ ...link }` 整条展开，而它的类型定义里可以没有这个字段 ——
 /// 那就等于**每次改名字都顺手把身份号抹掉**，功能在用户不知不觉中失效。
-/// 所以这里不看前端传了什么，按 id 找回旧条目自己决定：
-/// 目标路径没变就沿用，变了（用户重新指定了别的文件）就作废重记。
+/// 所以这里不看前端传了什么，一律沿用旧条目里的那份。
+///
+/// # ⚠️ 目标变了也**不清空**（这一条踩过）
+///
+/// 原来写的是"target 变了就把指纹丢掉"。听起来合理（换了个目标，身份该重记），
+/// 实际上正好毁掉唯一有用的东西：
+///
+/// 用户点「用找到的候选」把 target 从旧位置改到新位置时，**文件本身没变** ——
+/// 身份号该跟着走。清空它等于"刚找到就把线索扔了"，下一次再挪一次就彻底瞎了。
+/// 实测就撞上了：改完 target 之后再挪一次，修复面板一直转，什么也找不到。
+///
+/// 真正该不该更新，由 [`links_probe`] 拿**实际文件**核对后决定 ——
+/// 那里才有"这个路径现在到底指向哪个文件"的答案。
 #[tauri::command]
 pub async fn link_save(app: AppHandle, link: Link) -> Result<(), String> {
     let store = app.state::<Store>();
@@ -550,11 +561,7 @@ pub async fn link_save(app: AppHandle, link: Link) -> Result<(), String> {
     {
         let mut st = store.lock();
         if let Some(old) = st.links.iter().find(|l| l.id == next.id) {
-            next.fingerprint = if old.target == next.target {
-                old.fingerprint.clone()
-            } else {
-                None
-            };
+            next.fingerprint = old.fingerprint.clone();
         }
         match st.links.iter_mut().find(|l| l.id == next.id) {
             Some(slot) => *slot = next,
@@ -675,19 +682,12 @@ pub async fn link_launch_elevated(app: AppHandle, id: String) -> Result<(), Stri
 /// 拦截在 `launcher::probe` 里（见那里的说明），这里只负责批量。
 #[tauri::command]
 pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
-    let items: Vec<(String, String, LinkKind, bool)> = {
+    let items: Vec<(String, String, LinkKind)> = {
         let store = app.state::<Store>();
         let st = store.lock();
         st.links
             .iter()
-            .map(|l| {
-                (
-                    l.id.clone(),
-                    l.target.clone(),
-                    l.kind,
-                    l.fingerprint.is_none(),
-                )
-            })
+            .map(|l| (l.id.clone(), l.target.clone(), l.kind))
             .collect()
     };
 
@@ -696,10 +696,10 @@ pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
     let probed = tauri::async_runtime::spawn_blocking(move || {
         items
             .into_iter()
-            .map(|(id, target, kind, wants_trace)| {
+            .map(|(id, target, kind)| {
                 let target = launcher::probe(&target, kind);
                 // 只在「确实够着了、确实是本地的东西」时才记脚印
-                let trace = if wants_trace && target.state == launcher::TargetState::Ok {
+                let trace = if target.state == launcher::TargetState::Ok {
                     crate::trace::trace_of(&target.resolved)
                 } else {
                     None
@@ -711,9 +711,16 @@ pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
     .await
     .unwrap_or_default();
 
-    // 把这一轮新记下的身份写回数据文件。
+    // 把这一轮核对出来的身份写回数据文件。
     //
-    // ⚠️ 只在**真有新增**时写。这个核对是"打开链接页就自动跑"的，
+    // ⚠️ 判据是"**和实际不符**"，不是"原来是空的"。
+    //
+    // 只补空位的话会漏掉一种真实情况：目标被换成另一个文件（原地替换、
+    // 或者用户重新定位到别处），旧身份号留着不走，以后按它反而会找回
+    // 一个**曾经**属于这条链接的东西。所以每次核对都以**磁盘上的实际文件**
+    // 为准 —— 那才是唯一有资格回答"这个路径现在指向谁"的地方。
+    //
+    // ⚠️ 只在**真有变化**时写。这个核对是"打开链接页就自动跑"的，
     // 无条件落盘等于每切一次页签就重写一遍 links.json ——
     // 而写盘走的是全局写锁，会把同一时刻的自动保存一起堵在后面。
     let mut gained = false;
@@ -723,7 +730,10 @@ pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
         for (status, trace) in &probed {
             let Some(trace) = trace else { continue };
             if let Some(link) = st.links.iter_mut().find(|l| l.id == status.id) {
-                if link.fingerprint.is_none() {
+                let unchanged = link.fingerprint.as_ref().is_some_and(|old| {
+                    old.file_id == trace.file_id && old.volume_serial == trace.volume_serial
+                });
+                if !unchanged {
                     link.fingerprint = Some(trace.clone());
                     gained = true;
                 }
@@ -802,6 +812,159 @@ pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::Sa
     })
     .await
     .unwrap_or_default()
+}
+
+/// 一次「批量自动修复」的结果。
+///
+/// 三个数字分开给，是刻意的：用户最需要知道的不是"修好了几条"，
+/// 而是"剩下那些为什么没修" —— 不然他们会以为按钮没生效、反复点。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRepairResult {
+    /// 这次一共核对了多少条。
+    pub checked: usize,
+    /// 修好的（目标被改到新位置）。
+    pub repaired: Vec<AutoRepairItem>,
+    /// 确实是坏的、但这次没找到下落的条数。
+    pub still_broken: usize,
+    /// 缺身份的条数：这些是"这个功能加进来之前就存下的老链接"，
+    /// 或者跨盘搬过导致身份号对不上的。它们只能靠名字找，
+    /// 而名字不够硬，所以这里**不动手**，只报个数。
+    pub no_trace: usize,
+}
+
+/// 一条被修好的链接。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRepairItem {
+    pub id: String,
+    pub name: String,
+    /// 修之前指向哪。
+    pub from: String,
+    /// 修之后指向哪。
+    pub to: String,
+}
+
+/// 把所有坏掉的链接批量扫一遍，能确定的**直接改好**。
+///
+/// # 只有一种情况会自动改：身份号对上
+///
+/// 目标现在的状态是 `missing` / `noParent`，而按 `(卷号, 文件索引号)`
+/// 恰好找到一个文件 —— 那个文件就是它，只是改了名或换了位置。
+/// 这不是推测，是核对，所以可以直接写进链接。
+///
+/// 其余一律**不动手**：
+///
+/// - **同名文件**：同名可以纯属巧合（旧版本、模板、另一个项目的同名脚本）。
+///   自动改成候选里那个，用户不会收到任何提示，点开也照样"成功"，
+///   于是错误被永久藏起来。这比不修更糟。
+/// - **大小 + 时间相同**：可能是副本。也不动。
+/// - **没有身份号**：老链接（这个功能上线前存的）或跨盘搬过。
+/// - **快捷方式失效**（`lnkBroken`）：那是目标程序被卸载了，文件根本不存在，
+///   扫也扫不出来 —— 修不了，只能重装那个软件，或者删掉这条链接。
+///
+/// # `folder_id`
+///
+/// 只修某一个文件夹里的（用户说的"对当前文件夹扫"）。`None` 就是全部。
+#[tauri::command]
+pub async fn links_auto_repair(
+    app: AppHandle,
+    folder_id: Option<String>,
+) -> AutoRepairResult {
+    let targets: Vec<(String, String, String, LinkKind, Option<crate::trace::FileTrace>)> = {
+        let store = app.state::<Store>();
+        let st = store.lock();
+        st.links
+            .iter()
+            .filter(|l| match &folder_id {
+                Some(want) => l.folder_id.as_deref() == Some(want.as_str()),
+                None => true,
+            })
+            .map(|l| {
+                (
+                    l.id.clone(),
+                    l.name.clone(),
+                    l.target.clone(),
+                    l.kind,
+                    l.fingerprint.clone(),
+                )
+            })
+            .collect()
+    };
+
+    let checked = targets.len();
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        let mut repaired: Vec<AutoRepairItem> = Vec::new();
+        let mut still_broken = 0usize;
+        let mut no_trace = 0usize;
+
+        for (id, name, target, kind, fingerprint) in targets {
+            let status = launcher::probe(&target, kind);
+
+            // 只处理"东西挪走了"这一类。别的一律不碰：
+            // - `noDrive`：盘没插，扫描也扫不出东西来
+            // - `denied`：权限问题，跟位置无关
+            // - `lnkBroken`：目标程序被卸载了，文件真的不在了
+            // - `url` / `network` / `unknown`：本来就不该联网或没法确认
+            let moved_away = matches!(
+                status.state,
+                launcher::TargetState::Missing | launcher::TargetState::NoParent
+            );
+            if !moved_away {
+                continue;
+            }
+
+            let Some(trace) = fingerprint else {
+                no_trace += 1;
+                continue;
+            };
+
+            let want_dir = kind == LinkKind::Folder;
+            let hits = crate::trace::find_by_trace(&trace, &status.resolved, want_dir);
+
+            // 只认 `SameFile`（身份号完全一致）。`SameContent` 是"可能是副本"，
+            // 不配被自动写进链接。
+            match hits
+                .into_iter()
+                .find(|hit| hit.how == crate::trace::TraceMatch::SameFile)
+            {
+                Some(hit) => repaired.push(AutoRepairItem {
+                    id,
+                    name,
+                    from: target,
+                    to: hit.path,
+                }),
+                None => still_broken += 1,
+            }
+        }
+
+        (repaired, still_broken, no_trace)
+    })
+    .await
+    .unwrap_or_default();
+
+    let (repaired, still_broken, no_trace) = found;
+
+    if !repaired.is_empty() {
+        {
+            let store = app.state::<Store>();
+            let mut st = store.lock();
+            for item in &repaired {
+                if let Some(link) = st.links.iter_mut().find(|l| l.id == item.id) {
+                    link.target = item.to.clone();
+                }
+            }
+        }
+        let store = app.state::<Store>();
+        let _ = state::persist(&app, || store.lock().links.clone(), state::save_links);
+    }
+
+    AutoRepairResult {
+        checked,
+        repaired,
+        still_broken,
+        no_trace,
+    }
 }
 
 /// 提取某个路径的图标。

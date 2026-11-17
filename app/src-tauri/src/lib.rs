@@ -146,6 +146,7 @@ pub fn run() {
             commands::link_icon,
             commands::links_probe,
             commands::link_find_same_name,
+            commands::links_auto_repair,
             commands::classify_paths,
             // 文件夹（链接 / 文本片段 / 计时器共用）
             commands::folders_list,

@@ -302,10 +302,39 @@ export interface SameNameCandidate {
   how: CandidateMatch;
 }
 
+/** 一条被批量自动修复的链接。 */
+export interface AutoRepairItem {
+  id: string;
+  name: string;
+  /** 修之前指向哪。 */
+  from: string;
+  /** 修之后指向哪。 */
+  to: string;
+}
+
+/**
+ * 一次「批量自动修复」的结果。
+ *
+ * 三个数字分开给，是刻意的：用户最需要知道的不是"修好了几条"，
+ * 而是"剩下那些为什么没修" —— 不然他们会以为按钮没生效、反复点。
+ */
+export interface AutoRepairResult {
+  /** 这次一共核对了多少条。 */
+  checked: number;
+  /** 修好的（目标被改到新位置）。 */
+  repaired: AutoRepairItem[];
+  /** 确实是坏的、但这次没找到下落的条数。 */
+  stillBroken: number;
+  /**
+   * 缺身份的条数：这个功能上线之前就存下的老链接，或者跨盘搬过、
+   * 身份号对不上的。它们只能靠名字找，而名字不够硬，所以**不动手**。
+   */
+  noTrace: number;
+}
+
 // ===============================================================
 // 文件夹
 // ===============================================================
-
 /**
  * 一个文件夹，用来给条目分类。
  *
@@ -650,6 +679,18 @@ export const api = {
    * 候选里带大小和修改时间，界面上要显示出来 —— 见 {@link SameNameCandidate}。
    */
   linkFindSameName: (id: string) => invoke<SameNameCandidate[]>("link_find_same_name", { id }),
+  /**
+   * 批量扫一遍坏掉的链接，**能确定的直接改好**。
+   *
+   * "能确定"只有一种：按 `(卷号, 文件索引号)` 找到的那个文件 —— 那不是猜，
+   * 是核对出来的同一个东西。同名的、大小相同的都**不自动改**，
+   * 因为一旦改错，用户不会收到任何提示，点开还照样"成功"。
+   *
+   * `folderId` 传 `null` 就是全部；传某个文件夹的 id 就只扫那一摞
+   * （用户说的"对当前文件夹扫"）。
+   */
+  linksAutoRepair: (folderId: string | null) =>
+    invoke<AutoRepairResult>("links_auto_repair", { folderId }),
   linkIcon: (path: string) => invoke<IconData | null>("link_icon", { path }),
   /**
    * 判断一批路径各自是什么（拖拽添加链接时用）。
