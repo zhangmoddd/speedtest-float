@@ -522,15 +522,22 @@ namespace NetSpeedBall
         }
 
         /// <summary>
-        /// 找浮光面板程序：优先同目录，其次上一级（开发时两个工程是平级的）。
+        /// 找浮光面板程序：优先「面板」子文件夹，其次同目录，最后上一级（开发时两个工程是平级的）。
+        ///
+        /// 为什么子文件夹排在最前面：发布包里球和浮光是分开放的 ——
+        /// 桌面上并排摆两个 exe，用户第一反应是"我该点哪个"。
+        /// 把浮光收进「面板\」之后，用户只看得见球，而球自己知道去哪儿找人。
+        /// 同目录仍然保留：拆开发的时候（ball 和 app 各自编各自的）两个 exe 是平级的。
         /// </summary>
         private static string LocateFuguangPanel()
         {
             string[] names = { "浮光面板.exe", "fuguang.exe" };
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string[] dirs =
             {
-                AppDomain.CurrentDomain.BaseDirectory,
-                Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")),
+                Path.Combine(baseDir, "面板"),
+                baseDir,
+                Path.GetFullPath(Path.Combine(baseDir, "..")),
             };
 
             foreach (string dir in dirs)
