@@ -403,12 +403,25 @@ fn roots_for(hint: &str) -> Vec<PathBuf> {
         }
     }
 
-    // 3. 最后才是盘根。放最后不是因为它不重要，而是因为它最贵。
-    if let Some(first) = roots.first() {
-        if let Some(root) = first.ancestors().last() {
-            let root = root.to_path_buf();
-            push(root, &mut roots);
-        }
+    // 3. 盘根，**无条件**加，而且摆到**最前面**。
+    //
+    //    ⚠️ 这里原来是 `if let Some(first) = roots.first()` —— 也就是
+    //    "连一层祖上都找不到就放弃"。那正好漏掉唯一还能找的地方：
+    //    原路径整个被删/改名时 roots 可能是空的，而用户把文件拖到盘根
+    //    （`D:\清内存-双击这个.bat`）是非常常见的动作，实测就撞上了。
+    //
+    //    ⚠️ 为什么还要挪到最前面（实测数据）：盘根只有几十个目录项，
+    //    扫它几乎免费；而它后面的祖先可能是几万项的巨型目录。
+    //    排在后面时，用户点一下「找找看」要等 **1.5 秒**才出结果，
+    //    排到前面就是几十毫秒 —— 屏幕上是"转一下就好了"和
+    //    "卡了一下，是不是死了"的区别。
+    let drive_root = Path::new(hint.trim_matches('"'))
+        .ancestors()
+        .last()
+        .map(|p| p.to_path_buf());
+    if let Some(root) = drive_root.filter(|r| r.is_dir()) {
+        roots.retain(|r| r != &root);
+        roots.insert(0, root);
     }
 
     roots
@@ -429,10 +442,20 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
     let started = Instant::now();
     let mut seen = 0usize;
 
+    // ---- 所有起点放进**同一个**队列，按深度一层层铺开 ----
+    //
+    // ⚠️ 这里原来是"逐个根挖到底，挖完一个再挖下一个"，实测撞了个正着：
+    //
+    //   用户先把文件挪进 `D:\Project\workbuddy\一键清内存工具\`，链接跟着改好；
+    //   后来又把文件拖到了 `D:\` 的根目录。这时往上退出来的根依次是
+    //   `D:\Project\workbuddy`（两万多个条目）、`D:\Project`（更多）、`D:\`（几十个）。
+    //   串行扫的话，前两个根就把条目预算吃光了，`D:\` **一次都没轮到** ——
+    //   界面上就是"找不到"，而文件就在最浅的那一层，一眼就能看见。
+    //
+    // 合并成一个队列之后，`D:\` 的第一层会和 `D:\Project\workbuddy` 的第一层
+    // 一起被扫。**便宜的根先出结果，贵的根不会把它挡在后面。**
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
     for root in roots_for(hint) {
-        if seen >= MAX_ENTRIES || started.elapsed() > BUDGET {
-            break;
-        }
         // 卷不一样就不可能命中：索引号只在**本卷内**唯一，
         // 拿 A 盘的号去 B 盘比，撞上一个无关文件的风险是真实存在的。
         let Some(root_trace) = trace_of(&root.to_string_lossy()) else {
@@ -441,83 +464,93 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
         if root_trace.volume_serial != trace.volume_serial {
             continue;
         }
+        queue.push_back((root, 0usize));
+    }
 
-        let mut queue = VecDeque::from([(root, 0usize)]);
-        while let Some((dir, depth)) = queue.pop_front() {
-            if seen >= MAX_ENTRIES || started.elapsed() > BUDGET {
-                break;
-            }
-
-            let mut children: Vec<PathBuf> = Vec::new();
-            walk_dir(&dir, &mut |entry| {
-                seen += 1;
-                if seen >= MAX_ENTRIES || started.elapsed() > BUDGET {
-                    return false;
-                }
-
-                // 符号链接 / junction / OneDrive 占位：不进去、也不算候选。
-                // 跟进去可能绕圈，也可能一步跨到别的盘甚至另一台主机上。
-                if entry.attributes & 0x400 != 0 {
-                    return true;
-                }
-
-                if entry.is_dir == want_dir {
-                    let hit = if entry.file_id == trace.file_id {
-                        Some((TraceMatch::SameFile, 100u8))
-                    } else if !want_dir
-                        && trace.bytes > 0
-                        && entry.bytes == trace.bytes
-                        && match (entry.modified_ms, trace.modified_ms) {
-                            (Some(a), Some(b)) => (a - b).abs() <= 2000,
-                            _ => false,
-                        }
-                    {
-                        Some((TraceMatch::SameContent, 50u8))
-                    } else {
-                        None
-                    };
-
-                    if let Some((how, _)) = hit {
-                        let full = dir.join(&entry.name);
-                        let target = if how == TraceMatch::SameFile {
-                            &mut exact
-                        } else {
-                            &mut soft
-                        };
-                        if !target.iter().any(|h| h.path == full.to_string_lossy()) {
-                            target.push(TraceHit {
-                                path: full.to_string_lossy().into_owned(),
-                                bytes: entry.bytes,
-                                modified_ms: entry.modified_ms,
-                                how,
-                            });
-                        }
-                        if exact.len() >= MAX_HITS {
-                            return false;
-                        }
-                    }
-                }
-
-                if entry.is_dir && depth < MAX_DEPTH {
-                    children.push(dir.join(&entry.name));
-                }
-                true
-            });
-
-            for child in children {
-                queue.push_back((child, depth + 1));
-            }
-        }
-
-        // 身份号命中是**确定**的，找到就不用再往下扫别的根了
-        if !exact.is_empty() {
+    'scan: while let Some((dir, depth)) = queue.pop_front() {
+        if seen >= MAX_ENTRIES || started.elapsed() > BUDGET || !exact.is_empty() {
             break;
         }
+
+        let mut children: Vec<PathBuf> = Vec::new();
+        let keep_going = walk_dir(&dir, &mut |entry| {
+            seen += 1;
+            if seen >= MAX_ENTRIES || started.elapsed() > BUDGET {
+                return false;
+            }
+            // 已经按身份号锁定了，**立刻停**。
+            //
+            // 身份号命中是确定的：就是它，不会再有"另一个同一个人"。
+            // 继续扫只会让用户多等 —— 实测这条真实用例里，命中发生在
+            // 盘根的第一层（几十个目录项），但没有这一句的话，
+            // 搜索还会把后面那几个几万项的祖先目录全部扫完，
+            // 结果是「明明几十毫秒就该出结果，用户盯着转圈看了一秒多」。
+            if !exact.is_empty() {
+                return false;
+            }
+
+            // 符号链接 / junction / OneDrive 占位：不进去、也不算候选。
+            // 跟进去可能绕圈，也可能一步跨到别的盘甚至另一台主机上。
+            if entry.attributes & 0x400 != 0 {
+                return true;
+            }
+            // 隐藏 / 系统项：回收站（`$RECYCLE.BIN`）、`System Volume Information`
+            // 里也会有一堆同大小同时间的文件。扫它们既慢又只会造出误判候选。
+            if entry.attributes & (0x2 | 0x4) != 0 {
+                return true;
+            }
+
+            if entry.is_dir == want_dir {
+                let how = if entry.file_id == trace.file_id {
+                    Some(TraceMatch::SameFile)
+                } else if !want_dir
+                    && trace.bytes > 0
+                    && entry.bytes == trace.bytes
+                    && match (entry.modified_ms, trace.modified_ms) {
+                        (Some(a), Some(b)) => (a - b).abs() <= 2000,
+                        _ => false,
+                    }
+                {
+                    Some(TraceMatch::SameContent)
+                } else {
+                    None
+                };
+
+                if let Some(how) = how {
+                    let text = dir.join(&entry.name).to_string_lossy().into_owned();
+                    let bucket = if how == TraceMatch::SameFile {
+                        &mut exact
+                    } else {
+                        &mut soft
+                    };
+                    if !bucket.iter().any(|h| h.path == text) {
+                        bucket.push(TraceHit {
+                            path: text,
+                            bytes: entry.bytes,
+                            modified_ms: entry.modified_ms,
+                            how,
+                        });
+                    }
+                    if exact.len() >= MAX_HITS {
+                        return false;
+                    }
+                }
+            }
+
+            if entry.is_dir && depth < MAX_DEPTH {
+                children.push(dir.join(&entry.name));
+            }
+            true
+        });
+
+        for child in children {
+            queue.push_back((child, depth + 1));
+        }
+        if !keep_going {
+            break 'scan;
+        }
     }
 
-    for hit in &mut soft {
-        hit.how = TraceMatch::SameContent;
-    }
     exact.extend(soft);
     exact.truncate(MAX_HITS);
     exact
@@ -623,6 +656,49 @@ mod tests {
             hits.iter()
                 .any(|h| h.how == TraceMatch::SameFile && h.path.ends_with("一键清内存工具")),
             "实际：{hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠️ 这条钉的是一个**用户实测撞上的失败**。
+    ///
+    /// 真实过程：文件先被挪进 `…\workbuddy\一键清内存工具\`（链接跟着改好），
+    /// 后来又被人拖到 `D:\` 的根目录。这时往上退出来的起点是
+    /// `…\workbuddy`（两万多个条目）、`…\Project`（更多）、`D:\`（几十个）。
+    ///
+    /// 改动之前是"逐个根挖到底"：前两个巨型的根把条目预算吃光，
+    /// `D:\` 一次都没轮到 —— 界面上写"找不到"，而文件就在最浅的那一层。
+    ///
+    /// 这里刻意把**又深又杂的目录**和**浅层的目标**摆在一起，
+    /// 逼着搜索必须先把便宜的那一层走完。
+    #[test]
+    fn 深目录挡路时浅层的目标也要能找到() {
+        let dir = temp_dir("shallow-wins");
+        let deep = dir.join("很深的目录");
+        std::fs::create_dir_all(deep.join("里")).unwrap();
+        // 造一堆同级杂物，让这个分支"很贵"
+        for i in 0..400 {
+            let p = deep.join(format!("杂物{i}"));
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("填充.txt"), b"x").unwrap();
+        }
+
+        // 目标在浅层（相当于用户把它拖到了盘根那一层）
+        let target = dir.join("清内存-双击这个.bat");
+        std::fs::write(&target, b"echo clear").unwrap();
+        let trace = trace_of(&target.to_string_lossy()).unwrap();
+
+        let moved = dir.join("搬走后改的名字.bat");
+        std::fs::rename(&target, &moved).unwrap();
+
+        // 链接里存的还是那个深层的、已经不存在的路径
+        let stale = deep.join("不存在").join("清内存-双击这个.bat");
+        let hits = find_by_trace(&trace, &stale.to_string_lossy(), false);
+
+        assert!(
+            hits.iter()
+                .any(|h| h.how == TraceMatch::SameFile && h.path.ends_with("搬走后改的名字.bat")),
+            "应该按身份找到移到浅层的文件，实际：{hits:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

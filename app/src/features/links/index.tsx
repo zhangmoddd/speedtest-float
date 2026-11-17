@@ -2204,6 +2204,17 @@ function LinkRepair({
         </>
       )}
 
+      {/* 找完了、一条候选都没有 —— 必须**说出来**。
+          不说的话界面上就是"原因"加三个按钮，用户分不清是
+          "还在找"还是"找完了没找到"，只能反复点「重新检查」。 */}
+      {!sameName.loading && sameName.items.length === 0 && (
+        <div className="repair__hint">
+          <strong>没找到它的下落。</strong>
+          可能是被删除了，或者移到了别的盘（跨盘移动会换掉文件身份号）。
+          这种情况只能手动「重新定位」。
+        </div>
+      )}
+
       <div className="repair__actions">
         <button type="button" className="btn btn--primary" onClick={onRelocate}>
           <FolderSearch size={12} />
