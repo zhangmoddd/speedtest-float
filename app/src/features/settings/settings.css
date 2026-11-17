@@ -1,0 +1,347 @@
+/* ============================================================
+   设置页样式
+   只用 styles.css 里 :root 定义的变量，保证浅色主题一致。
+   ============================================================ */
+
+.settings {
+  padding: 12px 14px 18px;
+  overflow-y: auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings__loading {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--fs-md);
+}
+
+.settings__error {
+  padding: 7px 10px;
+  background: rgba(217, 45, 32, 0.08);
+  border: 1px solid rgba(217, 45, 32, 0.26);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+}
+
+.settings__saved {
+  padding: 6px 10px;
+  background: rgba(11, 122, 88, 0.1);
+  border: 1px solid rgba(11, 122, 88, 0.28);
+  border-radius: var(--radius-sm);
+  color: var(--success);
+  font-size: var(--fs-md);
+}
+
+.settings__group {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+/* 分组标题用一条细线引出，比加背景块更轻，符合"设置页"的密度 */
+.settings__group-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-faint);
+  letter-spacing: 0.5px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  cursor: pointer;
+}
+
+.settings__icon {
+  color: var(--text-dim);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.settings__label {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-md);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.settings__hint {
+  font-style: normal;
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  line-height: 1.55;
+}
+
+.settings__switch {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  cursor: pointer;
+}
+
+.settings__number {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.settings__number input {
+  width: 62px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  color: var(--text);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  outline: none;
+  text-align: right;
+}
+
+.settings__number input:focus {
+  border-color: rgba(29, 78, 216, 0.55);
+}
+
+.settings__unit {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+}
+
+.settings__note {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  line-height: 1.65;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* 警告类说明：加一点底色让它和普通说明区分开，但不要红得刺眼 */
+.settings__note--warn {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  background: rgba(217, 45, 32, 0.05);
+  border: 1px solid rgba(217, 45, 32, 0.18);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+}
+
+.settings__note--warn svg {
+  color: var(--danger);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.settings__note--warn strong {
+  color: var(--danger);
+}
+
+.settings__code {
+  display: block;
+  padding: 5px 7px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  word-break: break-all;
+  user-select: text;
+}
+
+.settings__warn {
+  color: var(--danger);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+}
+
+/* 危险动作按钮：退出这类操作要一眼看出和普通按钮不同，避免误点。
+   用描边 + 红字而不是实心红底 —— 实心红底太像"确认删除"的强提示，
+   这里只是"请留意"，不需要那么强的视觉重量。 */
+.btn--danger {
+  align-self: flex-start;
+  color: var(--danger);
+  border-color: rgba(217, 45, 32, 0.35);
+  background: rgba(217, 45, 32, 0.06);
+}
+
+.btn--danger:hover {
+  background: rgba(217, 45, 32, 0.12);
+  border-color: rgba(217, 45, 32, 0.5);
+}
+
+/* ---------- 字号选择 ---------- */
+
+.settings__sizes {
+  display: grid;
+  /* 四档等宽铺满，而不是按内容宽度挤在一起——
+     每档文字大小不同，按内容排会显得参差不齐 */
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding-left: 24px;
+}
+
+.settings__size {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  /* 固定高度：每档字号不同，不固定的话按钮会高低不一 */
+  height: 52px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.settings__size:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.settings__size--active {
+  background: var(--accent-soft);
+  border-color: rgba(29, 78, 216, 0.42);
+  color: var(--accent);
+}
+
+/* 像素值用固定的小字，不跟随预览字号，
+   否则"特大"那一档的标注会把按钮挤爆 */
+.settings__size-px {
+  font-style: normal;
+  font-size: 9px;
+  color: var(--text-faint);
+  line-height: 1;
+}
+
+.settings__size--active .settings__size-px {
+  color: var(--accent);
+}
+
+/* ---------- 悬浮球配色 ---------- */
+
+/* 和第二组设置拉开距离，不然两块会挤在一起看不清是一组 */
+.settings__row--spaced {
+  margin-top: 4px;
+}
+
+.settings__balls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding-left: 24px;
+}
+
+.settings__ball {
+  padding: 3px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.settings__ball:hover {
+  border-color: var(--border-strong);
+}
+
+.settings__ball--active {
+  border-color: var(--accent);
+}
+
+/* 缩小的球体本体。用真实的底色/描边/投影，所见即所得。 */
+.settings__ball-dot {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border-width: 1px;
+  border-style: solid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 缩略图上的投影要弱化，否则一堆小球挤在一起会很脏 */
+  filter: saturate(1);
+}
+
+/* 和悬浮球本体一样：PNG 当遮罩，颜色由 background-color 给。
+   遮罩图由 styles.css 的 :root 统一定义（见那里的说明：写多份会被内联多份）。 */
+.settings__ball-mark {
+  display: block;
+  width: 60%;
+  aspect-ratio: 156 / 104;
+  -webkit-mask-image: var(--logo-mark-mask);
+  mask-image: var(--logo-mark-mask);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/* ---------- 全局热键录制器 ---------- */
+
+.settings__hotkey {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 24px;
+}
+
+/* 做成按钮而不是 input：录制时它不接收文本输入，
+   只是"按下组合键"的落点，用按钮语义更准确（也能聚焦以接收 keydown）。 */
+.settings__recorder {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 6px 9px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: var(--fs-md);
+  cursor: pointer;
+  outline: none;
+}
+
+.settings__recorder:hover {
+  border-color: var(--border-strong);
+}
+
+/* 录制中用强调色描边 + 虚线，让"正在等待按键"这件事一眼可见 */
+.settings__recorder--recording {
+  border-color: var(--accent);
+  border-style: dashed;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.settings__code--inline {
+  display: inline;
+  padding: 2px 5px;
+  font-size: var(--fs-sm);
+  color: var(--accent);
+}
+

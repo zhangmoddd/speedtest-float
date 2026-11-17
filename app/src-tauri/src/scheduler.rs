@@ -1,0 +1,1085 @@
+//! 后台调度线程：负责"到点了就弹窗"。
+//!
+//! # 为什么必须放在 Rust 侧
+//!
+//! 面板窗口平时是隐藏的。隐藏的 WebView 里 `setInterval` 会被系统降频
+//! （Chromium 对后台页面的定时器有节流），倒计时会变慢、提醒会漏。
+//! 所以权威时钟必须放在原生线程里，前端只负责显示和编辑。
+//!
+//! # 时间语义
+//!
+//! 只做 `now >= 目标时刻` 的大小比较，不做任何日期运算（原因见 [`crate::models`]）。
+//! 重复提醒的"下一次时刻"由前端算好后写回来。
+//!
+//! # 分层：纯逻辑 / IO
+//!
+//! 判定部分（[`evaluate`] 及其辅助函数）是**纯函数**：只接收数据切片与 `now`，
+//! 不碰 `AppHandle`、不碰文件、不碰窗口。这样它们能被单元测试直接覆盖。
+//!
+//! 这一点很关键：这些判定的 bug 表现是"某天提醒没响"或"重复弹两次"，
+//! 用户很难察觉、也很难复现。把它们做成纯函数是唯一能可靠测到的办法。
+//!
+//! IO 部分（读状态、落盘、弹窗、发事件）在 `run_*` 里，只负责把纯逻辑的结果
+//! 搬出去，本身没有分支逻辑，出 bug 的空间小得多。
+
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::models::{now_ms, Memo, PendingAlert, PomodoroPhase, Timer, TimerKind};
+use crate::state::{self, AppState, Store};
+use crate::windows;
+
+/// 轮询间隔。
+///
+/// 取 500ms 而不是 1s：提醒最多晚半秒，肉眼无感，
+/// 但能避免"刚好卡在整秒边界"导致提醒晚 1 秒的观感问题。
+const TICK: Duration = Duration::from_millis(500);
+
+/// 汇总提醒里最多列出多少条，超出只报数量，避免弹窗被撑爆。
+const MAX_LISTED: usize = 8;
+
+// ===============================================================
+// 纯逻辑
+// ===============================================================
+
+/// 一次判定的结果。
+#[derive(Debug, Default)]
+pub struct Evaluation {
+    /// 本次需要弹出的提醒，按原定时刻升序。
+    pub alerts: Vec<PendingAlert>,
+    /// 计时器数据是否被改动（决定要不要落盘）。
+    pub timers_changed: bool,
+    /// 备忘录数据是否被改动。
+    pub memos_changed: bool,
+}
+
+/// 判定所有计时器与备忘录。
+///
+/// 会**就地修改**传入的数据（标记已提醒、推进番茄钟阶段），
+/// 因为"判定"和"更新状态"本质是同一件事：不可能只判定不更新，
+/// 否则下一 tick 会重复弹同一条。
+pub fn evaluate(timers: &mut [Timer], memos: &mut [Memo], now: i64) -> Evaluation {
+    let mut out = Evaluation::default();
+
+    evaluate_timers(timers, now, &mut out);
+    evaluate_memos(memos, now, &mut out);
+
+    // 按原定时刻排序，让用户看到的顺序符合直觉（先发生的先说）
+    out.alerts.sort_by_key(|a| a.due_at);
+    out
+}
+
+/// 判定计时器。
+fn evaluate_timers(timers: &mut [Timer], now: i64, out: &mut Evaluation) {
+    for t in timers.iter_mut() {
+        // 没有结束时刻 = 没在跑（未开始 / 已暂停 / 秒表）
+        let Some(ends) = t.ends_at else { continue };
+        // 没到点，或这一轮已经提醒过
+        if now < ends || t.fired {
+            continue;
+        }
+
+        match t.kind {
+            TimerKind::Countdown => {
+                // 标记完成。`remaining_ms` 清 0 只是"这一轮跑完了"，
+                // 用户当初设定的时长存在 `duration_ms` 里，重置时靠它恢复。
+                t.fired = true;
+                t.ends_at = None;
+                t.remaining_ms = Some(0);
+                out.timers_changed = true;
+
+                out.alerts.push(PendingAlert {
+                    source: "timer".into(),
+                    id: t.id.clone(),
+                    title: t.name.clone(),
+                    body: "倒计时已完成".into(),
+                    due_at: ends,
+                });
+            }
+
+            TimerKind::Pomodoro => {
+                // 阶段切换：专注结束进入休息，休息结束进入专注。
+                // 立刻为下一个阶段设好结束时刻并清掉 fired，
+                // 这样番茄钟能自己一直循环下去，不需要前端参与。
+                // 下限 1 分钟，**不能省**。
+                //
+                // `focus_minutes` / `break_minutes` 在 Rust 侧没有任何校验，
+                // 而 `timers.json` 是纯文本、用户能手动编辑，`#[serde(default)]`
+                // 也只管字段缺失、管不了显式的 0。一旦是 0：
+                //   `ends_at = now + 0` → 每个 tick（500ms）都判定"又到点了" →
+                //   弹窗风暴 + 每 500ms 写一次盘 + `rounds` 无限膨胀。
+                // 正常路径前端会拦住 0，但数据文件是可以被手改的。
+                let focus_ms = (t.focus_minutes.max(1) as i64) * 60_000;
+                let break_ms = (t.break_minutes.max(1) as i64) * 60_000;
+
+                let (next_phase, next_len, body) = match t.phase {
+                    Some(PomodoroPhase::Break) => (
+                        PomodoroPhase::Focus,
+                        focus_ms,
+                        format!("休息结束，开始专注 {} 分钟", t.focus_minutes),
+                    ),
+                    _ => {
+                        t.rounds += 1;
+                        (
+                            PomodoroPhase::Break,
+                            break_ms,
+                            format!(
+                                "专注结束，休息 {} 分钟（已完成 {} 轮）",
+                                t.break_minutes, t.rounds
+                            ),
+                        )
+                    }
+                };
+
+                t.phase = Some(next_phase);
+                t.ends_at = Some(now + next_len);
+                t.fired = false;
+                out.timers_changed = true;
+
+                out.alerts.push(PendingAlert {
+                    source: "timer".into(),
+                    id: t.id.clone(),
+                    title: t.name.clone(),
+                    body,
+                    due_at: ends,
+                });
+            }
+
+            // 秒表是正向计时，没有"到点"这回事
+            TimerKind::Stopwatch => {}
+
+            TimerKind::Alarm => {
+                // 和倒计时完全同一套收尾：标记已响、清掉结束时刻。
+                //
+                // 刻意**不**在这里推进「每天重复」的下一次。算下一次要按
+                // 本地时区做日期运算（"明天 07:30"不等于"加 86400000 毫秒"，
+                // 夏令时那天只有 23 小时），而 Rust 侧没有日历能力也不打算有
+                // （见 crate::models 顶部的分工）。所以下一次由前端在收到
+                // `fired` 之后算好写回来，和备忘录的重复提醒是同一条路。
+                //
+                // `remaining_ms` 不动：闹钟没有"剩余时长"这个概念，
+                // 留着 null 比塞一个 0 更诚实。
+                t.fired = true;
+                t.ends_at = None;
+                // 记下**真的响了的时刻**：卡片上要显示「已响过 · 昨天 11:30」。
+                // 前端推算不出这个值 —— 软件没开的时候闹钟不响，
+                // 推算只会给出"最近的某个钟点"，那是个假时间。
+                t.last_fired_at = Some(now);
+                out.timers_changed = true;
+
+                out.alerts.push(PendingAlert {
+                    // 单独标成 `alarm` 而不是 `timer`：提醒窗要靠它决定
+                    // **响多久**。闹钟按手机的逻辑"响到你处理为止"（10 分钟自动静音），
+                    // 而倒计时/番茄钟/备忘只是一声提醒，响半分钟就该停。
+                    source: "alarm".into(),
+                    id: t.id.clone(),
+                    title: t.name.clone(),
+                    body: "闹钟响了".into(),
+                    due_at: ends,
+                });
+            }
+        }
+    }
+}
+
+/// 判定备忘录提醒。
+fn evaluate_memos(memos: &mut [Memo], now: i64, out: &mut Evaluation) {
+    for m in memos.iter_mut() {
+        let Some(at) = m.remind_at else { continue };
+        // `fired_for` 是幂等标记：同一个提醒时刻只弹一次。
+        //
+        // 这个标记不可省。前端负责在弹窗后把 `remind_at` 推到下一次，
+        // 但前端可能因为窗口被降频而慢半拍；没有这个标记的话，
+        // 在它写回之前每 500ms 都会再弹一次，用户会被刷屏。
+        if now < at || m.fired_for == Some(at) {
+            continue;
+        }
+
+        m.fired_for = Some(at);
+        out.memos_changed = true;
+
+        out.alerts.push(PendingAlert {
+            source: "memo".into(),
+            id: m.id.clone(),
+            title: m.title.clone(),
+            body: summarize_body(&m.body),
+            due_at: at,
+        });
+    }
+}
+
+/// 把提醒列表拼成弹窗要显示的标题与正文。
+///
+/// 只有一条时直接显示它本身（用户最关心"是什么事"）；
+/// 多条时用 `multi_title` 生成汇总标题，正文逐条列出。
+///
+/// `multi_title` 是个闭包而不是模板字符串：条数只有在这里才知道，
+/// 让调用方拿到 `n` 自己决定措辞，比在字符串里塞占位符再替换干净得多。
+/// 开机补发时传「你错过了 N 条提醒」，运行时同时到点则传中性的「N 条提醒」。
+pub fn compose_alert(
+    alerts: &[PendingAlert],
+    multi_title: impl Fn(usize) -> String,
+) -> Option<(String, String)> {
+    match alerts.len() {
+        0 => None,
+        1 => Some((alerts[0].title.clone(), alerts[0].body.clone())),
+        n => {
+            let mut lines: Vec<String> = alerts
+                .iter()
+                .take(MAX_LISTED)
+                .map(|a| format!("· {} —— {}", a.title, a.body))
+                .collect();
+            if n > MAX_LISTED {
+                lines.push(format!("…… 还有 {} 条", n - MAX_LISTED));
+            }
+            Some((multi_title(n), lines.join("\n")))
+        }
+    }
+}
+
+/// 把备忘正文压成一行摘要，用于弹窗。
+fn summarize_body(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 120 {
+        format!("{}…", flat.chars().take(120).collect::<String>())
+    } else if flat.is_empty() {
+        "（无内容）".into()
+    } else {
+        flat
+    }
+}
+
+// ===============================================================
+// 线程与 IO
+// ===============================================================
+
+/// 启动调度线程。需要在 `setup` 阶段调用一次。
+pub fn start(app: AppHandle) {
+    thread::spawn(move || {
+        // 每一轮都套一层 **panic 守卫**。
+        //
+        // 不加的话：`run()` 里任何一处 panic 都会让**整个调度线程**结束 ——
+        // 倒计时、番茄钟、备忘录提醒**全部永久静默**，而且没有任何地方能发现
+        // （正式版是 `windows_subsystem = "windows"`，panic 信息进不了任何地方）。
+        // 用户只会觉得"提醒怎么不响了"，只有重启才可能恢复。
+        //
+        // 捕获之后继续跑：一次判定出错不该让所有提醒一起陪葬。
+        // 锁中毒不用担心：全项目的 `lock()` 都写了 `unwrap_or_else(|e| e.into_inner())`。
+        let tick = |app: &AppHandle, first: bool| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(app, first);
+            }));
+            if outcome.is_err() {
+                crate::diag!(
+                    "[浮光] 调度线程这一轮判定 panic 了，已跳过这一轮并继续运行（提醒不会因此永久停止）"
+                );
+            }
+        };
+
+        // 第一次 tick 单独处理：把所有"已经过期"的项目**汇总成一条**提醒，
+        // 而不是逐个弹窗。这就是设计里说的「开机后汇总补发错过的提醒」。
+        thread::sleep(TICK);
+        tick(&app, true);
+
+        loop {
+            thread::sleep(TICK);
+            tick(&app, false);
+        }
+    });
+}
+
+/// 跑一次判定并把结果搬出去。
+///
+/// `first` 为真表示这是开机后的第一次，措辞用"你错过了"。
+fn run(app: &AppHandle, first: bool) {
+    let now = now_ms();
+
+    let (mut alerts, timers_changed, memos_changed) = {
+        let store = app.state::<Store>();
+        let mut st = store.lock();
+
+        // 先解构出两个字段的不相交可变借用。
+        //
+        // 不能直接写 `evaluate(&mut st.timers, &mut st.memos, ...)`：
+        // `st` 是 MutexGuard，`st.timers` 会经 DerefMut 借走整个 guard，
+        // 于是第二次取 `st.memos` 就变成重复可变借用，编译不过。
+        let AppState { timers, memos, .. } = &mut *st;
+
+        let result = evaluate(timers, memos, now);
+        (result.alerts, result.timers_changed, result.memos_changed)
+    };
+
+    // 稍后提醒是**独立于数据**的一条队列：这一 tick 可能没有任何到点，
+    // 但用户几分钟前排的「稍后提醒」到时间了。
+    //
+    // 并进同一个列表里让 `compose_alert` 统一拼标题正文，而不是另弹一次：
+    // 提醒窗只有一个，两次 `show_alert` 会让后一条把前一条顶掉，
+    // 而 `evaluate` 已经把那些标记成"已弹过"了 —— 那等于丢了一条提醒。
+    alerts.extend(take_due_snoozes(now));
+    alerts.sort_by_key(|a| a.due_at);
+
+    if alerts.is_empty() {
+        return;
+    }
+
+    persist(app, timers_changed, memos_changed);
+    notify_frontend(app, timers_changed, memos_changed);
+
+    let multi_title = |n: usize| {
+        if first {
+            format!("你错过了 {n} 条提醒")
+        } else {
+            format!("{n} 条提醒")
+        }
+    };
+
+    // 闹钟按手机的逻辑响到你处理为止，其余几种只是一声提醒（见 AlertWindow）
+    let is_alarm = alerts.iter().any(|a| a.source == "alarm");
+
+    if let Some((title, body)) = compose_alert(&alerts, multi_title) {
+        let _ = windows::show_alert(app, &title, &body, is_alarm);
+    }
+}
+
+// ===============================================================
+// 「稍后提醒」
+// ===============================================================
+
+/// 一条排队中的稍后提醒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snooze {
+    title: String,
+    body: String,
+    /// 该重新弹出来的时刻。
+    at: i64,
+}
+
+/// 稍后提醒的队列。
+///
+/// 抽成独立结构体而不是直接在静态变量上写操作：**这样才能单测**。
+/// 挂在全局静态上的话，几个测试并行跑会互相把对方排的条目取走。
+#[derive(Default)]
+struct SnoozeQueue {
+    items: Vec<Snooze>,
+}
+
+impl SnoozeQueue {
+    /// 排一条。
+    fn push(&mut self, title: &str, body: &str, minutes: u32, now: i64) {
+        self.items.push(Snooze {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            at: now + (minutes as i64) * 60_000,
+        });
+    }
+
+    /// 取走所有到点的，剩下的留着。
+    fn take_due(&mut self, now: i64) -> Vec<Snooze> {
+        let mut due = Vec::new();
+        let mut rest = Vec::new();
+        for s in self.items.drain(..) {
+            if s.at <= now {
+                due.push(s);
+            } else {
+                rest.push(s);
+            }
+        }
+        self.items = rest;
+        due
+    }
+}
+
+/// 排队中的稍后提醒。
+///
+/// # 为什么不去改那条数据本身
+///
+/// 手机闹钟响的时候有两个选择：关掉，或者「稍后提醒」。
+/// 后者说的是**"这条提醒再等我五分钟"**，不是"把我的闹钟改成五分钟后"。
+/// 所以这里是一条独立的队列：闹钟的钟点、备忘的提醒时刻**一个都不动**，
+/// 也就不会把用户设的时间悄悄改掉（那才是真的坑）。
+///
+/// # 为什么只放内存里
+///
+/// 稍后提醒都是几分钟的事。为它单开一份持久化文件 —— 还要一并处理
+/// 备份、恢复、损坏隔离 —— 不划算。代价是软件重启会丢掉排队中的稍后提醒，
+/// 记在 README 的「已知限制」里。
+static SNOOZES: OnceLock<Mutex<SnoozeQueue>> = OnceLock::new();
+
+fn snooze_slot() -> &'static Mutex<SnoozeQueue> {
+    SNOOZES.get_or_init(|| Mutex::new(SnoozeQueue::default()))
+}
+
+/// 排一条稍后提醒。
+///
+/// `minutes` 由调用方夹到合理区间（见 `commands::snooze_alert`）。
+pub fn push_snooze(title: &str, body: &str, minutes: u32, now: i64) {
+    snooze_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(title, body, minutes, now);
+}
+
+/// 取出所有到点的稍后提醒，剩下的留在队列里。
+///
+/// 转成 [`PendingAlert`] 而不是单独弹一次：理由见 `run` 里那段说明。
+pub fn take_due_snoozes(now: i64) -> Vec<PendingAlert> {
+    snooze_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_due(now)
+        .into_iter()
+        .map(|s| PendingAlert {
+            source: "snooze".into(),
+            // 稍后提醒不对应任何一条数据，没有 id 可给
+            id: String::new(),
+            title: s.title,
+            body: s.body,
+            due_at: s.at,
+        })
+        .collect()
+}
+
+/// 落盘被修改的集合。
+fn persist(app: &AppHandle, timers: bool, memos: bool) {
+    let store = app.state::<Store>();
+    // 走 `state::persist` 而不是自己 clone 再 save：快照必须在写锁内取。
+    // 自己先 clone 的话，手里这份是**调用时刻**的旧快照，
+    // 落盘时会把并发命令刚写进去的新数据整份盖回去
+    // （已复现：编辑被回滚、删掉的计时器复活）。
+    if timers {
+        if let Err(e) = state::persist(app, || store.lock().timers.clone(), state::save_timers) {
+            crate::diag!("[浮光] 保存计时器失败：{e}");
+        }
+    }
+    if memos {
+        if let Err(e) = state::persist(app, || store.lock().memos.clone(), state::save_memos) {
+            crate::diag!("[浮光] 保存备忘录失败：{e}");
+        }
+    }
+}
+
+/// 通知前端刷新。
+///
+/// 前端可能正在显示计时器列表，需要立刻反映"已完成""已进入休息阶段"等变化。
+/// 前端没在监听也不影响，事件会被丢弃。
+fn notify_frontend(app: &AppHandle, timers: bool, memos: bool) {
+    let mut what: Vec<&str> = Vec::new();
+    if timers {
+        what.push("timers");
+    }
+    if memos {
+        what.push("memos");
+    }
+    let _ = app.emit("state-changed", serde_json::json!({ "what": what }));
+}
+
+// ===============================================================
+// 测试
+//
+// 这一组测试针对的是"错了也不会立刻发现"的逻辑：
+// 提醒漏弹、重复弹、番茄钟阶段错乱。
+// 这些问题的共同特点是用户很难察觉、更难复现，所以必须靠测试兜住。
+// ===============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Repeat;
+
+    // ---------- 稍后提醒的队列 ----------
+
+    #[test]
+    fn 稍后提醒排进去之后还没到点不会被取走() {
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+
+        assert!(q.take_due(NOW).is_empty(), "刚排上就取走等于没延后");
+        assert!(q.take_due(NOW + 4 * 60_000).is_empty(), "差一分钟也不该取");
+        // 还留在队列里
+        assert_eq!(q.items.len(), 1);
+    }
+
+    #[test]
+    fn 稍后提醒到点会被取走而且只取一次() {
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+
+        let due = q.take_due(NOW + 5 * 60_000);
+        assert_eq!(due.len(), 1, "正好到点就该取走");
+        assert_eq!(due[0].title, "开会");
+        assert_eq!(due[0].body, "10:30 的会");
+        assert_eq!(due[0].at, NOW + 5 * 60_000);
+
+        // 再取一次不能又冒出来 —— 否则每 500ms 弹一次，变成刷屏
+        assert!(q.take_due(NOW + 10 * 60_000).is_empty());
+    }
+
+    #[test]
+    fn 稍后提醒只取到点的那些其余留着() {
+        let mut q = SnoozeQueue::default();
+        q.push("早的", "1", 5, NOW);
+        q.push("晚的", "2", 30, NOW);
+
+        let due = q.take_due(NOW + 6 * 60_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].title, "早的");
+        // 晚的那条必须还在，等到点再弹
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].title, "晚的");
+    }
+
+    #[test]
+    fn 稍后提醒排出来的是一条独立来源的待弹提醒() {
+        // 它不对应任何一条数据，所以没有 id；来源标成 snooze
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+        let due = q.take_due(NOW + 5 * 60_000);
+
+        let alert = PendingAlert {
+            source: "snooze".into(),
+            id: String::new(),
+            title: due[0].title.clone(),
+            body: due[0].body.clone(),
+            due_at: due[0].at,
+        };
+        assert_eq!(alert.source, "snooze");
+        assert!(alert.id.is_empty());
+    }
+
+    #[test]
+    fn 闹钟的提醒来源标成_alarm_而不是_timer() {
+        // 提醒窗靠这个字段决定**响多久**：闹钟按手机逻辑响到你处理为止，
+        // 倒计时/番茄钟只是一声提醒。标错了会让倒计时也响十分钟。
+        let mut timers = vec![timer("a", TimerKind::Alarm, Some(NOW))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "alarm");
+    }
+
+    #[test]
+    fn 倒计时的提醒来源仍然是_timer() {
+        let mut timers = vec![timer("t", TimerKind::Countdown, Some(NOW))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "timer");
+    }
+
+    /// 基准时刻。用固定值而不是 `now_ms()`，
+    /// 否则测试会随运行时间漂移，边界断言变得不可靠。
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn timer(id: &str, kind: TimerKind, ends_at: Option<i64>) -> Timer {
+        Timer {
+            id: id.into(),
+            name: format!("计时器-{id}"),
+            kind,
+            ends_at,
+            remaining_ms: None,
+            duration_ms: Some(60_000),
+            phase: None,
+            focus_minutes: 25,
+            break_minutes: 5,
+            rounds: 0,
+            elapsed_ms: 0,
+            running_since: None,
+            laps: Vec::new(),
+            alarm_minutes: 0,
+            alarm_daily: false,
+            last_fired_at: None,
+            fired: false,
+            folder_id: None,
+            created_at: 0,
+        }
+    }
+
+    fn memo(id: &str, remind_at: Option<i64>) -> Memo {
+        Memo {
+            id: id.into(),
+            date: "2026-09-19".into(),
+            title: format!("备忘-{id}"),
+            body: "正文内容".into(),
+            tags: Vec::new(),
+            remind_at,
+            repeat: Repeat::None,
+            fired_for: None,
+            // 图片是独立字段，与提醒摘要无关（见 `summarize_body` 的说明）。
+            // 这里显式给空，正好也是「带图的备忘到点提醒时摘要只取正文」那条断言的输入。
+            images: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    // ---------- 倒计时 ----------
+
+    #[test]
+    fn 倒计时未到点不触发() {
+        let mut timers = vec![timer("a", TimerKind::Countdown, Some(NOW + 1))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert!(result.alerts.is_empty(), "还差 1 毫秒，不该触发");
+        assert!(!result.timers_changed);
+        assert!(!timers[0].fired);
+    }
+
+    #[test]
+    fn 倒计时到点触发并标记完成() {
+        let mut timers = vec![timer("a", TimerKind::Countdown, Some(NOW))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "timer");
+        assert_eq!(result.alerts[0].due_at, NOW);
+        assert!(result.timers_changed);
+
+        // 结束后必须清掉 ends_at，否则下一 tick 会再次判定为"到点"
+        assert_eq!(timers[0].ends_at, None);
+        assert_eq!(timers[0].remaining_ms, Some(0));
+        assert!(timers[0].fired);
+    }
+
+    #[test]
+    fn 倒计时已提醒过不会重复弹() {
+        let mut t = timer("a", TimerKind::Countdown, Some(NOW));
+        t.fired = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 10_000);
+
+        assert!(result.alerts.is_empty(), "fired 为真时不该再弹");
+        assert!(!result.timers_changed);
+    }
+
+    #[test]
+    fn 暂停中的倒计时不触发() {
+        // 暂停的语义就是 ends_at = None + remaining_ms 有值
+        let mut t = timer("a", TimerKind::Countdown, None);
+        t.remaining_ms = Some(30_000);
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 999_999);
+
+        assert!(result.alerts.is_empty());
+        assert_eq!(timers[0].remaining_ms, Some(30_000), "暂停状态不该被判定逻辑改动");
+    }
+
+    #[test]
+    fn 秒表永远不触发() {
+        // 秒表是正向计时。即便因为数据被手动改坏而带上 ends_at，也不该弹窗。
+        let mut t = timer("a", TimerKind::Stopwatch, Some(NOW));
+        t.running_since = Some(NOW - 5_000);
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 100_000);
+
+        assert!(result.alerts.is_empty(), "秒表没有到点这回事");
+        assert!(!result.timers_changed);
+    }
+
+    // ---------- 番茄钟 ----------
+
+    #[test]
+    fn 番茄钟专注结束进入休息() {
+        let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
+        t.phase = Some(PomodoroPhase::Focus);
+        t.focus_minutes = 25;
+        t.break_minutes = 5;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(timers[0].phase, Some(PomodoroPhase::Break));
+        assert_eq!(timers[0].rounds, 1, "完成一轮专注后轮数 +1");
+        // 下一阶段必须立刻排好，番茄钟才能自己循环下去
+        assert_eq!(timers[0].ends_at, Some(NOW + 5 * 60_000));
+        // fired 必须被清掉，否则休息结束时不会提醒
+        assert!(!timers[0].fired);
+    }
+
+    #[test]
+    fn 番茄钟时长为零也不会变成弹窗风暴() {
+        // `timers.json` 是纯文本、可以被手改。focus/break 为 0 时如果不兜底，
+        // `ends_at = now + 0` 会让**每个 tick（500ms）**都判定"又到点了"：
+        // 弹窗风暴 + 每 500ms 写一次盘 + rounds 无限膨胀。
+        // 正常路径前端会拦住 0，但数据文件拦不住。
+        let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
+        t.phase = Some(PomodoroPhase::Focus);
+        t.focus_minutes = 0;
+        t.break_minutes = 0;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1, "这一次到点还是要提醒的");
+        let ends = timers[0].ends_at.expect("下一阶段必须排好时刻");
+        assert!(
+            ends > NOW,
+            "下一阶段必须落在未来，否则下一个 tick 立刻又到点，实际：{ends} vs {NOW}"
+        );
+        // 再跑一次：时刻没到，就不该再弹
+        let again = evaluate(&mut timers, &mut memos, NOW);
+        assert!(again.alerts.is_empty(), "不该每 500ms 弹一次");
+    }
+
+    #[test]
+    fn 番茄钟休息结束回到专注且轮数不变() {        let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
+        t.phase = Some(PomodoroPhase::Break);
+        t.rounds = 3;
+        t.focus_minutes = 25;
+        t.break_minutes = 5;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(timers[0].phase, Some(PomodoroPhase::Focus));
+        assert_eq!(timers[0].rounds, 3, "休息结束不该增加轮数");
+        assert_eq!(timers[0].ends_at, Some(NOW + 25 * 60_000));
+    }
+
+    #[test]
+    fn 番茄钟phase缺失时按专注处理() {
+        // 兜底：老数据或手动改坏的数据可能没有 phase。
+        // 此时必须当作"专注刚结束"，否则这一轮会静默丢掉。
+        let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
+        t.phase = None;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(timers[0].phase, Some(PomodoroPhase::Break));
+        assert_eq!(timers[0].rounds, 1);
+    }
+
+    // ---------- 闹钟 ----------
+
+    #[test]
+    fn 闹钟未到点不触发() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW + 1));
+        t.alarm_minutes = 450;
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert!(result.alerts.is_empty(), "还差 1 毫秒，不该响");
+        assert!(!result.timers_changed);
+    }
+
+    #[test]
+    fn 闹钟到点响一次并停在已完成() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_minutes = 450;
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        // 闹钟单独标成 `alarm`：提醒窗靠它决定响多久（见同名测试）
+        assert_eq!(result.alerts[0].source, "alarm");
+        assert_eq!(result.alerts[0].body, "闹钟响了");
+        assert_eq!(result.alerts[0].due_at, NOW);
+        assert!(result.timers_changed);
+
+        // 必须清掉 ends_at，否则下一个 tick 又判定"到点"，变成每 500ms 弹一次
+        assert_eq!(timers[0].ends_at, None);
+        assert!(timers[0].fired);
+        // 记下真的响了的时刻：卡片上要显示「已响过 · 昨天 11:30」。
+        // 不记的话用户看到"已响过"却不知道是什么时候响的。
+        assert_eq!(timers[0].last_fired_at, Some(NOW));
+        // 闹钟没有"剩余时长"这个概念，不该被塞一个 0 进去
+        assert_eq!(timers[0].remaining_ms, None);
+        // 用户设的钟点不能被调度线程改掉：前端要靠它算下一次
+        assert_eq!(timers[0].alarm_minutes, 450);
+        assert!(timers[0].alarm_daily);
+    }
+
+    #[test]
+    fn 闹钟已响过不会重复弹() {
+        // 前端还没把「每天重复」的下一次写回来时，调度线程每 500ms 都会看到
+        // 这条记录。没有 fired 这道闸门，用户会被闹钟刷屏。
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.fired = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 10_000);
+
+        assert!(result.alerts.is_empty(), "fired 为真时不该再响");
+        assert!(!result.timers_changed);
+    }
+
+    #[test]
+    fn 只响一次的闹钟响完后不会自己再响() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_daily = false;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        evaluate(&mut timers, &mut memos, NOW);
+        assert!(timers[0].fired);
+
+        // 之后无论过多久都不该再响（要再响只能用户自己点）
+        for offset in [500, 60_000, 86_400_000, 7 * 86_400_000] {
+            let again = evaluate(&mut timers, &mut memos, NOW + offset);
+            assert!(again.alerts.is_empty(), "offset={offset} 时不该再响");
+        }
+    }
+
+    #[test]
+    fn 闹钟停在已完成时不会被当成暂停() {
+        // 暂停的语义是 ends_at 为空 + remaining_ms 有值。
+        // 闹钟响完也是 ends_at 为空，如果顺手把 remaining_ms 写成 Some(0)，
+        // 前端就会把它显示成「已暂停」并给出「继续」按钮 —— 点下去会从 0 开始跑。
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(timers[0].ends_at, None);
+        assert_eq!(
+            timers[0].remaining_ms, None,
+            "闹钟没有剩余时长，留 null 才会被判成「已完成」"
+        );
+    }
+
+    // ---------- 备忘录 ----------
+
+    #[test]
+    fn 备忘提醒到点触发并打幂等标记() {
+        let mut timers = Vec::new();
+        let mut memos = vec![memo("m", Some(NOW))];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "memo");
+        assert!(result.memos_changed);
+        assert_eq!(memos[0].fired_for, Some(NOW));
+        // remind_at 不在这里推进——那是前端的责任（要算重复规则与本地时区）
+        assert_eq!(memos[0].remind_at, Some(NOW));
+    }
+
+    #[test]
+    fn 备忘提醒不会重复弹() {
+        let mut timers = Vec::new();
+        let mut memos = vec![memo("m", Some(NOW))];
+
+        // 第一次触发
+        evaluate(&mut timers, &mut memos, NOW);
+        // 之后每一 tick 都判定一次，模拟真实运行
+        for offset in [500, 1_000, 60_000, 3_600_000] {
+            let result = evaluate(&mut timers, &mut memos, NOW + offset);
+            assert!(
+                result.alerts.is_empty(),
+                "同一 remind_at 不该重复弹（offset={offset}）"
+            );
+        }
+    }
+
+    #[test]
+    fn 备忘未设提醒不触发() {
+        let mut timers = Vec::new();
+        let mut memos = vec![memo("m", None)];
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 999_999);
+
+        assert!(result.alerts.is_empty());
+        assert!(!result.memos_changed);
+    }
+
+    #[test]
+    fn 带图片的备忘到点提醒时摘要只取正文() {
+        // 图片是 `Memo::images` 这个**独立字段**，不是正文的一部分，
+        // 所以 `summarize_body(&m.body)` 天然看不到它。
+        //
+        // 这条测试的意义是把"天然看不到"变成"钉住不许变"：
+        // 如果哪天有人为了"提醒里也显示图"改成把图片描述拼进 body，
+        // 提醒弹窗的正文会立刻变成一堆文件名/路径，用户看到的是一句废话。
+        let mut timers = Vec::new();
+        let mut memo_with_image = memo("m", Some(NOW));
+        memo_with_image.images = vec![crate::models::MediaRef {
+            id: "a".repeat(32),
+            name: "屏幕截图 2026-09-19.png".into(),
+            mime: "image/png".into(),
+            width: 1920,
+            height: 1080,
+            bytes: 123_456,
+            added_at: 1,
+        }];
+        let mut memos = vec![memo_with_image];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(
+            result.alerts[0].body, "正文内容",
+            "提醒摘要只能取正文，不能把图片信息算进去"
+        );
+        assert!(
+            !result.alerts[0].body.contains("png"),
+            "摘要里不该出现图片文件名：{}",
+            result.alerts[0].body
+        );
+    }
+
+    #[test]
+    fn 备忘推进到下一次后能再次触发() {
+        // 模拟前端的重复推进：弹过之后把 remind_at 换成下一次、清掉 fired_for
+        let mut timers = Vec::new();
+        let mut memos = vec![memo("m", Some(NOW))];
+
+        evaluate(&mut timers, &mut memos, NOW);
+        assert_eq!(memos[0].fired_for, Some(NOW));
+
+        let next = NOW + 86_400_000; // 明天同一时刻
+        memos[0].remind_at = Some(next);
+        memos[0].fired_for = None;
+
+        let result = evaluate(&mut timers, &mut memos, next);
+        assert_eq!(result.alerts.len(), 1, "推进后的下一次必须能正常触发");
+    }
+
+    // ---------- 组合与排序 ----------
+
+    #[test]
+    fn 多个提醒按原定时刻升序排列() {
+        let mut timers = vec![
+            timer("late", TimerKind::Countdown, Some(NOW - 1_000)),
+            timer("early", TimerKind::Countdown, Some(NOW - 9_000)),
+        ];
+        let mut memos = vec![memo("mid", Some(NOW - 5_000))];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        let ids: Vec<&str> = result.alerts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["early", "mid", "late"], "用户看到的顺序应该按发生先后");
+    }
+
+    #[test]
+    fn 一次判定可以同时处理计时器与备忘() {
+        let mut timers = vec![timer("t", TimerKind::Countdown, Some(NOW))];
+        let mut memos = vec![memo("m", Some(NOW))];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 2);
+        assert!(result.timers_changed);
+        assert!(result.memos_changed);
+    }
+
+    #[test]
+    fn 没有到点项目时不产生任何改动() {
+        let mut timers = vec![timer("t", TimerKind::Countdown, Some(NOW + 60_000))];
+        let mut memos = vec![memo("m", Some(NOW + 60_000))];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert!(result.alerts.is_empty());
+        // 这个断言很重要：如果没到点也报 changed，就会每 500ms 无谓地写一次磁盘
+        assert!(!result.timers_changed);
+        assert!(!result.memos_changed);
+    }
+
+    // ---------- 弹窗文案 ----------
+
+    #[test]
+    fn 单条提醒直接显示内容本身() {
+        let alerts = vec![PendingAlert {
+            source: "timer".into(),
+            id: "a".into(),
+            title: "煮蛋".into(),
+            body: "倒计时已完成".into(),
+            due_at: NOW,
+        }];
+
+        let (title, body) = compose_alert(&alerts, |n| format!("{n} 条")).expect("应有一条");
+
+        assert_eq!(title, "煮蛋", "只有一条时标题就是这件事本身");
+        assert_eq!(body, "倒计时已完成");
+    }
+
+    #[test]
+    fn 多条提醒走汇总标题并逐条列出() {
+        let alerts: Vec<PendingAlert> = (0..3)
+            .map(|i| PendingAlert {
+                source: "memo".into(),
+                id: format!("m{i}"),
+                title: format!("事项{i}"),
+                body: "内容".into(),
+                due_at: NOW + i,
+            })
+            .collect();
+
+        let (title, body) =
+            compose_alert(&alerts, |n| format!("你错过了 {n} 条提醒")).expect("应有三条");
+
+        assert_eq!(title, "你错过了 3 条提醒");
+        assert_eq!(body.lines().count(), 3);
+        assert!(body.contains("事项0"));
+    }
+
+    #[test]
+    fn 汇总超过上限时只列前几条并说明剩余数量() {
+        let alerts: Vec<PendingAlert> = (0..MAX_LISTED + 5)
+            .map(|i| PendingAlert {
+                source: "memo".into(),
+                id: format!("m{i}"),
+                title: format!("事项{i}"),
+                body: "内容".into(),
+                due_at: NOW + i as i64,
+            })
+            .collect();
+
+        let (_, body) = compose_alert(&alerts, |n| format!("{n} 条")).expect("应有多条");
+
+        // 列出 MAX_LISTED 条 + 一行"还有 N 条"
+        assert_eq!(body.lines().count(), MAX_LISTED + 1);
+        assert!(body.contains("还有 5 条"));
+    }
+
+    #[test]
+    fn 空列表不产生弹窗() {
+        assert!(compose_alert(&[], |n| format!("{n} 条")).is_none());
+    }
+
+    // ---------- 正文摘要 ----------
+
+    #[test]
+    fn 摘要把多行压成一行并截断() {
+        let long = "很长的内容".repeat(50);
+        let s = summarize_body(&long);
+        assert!(s.ends_with('…'));
+        assert!(s.chars().count() <= 121, "截断后长度应受控");
+
+        assert_eq!(summarize_body("第一行\n第二行"), "第一行 第二行");
+        assert_eq!(summarize_body("   "), "（无内容）");
+    }
+}

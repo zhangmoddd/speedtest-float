@@ -1,0 +1,52 @@
+/* ============================================================
+   拖拽（排序 + 归类）
+   为什么不用 HTML5 拖放、判定为什么用矩形而不是 elementFromPoint：
+   见 lib/drag-drop.ts 的文件头。
+   ============================================================ */
+
+/* 正在被拖的东西：压暗，明确"我拎起来的是这个"。
+   ⚠️ 链接页和文件夹卡片不用这个 —— 它们把被拖的那个换成"空位"（见下），
+   压暗的写法留着给计时器/文本片段那些只往文件夹里拖的列表用。 */
+.drag-source {
+  opacity: 0.45;
+}
+
+/* 指针下方的文件夹卡片：描边 + 淡底，明确"松手就放这儿" */
+.foldertile--over .foldertile__open {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* 空位：被拖的那个"提起来"之后留在原位/落点上的虚框。
+   手机桌面上拖图标就是这个样子 —— 不提"插到左边还是右边"，
+   而是其他格子先让开、空位自然出来。
+   高度只给下限：同一行的其他格子多高它就多高（见 links.css 的 grid-auto-rows）。 */
+.drag-gap {
+  border: 1px dashed var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  /* 它只是个占位，不该被点中，也不该再被当成投放目标 */
+  pointer-events: none;
+}
+
+/* 跟手的浮层：被拖的那个"提起来"跟着指针走。
+   调用方负责给尺寸和内容（见 useDragSort 的 sourceSize）。 */
+.drag-ghost {
+  position: fixed;
+  z-index: 70;
+  /* 指针落在浮层中心。浮层本身不吃指针事件，否则指针永远悬在它自己身上，
+     落点判定就全废了。 */
+  transform: translate(-50%, -50%) scale(1.06);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+  pointer-events: none;
+}
+
+/* 拖拽期间整页用抓取光标，让"现在是在拖东西"一直可见 */
+.dragging,
+.dragging * {
+  cursor: grabbing !important;
+}

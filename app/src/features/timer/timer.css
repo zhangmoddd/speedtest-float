@@ -1,0 +1,266 @@
+/* ============================================================
+   浮光 · 计时器
+   只补计时器特有的排版：卡片、按钮、表单都复用 styles.css 里的
+   .card / .btn / .iconbtn / .field 等通用类。
+   颜色一律走 :root 里的变量，浅色主题下才不会配出读不清的组合。
+   ============================================================ */
+
+.tmr {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.tmr__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  flex-shrink: 0;
+}
+
+.tmr__count {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+}
+
+.tmr__toolbar .btn {
+  margin-left: auto;
+}
+
+.tmr__error {
+  margin: 0 10px 6px;
+  padding: 6px 9px;
+  /* 浅色主题下不给红底：只留红字 + 红边框，避免整块面板被一块红压住 */
+  background: var(--bg-raised);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: var(--fs-md);
+  flex-shrink: 0;
+}
+
+/* 列表密度。`--density` 由计时页按 Ctrl+滚轮的档位写在 .tmr 根节点上，
+   默认 1。卡片的内边距由 styles.css 的 .card 统一缩放，这里补上
+   卡片之间的间距和卡片内部的行距。只动间距、不动字号——字号是设置页里
+   那个「界面字号」，两套混在一起用户就说不清自己调的是哪个了。 */
+.tmr__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: calc(7px * var(--density, 1));
+}
+
+.tmr__empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--fs-md);
+  line-height: 1.7;
+}
+
+/* ============================================================
+   卡片
+   ============================================================ */
+
+.tmr__card {
+  display: flex;
+  flex-direction: column;
+  gap: calc(6px * var(--density, 1));
+}
+
+/* 运行中的卡片：左侧一条强调色 + 强调边框。
+   列表里几条计时器同时存在时，一眼就能扫到哪条在走。 */
+.tmr__card--running {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.tmr__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tmr__name {
+  font-weight: 600;
+  font-size: var(--fs-md);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tmr__kind {
+  font-size: var(--fs-xs);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.tmr__state {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.tmr__state--running {
+  color: var(--accent);
+}
+
+.tmr__state--done {
+  color: var(--success);
+}
+
+/* 大号时间。
+   tabular-nums 让每个数字等宽：秒位每 100ms 跳一次，不用等宽数字整行会左右抖。 */
+.tmr__time {
+  font-size: var(--fs-2xl);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.tmr__time--running {
+  color: var(--accent);
+}
+
+.tmr__time--idle {
+  color: var(--text-dim);
+}
+
+.tmr__time--done {
+  color: var(--success);
+}
+
+.tmr__meta {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* 秒表的计次记录：横向排开，最多显示最近几次，不会把卡片撑高 */
+.tmr__laps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.tmr__lap {
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.tmr__lap-index {
+  font-style: normal;
+  color: var(--text-faint);
+  margin-right: 4px;
+}
+
+.tmr__actions {
+  margin-top: 2px;
+}
+
+/* 删除永远靠最右：其他按钮会随状态增减，删除固定位置才好形成肌肉记忆 */
+.tmr__delete {
+  margin-left: auto;
+}
+
+/* ============================================================
+   新建表单
+   ============================================================ */
+
+.tmr__creator {
+  margin: 0 10px 8px;
+  padding: 9px 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.tmr__creator-head {
+  font-weight: 600;
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+}
+
+.tmr__kinds {
+  display: flex;
+  gap: 4px;
+}
+
+.tmr__kindbtn {
+  flex: 1;
+  justify-content: center;
+}
+
+.tmr__kindbtn--on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 时 / 分 / 秒这一行：输入框窄一点，单位跟在后面 */
+.tmr__segment {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tmr__segment .field__input {
+  width: 62px;
+  text-align: center;
+}
+
+.tmr__unit {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+/* 闹钟的钟点输入框。
+   宽度只占一半：一个 HH:MM 撑满 380px 既难看又容易让人以为要填别的东西。
+   和 `.tmr__segment .field__input` 一样居中，视觉上是一类东西。 */
+.tmr__clock {
+  width: 120px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tmr__quickrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tmr__quick {
+  padding: 4px 9px;
+}
+
+.tmr__hint {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  line-height: 1.6;
+}
+
+.tmr__creator-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
