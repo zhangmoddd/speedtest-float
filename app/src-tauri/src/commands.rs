@@ -1001,6 +1001,62 @@ pub async fn links_auto_repair(
     }
 }
 
+/// 清理同一文件夹里指向同一个目标的重复条目，返回删掉的条数。
+///
+/// # 重复是怎么来的
+///
+/// 添加链接一共有三条入口（选文件、拖拽、从备份恢复），三条都只做"新增"，
+/// **谁都没问过"这个是不是已经有了"**。于是用户把桌面上的同一批快捷方式
+/// 拖进来四次，面板上就有四排一模一样的格子 —— 而且每一排都是独立的记录，
+/// 改名字、修位置都要重复四遍。实测那个人的「软件」文件夹 129 条里，
+/// 六十多条是这么来的。
+///
+/// # 判据只有「同一个文件夹 + 同一个目标」
+///
+/// 不同文件夹里的同一条**不算重复**：用户完全可能故意把同一个程序
+/// 同时放在「常用」和「软件」两处。那是他的组织方式，不是脏数据。
+///
+/// 目标比较不区分大小写 —— Windows 路径本来就不区分。
+///
+/// # 保留哪一条
+///
+/// 保留 `created_at` **最早**的那条。理由很实际：最早那条是用户第一次
+/// 认真放进去的，重命名过、排过序；后面几次是手滑重复导入的，
+/// 名字往往还是文件原名。删掉后面那些，用户的整理成果不会丢。
+#[tauri::command]
+pub async fn links_dedupe(app: AppHandle) -> usize {
+    let store = app.state::<Store>();
+    let mut removed = 0usize;
+    {
+        let mut st = store.lock();
+        let mut best: std::collections::HashMap<(Option<String>, String), (String, i64)> =
+            std::collections::HashMap::new();
+        for link in st.links.iter() {
+            let key = (link.folder_id.clone(), link.target.to_lowercase());
+            let keep = match best.get(&key) {
+                Some((_, created)) => link.created_at < *created,
+                None => true,
+            };
+            if keep {
+                best.insert(key, (link.id.clone(), link.created_at));
+            }
+        }
+
+        let keep: std::collections::HashSet<&String> = best.values().map(|(id, _)| id).collect();
+        let before = st.links.len();
+        // `keep` 借用的是 `st.links` 里的 id，不能一边 retain 一边借 ——
+        // 先克隆成 owned set
+        let keep: std::collections::HashSet<String> = keep.into_iter().cloned().collect();
+        st.links.retain(|l| keep.contains(&l.id));
+        removed = before - st.links.len();
+    }
+
+    if removed > 0 {
+        let _ = state::persist(&app, || store.lock().links.clone(), state::save_links);
+    }
+    removed
+}
+
 /// 提取某个路径的图标。
 ///
 /// 失败返回 `null`，前端会退回按类型区分的内置图标。

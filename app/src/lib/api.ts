@@ -691,6 +691,16 @@ export const api = {
    */
   linksAutoRepair: (folderId: string | null) =>
     invoke<AutoRepairResult>("links_auto_repair", { folderId }),
+  /**
+   * 清理同一文件夹里指向同一个目标的重复条目，返回删掉的条数。
+   *
+   * 保留每組里 `createdAt` 最早的那条 —— 那是用户第一次认真放进去、
+   * 改过名字、排过序的；后面几次是手滑重复导入，名字往往还是文件原名。
+   *
+   * 不同文件夹里的同一条**不算重复**：同一个程序放在「常用」和「软件」两处
+   * 是组织方式，不是脏数据。
+   */
+  linksDedupe: () => invoke<number>("links_dedupe"),
   linkIcon: (path: string) => invoke<IconData | null>("link_icon", { path }),
   /**
    * 判断一批路径各自是什么（拖拽添加链接时用）。

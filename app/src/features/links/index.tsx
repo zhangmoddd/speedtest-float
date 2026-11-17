@@ -663,8 +663,44 @@ export function LinksPanel() {
     [visible, isBroken],
   );
 
+  /**
+   * 这一层有多少条是重复的（算的是"多余出来的那几条"）。
+   *
+   * 判据：同一个文件夹 + 同一个目标。同一个程序放在两个不同文件夹里
+   * 不算重复 —— 那是用户的组织方式。
+   */
+  const duplicateHere = useMemo(() => {
+    const seen = new Map<string, number>();
+    for (const l of visible) {
+      const key = l.target.toLowerCase();
+      seen.set(key, (seen.get(key) ?? 0) + 1);
+    }
+    let extra = 0;
+    for (const n of seen.values()) if (n > 1) extra += n - 1;
+    return extra;
+  }, [visible]);
+
   /** 批量修复正在跑。跑的时候按钮要禁用 —— 连点会同时开好几轮全盘扫描。 */
   const [repairing, setRepairing] = useState(false);
+
+  /**
+   * 清掉这一层里重复的条目。
+   *
+   * 后端保留每组里**最早**的那条。这里只需要说清删了几条 ——
+   * 用户最怕的是"它到底删了哪个"，所以提示里带上数字。
+   */
+  const runDedupe = useCallback(async () => {
+    try {
+      const removed = await api.linksDedupe();
+      await reload();
+      setNotice({
+        kind: "ok",
+        text: removed > 0 ? `删掉了 ${removed} 条重复的` : "没有重复的。",
+      });
+    } catch (err) {
+      setNotice({ kind: "error", text: `清理失败：${errorText(err)}` });
+    }
+  }, [reload]);
 
   /**
    * 批量扫一遍坏掉的链接，**身份号对上的直接改好**。
@@ -826,9 +862,47 @@ export function LinksPanel() {
     async (items: Draft[]) => {
       if (items.length === 0) return;
 
+      // ⚠️ 先剔掉「这个文件夹里已经有了」的。
+      //
+      // 添加有两条入口（选文件 / 拖拽），两条原先都只管新增，
+      // **谁都没问过"这个是不是已经有了"**。于是用户把同一批桌面快捷方式
+      // 拖进来四次，面板上就是四排一模一样的格子 —— 而且每条都是独立记录，
+      // 改名、修位置、删重复全都要做四遍。实测有人 129 条里六十多条是这么来的。
+      //
+      // 只跟**当前文件夹**比：同一个程序同时放在「常用」和「软件」两处
+      // 是用户的组织方式，不是重复。
+      const inThisFolder = new Set(
+        links
+          .filter((l) => l.folderId === folders.currentId)
+          .map((l) => l.target.toLowerCase()),
+      );
+      const fresh: Draft[] = [];
+      const skipped: string[] = [];
+      for (const item of items) {
+        const key = item.target.toLowerCase();
+        if (inThisFolder.has(key)) {
+          skipped.push(baseName(item.target));
+          continue;
+        }
+        // 同一次拖进来的也要互相查重，否则一次拖两份同名文件照样是两条
+        inThisFolder.add(key);
+        fresh.push(item);
+      }
+
+      if (fresh.length === 0) {
+        setNotice({
+          kind: "ok",
+          text:
+            skipped.length === 1
+              ? `「${skipped[0]}」已经在这里了`
+              : `这 ${skipped.length} 个都已经在这里了`,
+        });
+        return;
+      }
+
       const base = links.reduce((max, l) => Math.max(max, l.order), -1) + 1;
       const now = Date.now();
-      const drafts: LinkItem[] = items.map((item, i) => ({
+      const drafts: LinkItem[] = fresh.map((item, i) => ({
         id: newId(),
         // 名字默认取路径最后一段（去掉扩展名）或网址主机名，用户手动填了就用用户的
         name:
@@ -870,9 +944,14 @@ export function LinksPanel() {
           text: `有 ${failures.length} 条没存上：${shown.join("；")}${more > 0 ? `；…… 还有 ${more} 条` : ""}`,
         });
       } else {
+        const skipNote =
+          skipped.length > 0 ? `，跳过 ${skipped.length} 个已经在这里的` : "";
         setNotice({
           kind: "ok",
-          text: saved.length === 1 ? `已添加「${saved[0].name}」` : `已添加 ${saved.length} 个链接`,
+          text:
+            (saved.length === 1
+              ? `已添加「${saved[0].name}」`
+              : `已添加 ${saved.length} 个链接`) + skipNote,
         });
       }
     },
@@ -1580,33 +1659,52 @@ export function LinksPanel() {
         </div>
       )}
 
-      {/* 批量修复条：只在**这一层**确实有破的时候出现。
-          没坏东西就完全不占地方 —— 常驻一个"自动修复"按钮会让人以为
-          它是必须定期点的维护动作，而它其实只是坏消息的处理入口。 */}
-      {brokenHere > 0 && (
+      {/* 整理条：只在"这一层确实有需要处理的事"时出现 ——
+          有打不开的，或者有重复的。没坏东西就完全不占地方；
+          常驻一个"自动修复"按钮会让人以为它是必须定期点的维护动作。 */}
+      {(brokenHere > 0 || duplicateHere > 0) && (
         <div className="links__fixbar">
           <TriangleAlert size={12} />
           <span className="links__fixbar-text">
-            这个文件夹里有 {brokenHere} 条打不开
+            {[
+              brokenHere > 0 ? `${brokenHere} 条打不开` : "",
+              duplicateHere > 0 ? `${duplicateHere} 条是重复的` : "",
+            ]
+              .filter(Boolean)
+              .join("，")}
           </span>
-          <button
-            type="button"
-            className="btn"
-            disabled={repairing}
-            onClick={() => void runAutoRepair("here")}
-            title="只扫这一层：按文件身份号核对，能确定是同一个文件的直接改过来，同名的一律不动"
-          >
-            {repairing ? "正在扫描…" : "修复这里"}
-          </button>
-          <button
-            type="button"
-            className="btn"
-            disabled={repairing}
-            onClick={() => void runAutoRepair("all")}
-            title="把所有文件夹里的失效链接都扫一遍（不只看当前这一层）"
-          >
-            全部修复
-          </button>
+          {brokenHere > 0 && (
+            <>
+              <button
+                type="button"
+                className="btn"
+                disabled={repairing}
+                onClick={() => void runAutoRepair("here")}
+                title="只扫这一层：按文件身份号核对，能确定是同一个文件的直接改过来，同名的一律不动"
+              >
+                {repairing ? "正在扫描…" : "修复这里"}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={repairing}
+                onClick={() => void runAutoRepair("all")}
+                title="把所有文件夹里的失效链接都扫一遍（不只看当前这一层）"
+              >
+                全部修复
+              </button>
+            </>
+          )}
+          {duplicateHere > 0 && (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void runDedupe()}
+              title="同一个文件夹里指向同一个东西的多余条目，只保留最早添加的那一条"
+            >
+              清理重复
+            </button>
+          )}
         </div>
       )}
 
