@@ -3244,15 +3244,46 @@ namespace NetSpeedBall
     internal sealed class TrafficWindow : Form
     {
         private const int RankRows = 12;
+
+        // 版面常量。窗口是 FixedSingle，尺寸固定，所以这些值只在一处算。
+        private const int PadX = 20;
+        private const int RowHeight = 23;
+        private const int CardHeight = 64;
+        private const int ChartHeight = 226;
+
+        // 一整套配色集中在这里。原来同一个蓝在四个方法里各写一遍，
+        // 想调一次得翻半个文件，调完还容易漏掉一处。
+        private static readonly Color Ink = Color.FromArgb(32, 41, 55);
+        private static readonly Color InkSoft = Color.FromArgb(71, 85, 105);
+        private static readonly Color Muted = Color.FromArgb(122, 134, 152);
+        private static readonly Color Faint = Color.FromArgb(167, 177, 191);
+        private static readonly Color Line = Color.FromArgb(232, 237, 244);
+        private static readonly Color Surface = Color.FromArgb(247, 249, 252);
+        private static readonly Color CardBg = Color.White;
+        private static readonly Color DownColor = Color.FromArgb(45, 105, 245);
+        private static readonly Color UpColor = Color.FromArgb(14, 165, 90);
+        private static readonly Color Track = Color.FromArgb(237, 241, 247);
+
         private readonly TrafficStore store;
-        private readonly Font sectionFont = new Font("Segoe UI", 9.0f, FontStyle.Bold);
-        private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
-        private readonly Font smallFont = new Font("Segoe UI", 8.0f, FontStyle.Regular);
-        private readonly Font tinyFont = new Font("Segoe UI", 7.4f, FontStyle.Regular);
-        private readonly DateTimePicker fromPicker;
-        private readonly DateTimePicker toPicker;
+        private readonly Font sectionFont = new Font("Microsoft YaHei UI", 9.2f, FontStyle.Bold);
+        private readonly Font valueFont = new Font("Microsoft YaHei UI", 14.5f, FontStyle.Bold);
+        private readonly Font smallFont = new Font("Microsoft YaHei UI", 8.6f, FontStyle.Regular);
+        private readonly Font tinyFont = new Font("Microsoft YaHei UI", 7.8f, FontStyle.Regular);
         private readonly ToolTip toolTip = new ToolTip();
         private readonly FormsTimer refreshTimer;
+        private readonly MonthCalendar calendar;
+
+        // 顶部那一排全是自绘的：原生 Button 是灰底 3D 边，跟下面的卡片放在一起
+        // 像两个年代的软件拼起来的。命中区在构造时算好，点击靠坐标判断。
+        private readonly Rectangle[] presetRects = new Rectangle[5];
+        private readonly string[] presetTags = { "today", "yesterday", "month", "lastmonth", "year" };
+        private readonly string[] presetTexts = { "今天", "昨天", "本月", "上月", "今年" };
+        private readonly Rectangle[] chipRects = new Rectangle[2];
+
+        private int activePreset = 2;
+        private bool editingFrom;
+        private int hoverPreset = -1;
+        private int hoverChip = -1;
         private long rangeFrom;
         private long rangeTo;
         private long[] rangeTotals = new long[] { 0, 0 };
@@ -3266,62 +3297,43 @@ namespace NetSpeedBall
         {
             store = trafficStore;
             Text = "流量统计";
-            ClientSize = new Size(700, 700);
+            ClientSize = new Size(720, 760);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.Manual;
-            BackColor = Color.White;
+            // 卡片是白的，底色就得浅一档，否则整片糊在一起分不出层次
+            BackColor = Surface;
             DoubleBuffered = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
 
-            AddPresetButton("今天", "today", 16);
-            AddPresetButton("昨天", "yesterday", 62);
-            AddPresetButton("本月", "month", 108);
-            AddPresetButton("上月", "lastmonth", 154);
-            AddPresetButton("今年", "year", 200);
+            // 标题栏用球自己的图标。不设的话是个默认的空窗口图标，
+            // 在一堆系统窗口里认不出来是这个程序的。
+            try
+            {
+                Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch (Exception)
+            {
+                // 取不到就算了，不值得为图标让窗口开不出来
+            }
 
-            Label fromLabel = new Label();
-            fromLabel.Text = "从";
-            fromLabel.AutoSize = true;
-            fromLabel.Location = new Point(254, 16);
-            fromLabel.Font = smallFont;
-            Controls.Add(fromLabel);
+            LayoutChrome();
 
-            fromPicker = new DateTimePicker();
-            fromPicker.Format = DateTimePickerFormat.Short;
-            fromPicker.Font = smallFont;
-            fromPicker.Location = new Point(272, 12);
-            fromPicker.Width = 96;
-            Controls.Add(fromPicker);
-
-            Label toLabel = new Label();
-            toLabel.Text = "到";
-            toLabel.AutoSize = true;
-            toLabel.Location = new Point(378, 16);
-            toLabel.Font = smallFont;
-            Controls.Add(toLabel);
-
-            toPicker = new DateTimePicker();
-            toPicker.Format = DateTimePickerFormat.Short;
-            toPicker.Font = smallFont;
-            toPicker.Location = new Point(396, 12);
-            toPicker.Width = 96;
-            Controls.Add(toPicker);
-
-            Button applyButton = new Button();
-            applyButton.Text = "查询";
-            applyButton.Font = smallFont;
-            applyButton.Location = new Point(500, 11);
-            applyButton.Size = new Size(56, 25);
-            applyButton.UseVisualStyleBackColor = true;
-            applyButton.Click += OnApplyClick;
-            Controls.Add(applyButton);
+            // 日期选择用一个常驻的 MonthCalendar，点胶囊时挪过去弹出来。
+            // 用 DateTimePicker 的话外观改不动（灰底 + 系统下拉箭头），
+            // 而且它的下拉框没法用代码打开。
+            calendar = new MonthCalendar();
+            calendar.MaxSelectionCount = 1;
+            calendar.Visible = false;
+            calendar.DateSelected += OnCalendarPicked;
+            calendar.Leave += OnCalendarLeave;
+            Controls.Add(calendar);
 
             DateTime today = DateTime.Today;
-            fromPicker.Value = new DateTime(today.Year, today.Month, 1);
-            toPicker.Value = today;
-            rangeFrom = TrafficStore.ToDateInt(fromPicker.Value.Date);
-            rangeTo = TrafficStore.ToDateInt(toPicker.Value.Date);
+            rangeFrom = TrafficStore.ToDateInt(new DateTime(today.Year, today.Month, 1));
+            rangeTo = TrafficStore.ToDateInt(today);
             RefreshData();
 
             refreshTimer = new FormsTimer();
@@ -3329,6 +3341,37 @@ namespace NetSpeedBall
             refreshTimer.Tick += OnRefreshTick;
             refreshTimer.Start();
         }
+
+        /// <summary>
+        /// 算好顶部控件的命中区。布局只依赖固定的 ClientSize，所以只算一次。
+        /// </summary>
+        private void LayoutChrome()
+        {
+            // 五个快捷范围做成一条分段控件：整组一个浅色底，选中项白底加粗。
+            const int segTop = 14;
+            const int segHeight = 30;
+            const int segPadding = 3;
+            const int segWidth = 62;
+
+            int x = PadX;
+            for (int i = 0; i < presetRects.Length; i++)
+            {
+                presetRects[i] = new Rectangle(x + segPadding + i * segWidth, segTop + segPadding,
+                    segWidth, segHeight - segPadding * 2);
+            }
+
+            int groupWidth = segWidth * presetRects.Length;
+            presetGroupRect = new Rectangle(PadX, segTop, groupWidth + segPadding * 2, segHeight);
+
+            // 右侧两个日期胶囊，右对齐
+            const int chipHeight = 30;
+            const int chipWidth = 104;
+            int right = ClientSize.Width - PadX;
+            chipRects[1] = new Rectangle(right - chipWidth, segTop, chipWidth, chipHeight);
+            chipRects[0] = new Rectangle(chipRects[1].Left - chipWidth - 26, segTop, chipWidth, chipHeight);
+        }
+
+        private Rectangle presetGroupRect;
 
         /// <summary>
         /// 把流量统计窗口渲染成 PNG，只给 <c>--render-traffic 路径</c> 自检用。
@@ -3357,67 +3400,77 @@ namespace NetSpeedBall
             }
         }
 
-        private void AddPresetButton(string text, string tag, int x)        {
-            Button button = new Button();
-            button.Text = text;
-            button.Tag = tag;
-            button.Font = smallFont;
-            button.Location = new Point(x, 11);
-            button.Size = new Size(42, 25);
-            button.UseVisualStyleBackColor = true;
-            button.Click += OnPresetClick;
-            Controls.Add(button);
-        }
-
-        private void OnPresetClick(object sender, EventArgs e)
+        private void ApplyPreset(string tag)
         {
-            Button button = sender as Button;
-            string tag = button != null ? button.Tag as string : null;
             DateTime today = DateTime.Today;
             if (tag == "today")
             {
-                SetRange(today, today);
+                SetRange(today, today, 0);
             }
             else if (tag == "yesterday")
             {
                 DateTime day = today.AddDays(-1);
-                SetRange(day, day);
+                SetRange(day, day, 1);
             }
             else if (tag == "month")
             {
-                SetRange(new DateTime(today.Year, today.Month, 1), today);
+                SetRange(new DateTime(today.Year, today.Month, 1), today, 2);
             }
             else if (tag == "lastmonth")
             {
                 DateTime first = new DateTime(today.Year, today.Month, 1).AddMonths(-1);
-                SetRange(first, first.AddMonths(1).AddDays(-1));
+                SetRange(first, first.AddMonths(1).AddDays(-1), 3);
             }
             else if (tag == "year")
             {
-                SetRange(new DateTime(today.Year, 1, 1), today);
+                SetRange(new DateTime(today.Year, 1, 1), today, 4);
             }
         }
 
-        private void OnApplyClick(object sender, EventArgs e)
+        /// <summary>
+        /// 点日历里的一天。点的是哪一端就改哪一端，改完立刻刷新。
+        /// </summary>
+        private void OnCalendarPicked(object sender, DateRangeEventArgs e)
         {
-            DateTime from = fromPicker.Value.Date;
-            DateTime to = toPicker.Value.Date;
-            if (to < from)
+            calendar.Visible = false;
+            DateTime from = TrafficStore.FromDateInt(rangeFrom);
+            DateTime to = TrafficStore.FromDateInt(rangeTo);
+
+            if (editingFrom)
             {
-                DateTime swap = from;
-                from = to;
-                to = swap;
-            }
+                // 起点不能晚于终点，否则整段是倒的、一条数据都查不到。
+                // 这时候把终点一起顶过去，比给个"日期不合法"的提示顺手。
+                if (e.Start > to)
+                {
+                    to = e.Start;
+                }
 
-            SetRange(from, to);
+                SetRange(e.Start, to, -1);
+            }
+            else
+            {
+                if (e.Start < from)
+                {
+                    from = e.Start;
+                }
+
+                SetRange(from, e.Start, -1);
+            }
         }
 
-        private void SetRange(DateTime from, DateTime to)
+        private void OnCalendarLeave(object sender, EventArgs e)
         {
-            fromPicker.Value = from;
-            toPicker.Value = to;
+            calendar.Visible = false;
+        }
+
+        /// <summary>
+        /// `preset` 是哪个快捷范围被选中（-1 表示用户手挑的日期，五个都不高亮）。
+        /// </summary>
+        private void SetRange(DateTime from, DateTime to, int preset)
+        {
             rangeFrom = TrafficStore.ToDateInt(from);
             rangeTo = TrafficStore.ToDateInt(to);
+            activePreset = preset;
             hoverDayIndex = -1;
             RefreshData();
             Invalidate();
@@ -3447,6 +3500,19 @@ namespace NetSpeedBall
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+
+            int preset = HitPreset(e.Location);
+            int chip = chipRects[0].Contains(e.Location) ? 0 : (chipRects[1].Contains(e.Location) ? 1 : -1);
+            Cursor = (preset >= 0 || chip >= 0) ? Cursors.Hand : Cursors.Default;
+
+            bool chromeDirty = preset != hoverPreset || chip != hoverChip;
+            hoverPreset = preset;
+            hoverChip = chip;
+            if (chromeDirty)
+            {
+                Invalidate();
+            }
+
             int index = -1;
             if (rangeDays.Count > 0 && chartPlot.Width > 0 && chartSlot > 0 &&
                 e.X >= chartPlot.Left && e.X <= chartPlot.Right &&
@@ -3480,6 +3546,85 @@ namespace NetSpeedBall
             Invalidate();
         }
 
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (hoverPreset < 0 && hoverChip < 0)
+            {
+                return;
+            }
+
+            hoverPreset = -1;
+            hoverChip = -1;
+            Invalidate();
+        }
+
+        private int HitPreset(Point point)
+        {
+            for (int i = 0; i < presetRects.Length; i++)
+            {
+                if (presetRects[i].Contains(point))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left)
+            {
+                return;
+            }
+
+            if (calendar.Visible && !calendar.Bounds.Contains(e.Location))
+            {
+                calendar.Visible = false;
+            }
+
+            int preset = HitPreset(e.Location);
+            if (preset >= 0)
+            {
+                ApplyPreset(presetTags[preset]);
+                return;
+            }
+
+            if (chipRects[0].Contains(e.Location))
+            {
+                OpenCalendar(true);
+            }
+            else if (chipRects[1].Contains(e.Location))
+            {
+                OpenCalendar(false);
+            }
+        }
+
+        /// <summary>
+        /// 把日历挪到某个日期胶囊下面弹出来。
+        /// </summary>
+        private void OpenCalendar(bool from)
+        {
+            editingFrom = from;
+            DateTime current = TrafficStore.FromDateInt(from ? rangeFrom : rangeTo);
+            calendar.SetDate(current);
+
+            Rectangle chip = chipRects[from ? 0 : 1];
+            int left = Math.Min(chip.Left, ClientSize.Width - calendar.Width - 8);
+            int top = chip.Bottom + 4;
+            if (top + calendar.Height > ClientSize.Height - 8)
+            {
+                top = chip.Top - calendar.Height - 4;
+            }
+
+            calendar.Location = new Point(Math.Max(4, left), Math.Max(4, top));
+            calendar.Visible = true;
+            calendar.BringToFront();
+            calendar.Focus();
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -3487,29 +3632,97 @@ namespace NetSpeedBall
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
+            DrawChrome(g);
+
             DateTime from = TrafficStore.FromDateInt(rangeFrom);
             DateTime to = TrafficStore.FromDateInt(rangeTo);
             string scopeText = rangeFrom == rangeTo
-                ? from.ToString("yyyy年M月d日")
-                : from.ToString("yyyy年M月d日") + "  -  " + to.ToString("yyyy年M月d日");
+                ? from.ToString("yyyy年M月d日 dddd")
+                : from.ToString("yyyy年M月d日") + "  至  " + to.ToString("yyyy年M月d日");
             int dayCount = Math.Max(1, (int)TrafficStore.DaysBetween(rangeFrom, rangeTo) + 1);
 
-            using (Brush muted = new SolidBrush(Color.FromArgb(96, 110, 130)))
+            using (Brush muted = new SolidBrush(Muted))
             {
-                // The window caption already shows the title; painting another one here
-                // used to bleed through the 4px gaps between the preset buttons.
-                g.DrawString(scopeText + "  ·  共 " + dayCount + " 天", smallFont, muted, 16, 40);
+                g.DrawString(scopeText + "    ·    共 " + dayCount + " 天", smallFont, muted, PadX, 56);
             }
 
             DrawSummaryCards(g, dayCount);
             DrawDailyChart(g);
             DrawRankList(g);
 
-            using (Brush note = new SolidBrush(Color.FromArgb(128, 118, 132, 150)))
+            using (Brush note = new SolidBrush(Faint))
             {
-                g.DrawString("排行榜按 TCP 连接统计，不含 UDP/QUIC 流量与协议头开销，故各项之和略小于总流量。" +
-                    "数据保存在本机 %LOCALAPPDATA%\\NetSpeedBall，年占用不足 1 MB。",
-                    tinyFont, note, 16, ClientSize.Height - 20);
+                g.DrawString("排行榜按 TCP 连接统计，不含 UDP/QUIC 与协议头开销 · 数据只存本机，年占用不足 1 MB",
+                    tinyFont, note, PadX, ClientSize.Height - 22);
+            }
+        }
+
+        /// <summary>
+        /// 顶部一整条：分段控件 + 两个日期胶囊。全部自绘 —— 原生 Button 是灰底 3D 边，
+        /// 跟下面的卡片摆在一起像两个年代的软件拼起来的。
+        /// </summary>
+        private void DrawChrome(Graphics g)
+        {
+            using (GraphicsPath path = CreateRoundedRectangle(presetGroupRect, 9))
+            using (Brush fill = new SolidBrush(Color.FromArgb(237, 242, 249)))
+            {
+                g.FillPath(fill, path);
+            }
+
+            for (int i = 0; i < presetRects.Length; i++)
+            {
+                Rectangle rect = presetRects[i];
+                bool active = i == activePreset;
+                if (active)
+                {
+                    using (GraphicsPath path = CreateRoundedRectangle(rect, 7))
+                    using (Brush fill = new SolidBrush(CardBg))
+                    using (Pen border = new Pen(Color.FromArgb(221, 229, 241)))
+                    {
+                        g.FillPath(fill, path);
+                        g.DrawPath(border, path);
+                    }
+                }
+                else if (i == hoverPreset)
+                {
+                    using (GraphicsPath path = CreateRoundedRectangle(rect, 7))
+                    using (Brush fill = new SolidBrush(Color.FromArgb(18, 80, 120, 200)))
+                    {
+                        g.FillPath(fill, path);
+                    }
+                }
+
+                using (Brush text = new SolidBrush(active ? DownColor : InkSoft))
+                {
+                    DrawLabel(g, presetTexts[i], active ? sectionFont : smallFont, text, rect,
+                        StringAlignment.Center);
+                }
+            }
+
+            for (int i = 0; i < chipRects.Length; i++)
+            {
+                Rectangle rect = chipRects[i];
+                bool hot = i == hoverChip;
+                using (GraphicsPath path = CreateRoundedRectangle(rect, 9))
+                using (Brush fill = new SolidBrush(hot ? Color.FromArgb(246, 249, 253) : CardBg))
+                using (Pen border = new Pen(hot ? Color.FromArgb(196, 211, 232) : Line))
+                {
+                    g.FillPath(fill, path);
+                    g.DrawPath(border, path);
+                }
+
+                DateTime value = TrafficStore.FromDateInt(i == 0 ? rangeFrom : rangeTo);
+                using (Brush text = new SolidBrush(Ink))
+                {
+                    DrawLabel(g, value.ToString("yyyy/MM/dd"), smallFont, text, rect, StringAlignment.Center);
+                }
+            }
+
+            Rectangle gap = Rectangle.FromLTRB(chipRects[0].Right, chipRects[0].Top,
+                chipRects[1].Left, chipRects[0].Bottom);
+            using (Brush arrow = new SolidBrush(Faint))
+            {
+                DrawLabel(g, "→", smallFont, arrow, gap, StringAlignment.Center);
             }
         }
 
@@ -3519,7 +3732,9 @@ namespace NetSpeedBall
             long up = rangeTotals[1];
             long total = down + up;
             long perDay = total / dayCount;
-            int width = (ClientSize.Width - 32 - 30) / 4;
+
+            const int gap = 12;
+            int width = (ClientSize.Width - PadX * 2 - gap * 3) / 4;
             string[] labels = { "下载", "上传", "合计", "日均" };
             string[] values =
             {
@@ -3528,133 +3743,202 @@ namespace NetSpeedBall
                 SpeedFormatter.Format(total),
                 SpeedFormatter.Format(perDay)
             };
-            Color[] colors =
-            {
-                Color.FromArgb(35, 119, 238),
-                Color.FromArgb(16, 178, 92),
-                Color.FromArgb(58, 70, 92),
-                Color.FromArgb(242, 126, 42)
-            };
+            Color[] accents = { DownColor, UpColor, Color.FromArgb(30, 64, 175), Faint };
 
             for (int i = 0; i < 4; i++)
             {
-                Rectangle card = new Rectangle(16 + i * (width + 10), 64, width, 52);
-                using (GraphicsPath path = CreateRoundedRectangle(card, 10))
-                using (Brush fill = new SolidBrush(Color.FromArgb(244, 249, 254)))
-                using (Pen border = new Pen(Color.FromArgb(200, 205, 225, 240)))
+                Rectangle card = new Rectangle(PadX + i * (width + gap), 76, width, CardHeight);
+                // 合计是主角，单独给一层淡蓝底，其余三张白底。
+                bool hero = i == 2;
+                using (GraphicsPath path = CreateRoundedRectangle(card, 12))
+                using (Brush fill = new SolidBrush(hero ? Color.FromArgb(240, 245, 255) : CardBg))
+                using (Pen border = new Pen(hero ? Color.FromArgb(206, 222, 250) : Line))
                 {
                     g.FillPath(fill, path);
                     g.DrawPath(border, path);
                 }
 
-                using (Brush label = new SolidBrush(Color.FromArgb(110, 122, 142)))
-                using (Brush value = new SolidBrush(colors[i]))
+                // 颜色只用来标类别（一根 3px 竖条），不用来染数字。
+                // 原来四个数字是蓝绿橙深灰各一色，横着看过去像四个互不相干的指标。
+                using (Brush accent = new SolidBrush(accents[i]))
                 {
-                    g.DrawString(labels[i], smallFont, label, card.X + 12, card.Y + 7);
-                    g.DrawString(values[i], valueFont, value, card.X + 12, card.Y + 24);
+                    g.FillRectangle(accent, card.X + 14, card.Y + 15, 3, card.Height - 30);
+                }
+
+                using (Brush label = new SolidBrush(Muted))
+                using (Brush value = new SolidBrush(Ink))
+                {
+                    g.DrawString(labels[i], smallFont, label, card.X + 25, card.Y + 9);
+                    g.DrawString(values[i], valueFont, value, card.X + 24, card.Y + 26);
                 }
             }
         }
 
         private void DrawDailyChart(Graphics g)
         {
-            Rectangle panel = new Rectangle(16, 128, ClientSize.Width - 32, 236);
-            using (GraphicsPath path = CreateRoundedRectangle(panel, 12))
-            using (Brush fill = new SolidBrush(Color.FromArgb(247, 251, 255)))
-            using (Pen border = new Pen(Color.FromArgb(205, 208, 226, 242)))
+            Rectangle panel = new Rectangle(PadX, 152, ClientSize.Width - PadX * 2, ChartHeight);
+            DrawCardSurface(g, panel);
+
+            using (Brush heading = new SolidBrush(Ink))
             {
-                g.FillPath(fill, path);
-                g.DrawPath(border, path);
+                g.DrawString("每日流量", sectionFont, heading, panel.X + 16, panel.Y + 12);
             }
 
-            using (Brush heading = new SolidBrush(Color.FromArgb(70, 84, 104)))
-            {
-                g.DrawString("每日流量", sectionFont, heading, panel.X + 12, panel.Y + 8);
-            }
+            DrawLegend(g, panel.Right - 136, panel.Y + 14);
 
-            chartPlot = new Rectangle(panel.Left + 14, panel.Top + 34,
-                panel.Width - 28, panel.Height - 66);
-            chartSlot = rangeDays.Count > 0 ? Math.Max(1, chartPlot.Width / rangeDays.Count) : 0;
+            // 上留 56（标题一行 + 刻度值一行），下留 34 给日期轴
+            Rectangle plot = new Rectangle(panel.Left + 16, panel.Top + 56,
+                panel.Width - 32, panel.Height - 90);
+            chartPlot = plot;
+            chartSlot = rangeDays.Count > 0 ? Math.Max(1, plot.Width / rangeDays.Count) : 0;
 
-            double maximum = 1.0;
+            double maximum = 0;
             for (int i = 0; i < rangeDays.Count; i++)
             {
                 maximum = Math.Max(maximum, (double)(rangeDays[i].Rx + rangeDays[i].Tx));
             }
 
-            using (Pen grid = new Pen(Color.FromArgb(70, 178, 200, 220)))
-            using (Brush axisText = new SolidBrush(Color.FromArgb(130, 120, 136, 154)))
+            maximum = NiceCeil(maximum);
+
+            // 刻度线只留顶端和中间。原来画五条，密度和柱子差不多，
+            // 整块图看起来像草稿纸。
+            using (Pen grid = new Pen(Color.FromArgb(228, 233, 242)))
             {
-                for (int row = 0; row <= 4; row++)
-                {
-                    int y = chartPlot.Bottom - chartPlot.Height * row / 4;
-                    g.DrawLine(grid, chartPlot.Left, y, chartPlot.Right, y);
-                    if (row == 4)
-                    {
-                        string label = SpeedFormatter.Format(maximum);
-                        g.DrawString(label, tinyFont, axisText, chartPlot.Left + 2, chartPlot.Top - 16);
-                    }
-                }
+                grid.DashStyle = DashStyle.Dash;
+                grid.DashPattern = new float[] { 3f, 4f };
+                int half = plot.Bottom - plot.Height / 2;
+                g.DrawLine(grid, plot.Left, half, plot.Right, half);
+            }
+
+            using (Pen baseline = new Pen(Color.FromArgb(214, 222, 234)))
+            {
+                g.DrawLine(baseline, plot.Left, plot.Bottom, plot.Right, plot.Bottom);
+            }
+
+            using (Brush axisText = new SolidBrush(Faint))
+            {
+                // 两个刻度值分别靠左右两侧摆：都放右边会跟图例叠在一起。
+                DrawLabel(g, SpeedFormatter.Format((long)maximum), tinyFont, axisText,
+                    new Rectangle(plot.Left, plot.Top - 22, 90, 16), StringAlignment.Near);
+                DrawLabel(g, SpeedFormatter.Format((long)(maximum / 2)), tinyFont, axisText,
+                    new Rectangle(plot.Right - 90, plot.Top + plot.Height / 2 - 18, 90, 14), StringAlignment.Far);
             }
 
             if (rangeDays.Count == 0)
             {
+                using (Brush empty = new SolidBrush(Faint))
+                {
+                    DrawLabel(g, "这段时间没有记录", smallFont, empty, plot, StringAlignment.Center);
+                }
+
                 return;
             }
 
             int slot = chartSlot;
-            int barWidth = Math.Max(1, (int)(slot * 0.34));
-            for (int i = 0; i < rangeDays.Count; i++)
+            // 柱宽封顶 46px。单日时 slot 等于整幅图的宽度，不封顶就会变成
+            // 一整块占掉半个窗口的蓝色板子（就是改版前那张截图里的样子）。
+            int barWidth = Math.Min(46, Math.Max(3, (int)Math.Round(slot * 0.56)));
+
+            using (Brush downBrush = new SolidBrush(DownColor))
+            using (Brush upBrush = new SolidBrush(UpColor))
+            using (Brush hoverBrush = new SolidBrush(Color.FromArgb(14, 45, 105, 245)))
             {
-                DayPoint point = rangeDays[i];
-                int x = chartPlot.Left + i * slot + (slot - barWidth) / 2;
-                if (i == hoverDayIndex)
+                for (int i = 0; i < rangeDays.Count; i++)
                 {
-                    using (Brush hover = new SolidBrush(Color.FromArgb(40, 255, 214, 120)))
+                    DayPoint point = rangeDays[i];
+                    int slotLeft = plot.Left + i * slot;
+                    if (i == hoverDayIndex)
                     {
-                        g.FillRectangle(hover, chartPlot.Left + i * slot, chartPlot.Top, slot, chartPlot.Height);
+                        g.FillRectangle(hoverBrush, slotLeft, plot.Top, slot, plot.Height);
                     }
-                }
 
-                double downRatio = Math.Min(1.0, point.Rx / maximum);
-                double upRatio = Math.Min(1.0, point.Tx / maximum);
-                int downHeight = (int)Math.Round(downRatio * (chartPlot.Height - 2));
-                int upHeight = (int)Math.Round(upRatio * (chartPlot.Height - 2));
-                if (downHeight > 0)
-                {
-                    using (Brush down = new SolidBrush(Color.FromArgb(200, 62, 138, 245)))
+                    long total = point.Rx + point.Tx;
+                    if (total <= 0)
                     {
-                        g.FillRectangle(down, x, chartPlot.Bottom - downHeight, barWidth, downHeight);
+                        continue;
                     }
-                }
 
-                if (upHeight > 0)
-                {
-                    using (Brush up = new SolidBrush(Color.FromArgb(210, 34, 197, 110)))
+                    int barHeight = Math.Max(2,
+                        (int)Math.Round(Math.Min(1.0, total / maximum) * plot.Height));
+                    Rectangle bar = new Rectangle(slotLeft + (slot - barWidth) / 2,
+                        plot.Bottom - barHeight, barWidth, barHeight);
+
+                    // 下载在下、上传在上。用一条圆角路径当模具分别填色：
+                    // 柱顶永远是圆的，中间那道接缝是直的。
+                    using (GraphicsPath clip = CreateRoundedRectangle(bar, 3))
                     {
-                        g.FillRectangle(up, x + barWidth, chartPlot.Bottom - upHeight, barWidth, upHeight);
+                        GraphicsState state = g.Save();
+                        g.SetClip(clip, CombineMode.Replace);
+
+                        int downHeight = (int)Math.Round(
+                            Math.Min(1.0, (double)point.Rx / maximum) * plot.Height);
+                        if (downHeight > 0)
+                        {
+                            g.FillRectangle(downBrush, bar.X, bar.Bottom - downHeight, bar.Width, downHeight);
+                        }
+
+                        if (point.Tx > 0)
+                        {
+                            int upHeight = Math.Max(2, (int)Math.Round(
+                                Math.Min(1.0, (double)point.Tx / maximum) * plot.Height));
+                            g.FillRectangle(upBrush, bar.X, bar.Bottom - downHeight - upHeight,
+                                bar.Width, upHeight);
+                        }
+
+                        g.Restore(state);
                     }
                 }
             }
 
-            DrawDateAxis(g, panel);
+            DrawDateAxis(g, plot);
         }
 
-        private void DrawDateAxis(Graphics g, Rectangle panel)
+        /// <summary>
+        /// 小圆点 + 文字，标一下柱子两种颜色各是什么。
+        /// </summary>
+        private void DrawLegend(Graphics g, int x, int y)
         {
-            using (Brush axisText = new SolidBrush(Color.FromArgb(140, 110, 124, 144)))
+            string[] names = { "下载", "上传" };
+            Color[] colors = { DownColor, UpColor };
+            using (Brush text = new SolidBrush(Muted))
             {
-                int count = rangeDays.Count;
-                if (count == 0)
+                for (int i = 0; i < names.Length; i++)
                 {
+                    int left = x + i * 66;
+                    using (Brush dot = new SolidBrush(colors[i]))
+                    {
+                        g.FillEllipse(dot, left, y + 3, 7, 7);
+                    }
+
+                    g.DrawString(names[i], tinyFont, text, left + 12, y - 1);
+                }
+            }
+        }
+
+        private void DrawDateAxis(Graphics g, Rectangle plot)
+        {
+            int count = rangeDays.Count;
+            if (count == 0)
+            {
+                return;
+            }
+
+            using (Brush axisText = new SolidBrush(Faint))
+            {
+                if (count == 1)
+                {
+                    // 只有一天时起点一定在最左边，看着像"图从这儿开始"。居中摆。
+                    DateTime only = TrafficStore.FromDateInt(rangeDays[0].Date);
+                    DrawLabel(g, only.ToString("M月d日"), tinyFont, axisText,
+                        new Rectangle(plot.Left, plot.Bottom + 8, plot.Width, 16), StringAlignment.Center);
                     return;
                 }
 
                 int step = count <= 16 ? 1 : (count <= 62 ? 7 : 30);
-                int y = panel.Bottom - 16;
+                int y = plot.Bottom + 9;
                 for (int i = 0; i < count; i += step)
                 {
-                    if (i > 0 && chartPlot.Left + i * chartSlot + 30 > chartPlot.Right)
+                    if (i > 0 && plot.Left + i * chartSlot + 30 > plot.Right)
                     {
                         break;
                     }
@@ -3679,24 +3963,51 @@ namespace NetSpeedBall
                         label = day.Month + "/" + day.Day;
                     }
 
-                    g.DrawString(label, tinyFont, axisText, chartPlot.Left + i * chartSlot, y);
+                    g.DrawString(label, tinyFont, axisText, plot.Left + i * chartSlot, y);
                 }
             }
         }
 
         private void DrawRankList(Graphics g)
         {
-            using (Brush heading = new SolidBrush(Color.FromArgb(70, 84, 104)))
+            Rectangle card = new Rectangle(PadX, 388, ClientSize.Width - PadX * 2, 340);
+            DrawCardSurface(g, card);
+
+            using (Brush heading = new SolidBrush(Ink))
             {
-                g.DrawString("应用排行（Top " + RankRows + "）", sectionFont, heading, 16, 378);
+                g.DrawString("应用排行", sectionFont, heading, card.X + 16, card.Y + 10);
             }
 
-            int rowHeight = 22;
-            int y = 404;
-            int nameWidth = 168;
-            int barLeft = 196;
-            int barRight = ClientSize.Width - 250;
-            int valueLeft = ClientSize.Width - 240;
+            using (Brush hint = new SolidBrush(Faint))
+            {
+                DrawLabel(g, "按总流量排序", tinyFont, hint,
+                    new Rectangle(card.Right - 160, card.Y + 10, 144, 18), StringAlignment.Far);
+            }
+
+            int headerTop = card.Y + 38;
+            using (Pen line = new Pen(Line))
+            {
+                g.DrawLine(line, card.X + 1, headerTop, card.Right - 1, headerTop);
+            }
+
+            int indexLeft = card.X + 14;
+            int nameLeft = card.X + 42;
+            int nameWidth = 166;
+            int barLeft = card.X + 210;
+            int barRight = card.Right - 190;
+            int downLeft = card.Right - 176;
+            int upLeft = card.Right - 92;
+            int upRight = card.Right - 16;
+
+            using (Brush headText = new SolidBrush(Faint))
+            {
+                DrawLabel(g, "应用", tinyFont, headText,
+                    new Rectangle(nameLeft, headerTop + 1, nameWidth, 20), StringAlignment.Near);
+                DrawLabel(g, "下载", tinyFont, headText,
+                    new Rectangle(downLeft, headerTop + 1, upLeft - 4 - downLeft, 20), StringAlignment.Far);
+                DrawLabel(g, "上传", tinyFont, headText,
+                    new Rectangle(upLeft, headerTop + 1, upRight - upLeft, 20), StringAlignment.Far);
+            }
 
             double maxTotal = 1.0;
             for (int i = 0; i < rangeRanks.Count; i++)
@@ -3704,68 +4015,161 @@ namespace NetSpeedBall
                 maxTotal = Math.Max(maxTotal, (double)rangeRanks[i].Total);
             }
 
-            using (Brush evenRow = new SolidBrush(Color.FromArgb(248, 251, 254)))
-            using (Brush track = new SolidBrush(Color.FromArgb(235, 228, 238, 246)))
-            using (Brush nameText = new SolidBrush(Color.FromArgb(52, 64, 84)))
-            using (Brush valueText = new SolidBrush(Color.FromArgb(90, 104, 124)))
-            using (Brush downBar = new SolidBrush(Color.FromArgb(214, 62, 138, 245)))
-            using (Brush upBar = new SolidBrush(Color.FromArgb(214, 34, 197, 110)))
+            int y = card.Y + 58;
+            using (Brush indexText = new SolidBrush(Faint))
+            using (Brush nameText = new SolidBrush(InkSoft))
+            using (Brush valueText = new SolidBrush(InkSoft))
+            using (Brush downBrush = new SolidBrush(DownColor))
+            using (Brush upBrush = new SolidBrush(UpColor))
             {
                 for (int i = 0; i < rangeRanks.Count; i++)
                 {
                     AppRankRow row = rangeRanks[i];
+
+                    // 斑马纹用最浅的一层，只为断开相邻两行，不抢名字的注意力
                     if (i % 2 == 0)
                     {
-                        g.FillRectangle(evenRow, 12, y, ClientSize.Width - 24, rowHeight);
+                        Rectangle stripe = new Rectangle(card.X + 8, y, card.Width - 16, RowHeight);
+                        using (GraphicsPath path = CreateRoundedRectangle(stripe, 6))
+                        using (Brush fill = new SolidBrush(Color.FromArgb(249, 251, 254)))
+                        {
+                            g.FillPath(fill, path);
+                        }
                     }
 
-                    string name = TruncateName(row.Name, nameWidth - 12, g, smallFont);
-                    g.DrawString((i + 1) + ". " + name, smallFont, nameText, 16, y + 4);
+                    DrawLabel(g, (i + 1).ToString(), tinyFont, indexText,
+                        new Rectangle(indexLeft, y, 22, RowHeight), StringAlignment.Far);
 
-                    int barWidth = barRight - barLeft;
-                    int barY = y + (rowHeight - 10) / 2;
-                    g.FillRectangle(track, barLeft, barY, barWidth, 10);
+                    DrawLabel(g, TruncateName(row.Name, nameWidth, g, smallFont), smallFont, nameText,
+                        new Rectangle(nameLeft, y, nameWidth, RowHeight), StringAlignment.Near);
+
+                    int barY = y + (RowHeight - 6) / 2;
+                    Rectangle barArea = new Rectangle(barLeft, barY, barRight - barLeft, 6);
+                    using (GraphicsPath path = CreateRoundedRectangle(barArea, 3))
+                    using (Brush fill = new SolidBrush(Track))
+                    {
+                        g.FillPath(fill, path);
+                    }
+
                     long total = row.Total;
                     if (total > 0)
                     {
-                        int filled = (int)Math.Round(barWidth * total / maxTotal);
-                        int downWidth = (int)Math.Round(filled * (double)row.Rx / total);
-                        if (downWidth > 0)
+                        int filled = (int)Math.Round((barRight - barLeft) * total / maxTotal);
+                        filled = Math.Min(barRight - barLeft, Math.Max(2, filled));
+                        Rectangle barFill = new Rectangle(barLeft, barY, filled, 6);
+                        using (GraphicsPath clip = CreateRoundedRectangle(barFill, 3))
                         {
-                            g.FillRectangle(downBar, barLeft, barY, downWidth, 10);
-                        }
+                            GraphicsState state = g.Save();
+                            g.SetClip(clip, CombineMode.Replace);
+                            int downWidth = (int)Math.Round(filled * (double)row.Rx / total);
+                            if (downWidth > 0)
+                            {
+                                g.FillRectangle(downBrush, barLeft, barY, downWidth, 6);
+                            }
 
-                        if (filled - downWidth > 0)
-                        {
-                            g.FillRectangle(upBar, barLeft + downWidth, barY, filled - downWidth, 10);
+                            if (filled - downWidth > 0)
+                            {
+                                g.FillRectangle(upBrush, barLeft + downWidth, barY, filled - downWidth, 6);
+                            }
+
+                            g.Restore(state);
                         }
                     }
 
-                    string value = "\u2193 " + SpeedFormatter.Format(row.Rx) +
-                                   "   \u2191 " + SpeedFormatter.Format(row.Tx);
-                    SizeF size = g.MeasureString(value, smallFont);
-                    g.DrawString(value, smallFont, valueText, valueLeft + (236 - size.Width) / 2, y + 4);
+                    DrawLabel(g, SpeedFormatter.Format(row.Rx), smallFont, valueText,
+                        new Rectangle(downLeft, y, upLeft - 4 - downLeft, RowHeight), StringAlignment.Far);
+                    DrawLabel(g, SpeedFormatter.Format(row.Tx), smallFont, valueText,
+                        new Rectangle(upLeft, y, upRight - upLeft, RowHeight), StringAlignment.Far);
 
-                    y += rowHeight;
+                    y += RowHeight;
                 }
             }
 
             if (rangeRanks.Count == 0)
             {
-                using (Brush empty = new SolidBrush(Color.FromArgb(150, 120, 134, 154)))
+                using (Brush empty = new SolidBrush(Muted))
                 {
                     // 空列表有两种原因，必须说清楚，否则用户只会以为功能坏了。
                     if (AppTrafficMonitor.CanCollectAppTraffic)
                     {
-                        g.DrawString("所选范围内暂无应用流量记录", smallFont, empty, 16, y + 6);
+                        DrawLabel(g, "所选范围内暂无应用流量记录", smallFont, empty,
+                            new Rectangle(card.X + 8, y + 6, card.Width - 16, 24), StringAlignment.Center);
                     }
                     else
                     {
-                        g.DrawString("应用流量排行需要管理员权限", smallFont, empty, 16, y + 6);
-                        g.DrawString("右键托盘图标 → 以管理员身份重启", smallFont, empty, 16, y + 24);
+                        DrawLabel(g, "应用流量排行需要管理员权限", smallFont, empty,
+                            new Rectangle(card.X + 8, y + 2, card.Width - 16, 22), StringAlignment.Center);
+                        DrawLabel(g, "右键托盘图标 → 以管理员身份重启", tinyFont, empty,
+                            new Rectangle(card.X + 8, y + 24, card.Width - 16, 20), StringAlignment.Center);
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// 卡片底：白底 + 1px 描边 + 12px 圆角。
+        /// </summary>
+        private static void DrawCardSurface(Graphics g, Rectangle rect)
+        {
+            using (GraphicsPath path = CreateRoundedRectangle(rect, 12))
+            using (Brush fill = new SolidBrush(CardBg))
+            using (Pen border = new Pen(Line))
+            {
+                g.FillPath(fill, path);
+                g.DrawPath(border, path);
+            }
+        }
+
+        /// <summary>
+        /// 在矩形里画一行字，垂直居中由 StringFormat 负责。
+        /// 原来的写法是每处 `DrawString(..., x, y + 4)` 手调偏移，换个字号就全歪。
+        /// </summary>
+        private static void DrawLabel(Graphics g, string text, Font font, Brush brush,
+            RectangleF box, StringAlignment align)
+        {
+            using (StringFormat format = new StringFormat())
+            {
+                format.Alignment = align;
+                format.LineAlignment = StringAlignment.Center;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                g.DrawString(text, font, brush, box, format);
+            }
+        }
+
+        /// <summary>
+        /// 把最大值向上取整到 1 / 2 / 5 × 10ⁿ。
+        /// 直接用原始最大值当刻度顶，轴上会出现 "182.7 MB" 这种数字，
+        /// 而柱顶永远差一点点到顶，看起来像没画完。
+        /// </summary>
+        private static double NiceCeil(double value)
+        {
+            if (value <= 0)
+            {
+                return 1;
+            }
+
+            double magnitude = Math.Pow(10, Math.Floor(Math.Log10(value)));
+            double normalized = value / magnitude;
+            double step;
+            if (normalized <= 1)
+            {
+                step = 1;
+            }
+            else if (normalized <= 2)
+            {
+                step = 2;
+            }
+            else if (normalized <= 5)
+            {
+                step = 5;
+            }
+            else
+            {
+                step = 10;
+            }
+
+            return step * magnitude;
         }
 
         private static string TruncateName(string name, int maxWidth, Graphics g, Font font)
