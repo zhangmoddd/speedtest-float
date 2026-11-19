@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Management;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -1332,6 +1333,9 @@ namespace NetSpeedBall
                 return;
             }
 
+            // 先补数据再算位置：磁盘数量变了窗口高度会跟着变，位置得按最终高度摆
+            detailsForm.PrimeResources();
+
             Rectangle area = Screen.FromControl(this).WorkingArea;
             int x = Right + 10;
             if (x + detailsForm.Width > area.Right)
@@ -2198,23 +2202,39 @@ namespace NetSpeedBall
         }
     }
 
+
+    /// <summary>
+    /// 「系统详情」面板：网络 + CPU + 内存 + 磁盘 + GPU + 网卡。
+    ///
+    /// 口径一律对齐任务管理器「性能」页：CPU 利用率是全局占用，磁盘是「活动时间」
+    /// 而不是「用了多少空间」，内存「已缓存」对应系统缓存。
+    /// 目的就一个 —— 不用再开任务管理器，瞄一眼这块卡片就知道机器什么状态。
+    /// </summary>
     internal sealed class SpeedDetailsForm : Form
     {
         private const int MaxSamples = 60;
-        /// <summary>资源面板最多画几块磁盘。 Dock 里插一排 U 盘也不会把窗口撑到屏幕外。</summary>
+        /// <summary>资源面板最多画几块磁盘。 Dock 里插一排 U 盘也不会把窗口撑出屏幕。</summary>
         private const int MaxDiskRows = 8;
-        /// <summary>CPU/内存那一行的高度。</summary>
-        private const int MetricRowHeight = 44;
-        /// <summary>每块磁盘一行的高度。</summary>
-        private const int DiskRowHeight = 24;
-        /// <summary>CPU/内存两列的宽度。</summary>
-        private const int MetricWidth = 128;
+        /// <summary>网卡那一栏最多列几块，虚拟网卡（VMware/Hyper-V）能有一打。</summary>
+        private const int MaxLinkRows = 3;
+        /// <summary>两张卡片之间的空隙。</summary>
+        private const int CardGap = 8;
+        /// <summary>左右边距。所有卡片共用同一条竖线，视觉上才整齐。</summary>
+        private const int SideMargin = 14;
+        /// <summary>网络区画完的位置，下面全是资源卡片。</summary>
+        private const int NetworkBottom = 250;
+        /// <summary>一块磁盘占的高度（标题行 + 进度条 + 读写行）。</summary>
+        private const int DiskRowHeight = 48;
+        /// <summary>一行网卡占的高度。</summary>
+        private const int LinkRowHeight = 17;
+
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
         private readonly double[] smoothBuffer = new double[MaxSamples];
         private int sampleCount;
         /// <summary>这 60 秒里出现过的最高速率，画在曲线右上角当比例尺的说明。</summary>
         private double historyPeak;
+
         private readonly TrafficStore trafficStore;
         private SpeedSample currentSample;
         private readonly SystemResourceMonitor resourceMonitor = new SystemResourceMonitor();
@@ -2225,6 +2245,7 @@ namespace NetSpeedBall
         private double shownUpload;
         private double shownCpu;
         private double shownMemory;
+        private double shownGpu;
         private double[] shownDisks = new double[0];
         private bool shownPrimed;
 
@@ -2233,10 +2254,33 @@ namespace NetSpeedBall
         private readonly HeldValue heldUpload = new HeldValue(0.25, 2048.0);
         private readonly HeldValue heldCpu = new HeldValue(0.12, 1.0);
         private readonly HeldValue heldMemory = new HeldValue(0.06, 0.5);
+        private readonly HeldValue heldGpu = new HeldValue(0.12, 1.0);
         private readonly List<HeldValue> heldDisks = new List<HeldValue>();
+
         private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
+        private readonly Font cardTitleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold);
         private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
+        private readonly Font strongFont = new Font("Segoe UI", 8.2f, FontStyle.Bold);
         private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
+
+        private readonly Brush darkBrush = new SolidBrush(Color.FromArgb(30, 42, 60));
+        private readonly Brush mutedBrush = new SolidBrush(Color.FromArgb(94, 112, 134));
+        private readonly Brush faintBrush = new SolidBrush(Color.FromArgb(142, 158, 176));
+        private readonly Brush downBrush = new SolidBrush(Color.FromArgb(35, 119, 238));
+        private readonly Brush upBrush = new SolidBrush(Color.FromArgb(16, 178, 92));
+
+        private static readonly Color CpuColor = Color.FromArgb(242, 126, 42);
+        private static readonly Color MemoryColor = Color.FromArgb(35, 119, 238);
+        private static readonly Color DiskColor = Color.FromArgb(16, 178, 92);
+        private static readonly Color GpuColor = Color.FromArgb(138, 96, 230);
+        private static readonly Color LinkColor = Color.FromArgb(22, 160, 170);
+
+        /// <summary>各卡片的位置，每帧按当前磁盘/网卡数量重算一次。</summary>
+        private Rectangle cpuCard;
+        private Rectangle memoryCard;
+        private Rectangle diskCard;
+        private Rectangle gpuCard;
+        private Rectangle linkCard;
 
         /// <summary>鼠标是否停在关闭按钮上。用来画悬停反馈。</summary>
         private bool closeHover;
@@ -2257,8 +2301,10 @@ namespace NetSpeedBall
         public SpeedDetailsForm(TrafficStore store)
         {
             trafficStore = store;
-            Text = "Network details";
-            Size = new Size(330, 372);
+            Text = "System details";
+            // 静态信息（CPU 型号、内存条频率、GPU 名字）在后台读一次，读好了自动重绘。
+            SystemInfoProvider.EnsureLoading(delegate { Invalidate(); });
+            Size = new Size(430, 780);
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -2289,16 +2335,59 @@ namespace NetSpeedBall
             Invalidate();
         }
 
+        /// <summary>
+        /// 面板刚被打开时先取一次最新数据，别让用户先看到几秒前的旧数字。
+        /// 只补资源那几块，流量曲线和今日/本月统计一直是最新的。
+        /// </summary>
+        public void PrimeResources()
+        {
+            resourceSnapshot = resourceMonitor.Read();
+            heldCpu.Snap(resourceSnapshot.CpuPercent);
+            heldMemory.Snap(resourceSnapshot.MemoryPercent);
+            heldGpu.Snap(resourceSnapshot.GpuPercent);
+            shownCpu = heldCpu.Target;
+            shownMemory = heldMemory.Target;
+            shownGpu = heldGpu.Target;
+
+            while (heldDisks.Count < DiskRowCount())
+            {
+                heldDisks.Add(new HeldValue(0.2, 1.0));
+            }
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                heldDisks[i].Snap(disks[i].Percent);
+                shownDisks[i] = disks[i].Percent;
+            }
+
+            SyncHeight();
+            Invalidate();
+        }
+
         public void AddSample(SpeedSample sample)
         {
             currentSample = sample;
-            resourceSnapshot = resourceMonitor.Read();
-            SyncResourcePanelHeight();
+
+            // 面板没显示的时候没必要每秒去翻性能计数器 —— 那些东西要读注册表、
+            // 枚举磁盘和 GPU 实例，白白占 CPU。流量曲线照记，资源数据等打开时再补。
+            if (Visible || resourceSnapshot == null)
+            {
+                resourceSnapshot = resourceMonitor.Read();
+                SyncHeight();
+            }
 
             heldDownload.Update(sample.DownloadBytesPerSecond);
             heldUpload.Update(sample.UploadBytesPerSecond);
             heldCpu.Update(resourceSnapshot.CpuPercent);
             heldMemory.Update(resourceSnapshot.MemoryPercent);
+            heldGpu.Update(resourceSnapshot.GpuPercent);
 
             DiskActivityRow[] disks = resourceSnapshot.Disks;
             int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
@@ -2396,7 +2485,14 @@ namespace NetSpeedBall
                 moved = true;
             }
 
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            double gpu = SmoothValue.Toward(shownGpu, heldGpu.Target, elapsed, 0.5, 0.1);
+            if (gpu != shownGpu)
+            {
+                shownGpu = gpu;
+                moved = true;
+            }
+
+            DiskActivityRow[] disks = resourceSnapshot == null ? null : resourceSnapshot.Disks;
             int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
             if (shownDisks.Length != count)
             {
@@ -2432,15 +2528,19 @@ namespace NetSpeedBall
         {
             heldDownload.Snap(currentSample.DownloadBytesPerSecond);
             heldUpload.Snap(currentSample.UploadBytesPerSecond);
-            heldCpu.Snap(resourceSnapshot.CpuPercent);
-            heldMemory.Snap(resourceSnapshot.MemoryPercent);
+
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            heldCpu.Snap(snapshot.CpuPercent);
+            heldMemory.Snap(snapshot.MemoryPercent);
+            heldGpu.Snap(snapshot.GpuPercent);
 
             shownDownload = heldDownload.Target;
             shownUpload = heldUpload.Target;
             shownCpu = heldCpu.Target;
             shownMemory = heldMemory.Target;
+            shownGpu = heldGpu.Target;
 
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            DiskActivityRow[] disks = snapshot.Disks;
             int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
             if (shownDisks.Length != count)
             {
@@ -2463,11 +2563,10 @@ namespace NetSpeedBall
         /// 磁盘数量一变就把窗口高度跟上：插个 U 盘当场多一行，拔掉当场少一行。
         /// 变高之后底边可能已经出屏了，所以顺手按回工作区内。
         /// </summary>
-        private void SyncResourcePanelHeight()
+        private void SyncHeight()
         {
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
-            int rows = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
-            int height = 275 + (8 + MetricRowHeight + rows * DiskRowHeight + 8) + 12;
+            LayoutCards();
+            int height = contentBottom;
             if (height == Height)
             {
                 return;
@@ -2488,6 +2587,62 @@ namespace NetSpeedBall
             }
         }
 
+        /// <summary>卡片底部，也就是窗口应有的高度。</summary>
+        private int contentBottom;
+
+        /// <summary>
+        /// 从上往下依次摆卡片，顺便算出总高度。
+        ///
+        /// 绘制和算窗口高度都走这一个方法 —— 分成两份的话，改个间距就会出现
+        /// 「窗口比内容矮 20px，最底下那行被切掉」这种只有用户能看见的错。
+        /// </summary>
+        private void LayoutCards()
+        {
+            int width = Math.Max(240, Width - SideMargin * 2);
+            int y = NetworkBottom;
+
+            cpuCard = new Rectangle(SideMargin, y, width, 140);
+            y += cpuCard.Height + CardGap;
+
+            memoryCard = new Rectangle(SideMargin, y, width, 124);
+            y += memoryCard.Height + CardGap;
+
+            int disks = DiskRowCount();
+            if (disks > 0)
+            {
+                diskCard = new Rectangle(SideMargin, y, width, 24 + disks * DiskRowHeight);
+                y += diskCard.Height + CardGap;
+            }
+            else
+            {
+                diskCard = Rectangle.Empty;
+            }
+
+            gpuCard = new Rectangle(SideMargin, y, width, 102);
+            y += gpuCard.Height + CardGap;
+
+            int links = LinkRowCount();
+            linkCard = new Rectangle(SideMargin, y, width, 28 + links * LinkRowHeight);
+            y += linkCard.Height;
+
+            contentBottom = y + 12;
+        }
+
+        private int DiskRowCount()
+        {
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            DiskActivityRow[] disks = snapshot.Disks;
+            return disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+        }
+
+        private int LinkRowCount()
+        {
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            NetworkLinkRow[] links = snapshot.Links;
+            int count = links == null ? 0 : Math.Min(links.Length, MaxLinkRows);
+            return count > 0 ? count : 1;
+        }
+
         /// <summary>
         /// 把详情面板原样渲染成 PNG，只给 <c>--render-details 路径</c> 自检用。
         /// 假数据按日常待机那种"20~50 KB/s 抖 + 偶尔一下 190 KB/s"来造，
@@ -2496,6 +2651,7 @@ namespace NetSpeedBall
         public static void SavePreview(string path)
         {
             TrafficStore store = new TrafficStore();
+            SystemInfoProvider.WaitForStaticInfo(3000);
             using (SpeedDetailsForm form = new SpeedDetailsForm(store))
             {
                 // 逼出窗口句柄，否则 DrawToBitmap 画出来是一张白图。
@@ -2506,8 +2662,10 @@ namespace NetSpeedBall
 
                 // 磁盘活动率是"两次读数之间的差值"，必须真的隔一秒取两次，
                 // 连着循环喂 60 条假数据只会算出垃圾值（间隔≈0）。
+                // GPU 也一个道理，顺手把它的采样倒计时拨到 1，两次都真采一遍。
                 form.resourceSnapshot = form.resourceMonitor.Read();
                 System.Threading.Thread.Sleep(1100);
+                form.resourceMonitor.ForceGpuSample();
                 form.resourceSnapshot = form.resourceMonitor.Read();
 
                 // 曲线历史直接写数组，不走 AddSample —— 否则每写一个点都会再读一次计数器。
@@ -2532,7 +2690,7 @@ namespace NetSpeedBall
                 form.currentSample = new SpeedSample(form.downloadHistory[MaxSamples - 1],
                     form.uploadHistory[MaxSamples - 1], true, 1.0, 0, 0);
                 form.SnapShownValues();
-                form.SyncResourcePanelHeight();
+                form.SyncHeight();
 
                 using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
                 {
@@ -2616,6 +2774,8 @@ namespace NetSpeedBall
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
+            LayoutCards();
+
             Rectangle body = new Rectangle(1, 1, Width - 3, Height - 3);
             using (GraphicsPath path = CreateRoundedRectangle(body, 18))
             using (LinearGradientBrush background = new LinearGradientBrush(body, Color.White, Color.FromArgb(235, 247, 255), LinearGradientMode.Vertical))
@@ -2625,29 +2785,46 @@ namespace NetSpeedBall
                 g.DrawPath(border, path);
             }
 
-            using (Brush dark = new SolidBrush(Color.FromArgb(28, 38, 56)))
-            using (Brush muted = new SolidBrush(Color.FromArgb(96, 112, 132)))
-            using (Brush downBrush = new SolidBrush(Color.FromArgb(35, 119, 238)))
-            using (Brush upBrush = new SolidBrush(Color.FromArgb(16, 178, 92)))
-            {
-                g.DrawString("\u7f51\u7edc\u8be6\u60c5", titleFont, dark, 16, 13);
-                g.DrawString(currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf", smallFont, muted, 236, 17);
-                g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
-                g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 168, 43);
-                g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, muted, 16, 72);
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
 
-                // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
-                if (historyPeak > 0)
-                {
-                    string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
-                    SizeF peakSize = g.MeasureString(peakText, smallFont);
-                    g.DrawString(peakText, smallFont, muted, Width - 16 - peakSize.Width, 72);
-                }
-            }
+            DrawNetworkSection(g, snapshot);
+
+            DrawCpuCard(g, snapshot);
+            DrawMemoryCard(g, snapshot);
+            DrawDiskCard(g, snapshot);
+            DrawGpuCard(g, snapshot);
+            DrawLinkCard(g, snapshot);
 
             DrawCloseButton(g);
 
-            Rectangle graph = new Rectangle(16, 91, Width - 32, 82);
+            // 关闭按钮最后画，标题那一行的状态文字不会压到它上面
+        }
+
+        /// <summary>
+        /// 网络区：跟原来一样 —— 上下行实时速度、60 秒曲线、今日/本月流量。
+        /// 这块是这个程序的看家本事，位置不动，用户一开就知道该看哪儿。
+        /// </summary>
+        private void DrawNetworkSection(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            g.DrawString("\u7cfb\u7edf\u8be6\u60c5", titleFont, darkBrush, 16, 13);
+
+            string status = currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf";
+            SizeF statusSize = g.MeasureString(status, smallFont);
+            g.DrawString(status, smallFont, faintBrush, Width - 42 - statusSize.Width, 17);
+
+            g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
+            g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 178, 43);
+            g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, mutedBrush, 16, 72);
+
+            // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
+            if (historyPeak > 0)
+            {
+                string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
+                SizeF peakSize = g.MeasureString(peakText, smallFont);
+                g.DrawString(peakText, smallFont, mutedBrush, Width - 16 - peakSize.Width, 72);
+            }
+
+            Rectangle graph = new Rectangle(16, 91, Width - 32, 74);
             DrawGraph(g, graph);
 
             long todayDate = TrafficStore.ToDateInt(DateTime.Today);
@@ -2659,96 +2836,245 @@ namespace NetSpeedBall
                 ? trafficStore.GetRangeTotals(TrafficStore.ToDateInt(monthStart), todayDate)
                 : new long[] { 0, 0 };
 
-            using (Brush muted = new SolidBrush(Color.FromArgb(90, 108, 128)))
-            using (Brush dark = new SolidBrush(Color.FromArgb(32, 44, 62)))
-            {
-                g.DrawString("\u4eca\u65e5\u4e0b\u8f7d", smallFont, muted, 18, 184);
-                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[0]), valueFont, dark, 18, 201);
-                g.DrawString("\u4eca\u65e5\u4e0a\u4f20", smallFont, muted, 174, 184);
-                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[1]), valueFont, dark, 174, 201);
-                g.DrawString("\u672c\u6708\u4e0b\u8f7d", smallFont, muted, 18, 224);
-                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[0]), valueFont, dark, 18, 241);
-                g.DrawString("\u672c\u6708\u4e0a\u4f20", smallFont, muted, 174, 224);
-                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[1]), valueFont, dark, 174, 241);
-            }
-
-            DrawResourcePanel(g);
+            int rightColumn = (Width - 32) / 2 + 16;
+            g.DrawString("\u4eca\u65e5\u4e0b\u8f7d", smallFont, mutedBrush, 18, 172);
+            g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[0]), valueFont, darkBrush, 18, 188);
+            g.DrawString("\u4eca\u65e5\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, 172);
+            g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[1]), valueFont, darkBrush, rightColumn, 188);
+            g.DrawString("\u672c\u6708\u4e0b\u8f7d", smallFont, mutedBrush, 18, 212);
+            g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[0]), valueFont, darkBrush, 18, 228);
+            g.DrawString("\u672c\u6708\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, 212);
+            g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[1]), valueFont, darkBrush, rightColumn, 228);
         }
 
-        private void DrawResourcePanel(Graphics g)
+        /// <summary>卡片底：浅蓝一块，跟顶部网络区分开，一眼能看出"这是另一类信息"。</summary>
+        private void DrawCard(Graphics g, Rectangle card)
         {
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
-            int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
-
-            // 有几块磁盘就画几行：U 盘插上来当场多一行，拔掉当场少一行。
-            int panelHeight = 8 + MetricRowHeight + diskCount * DiskRowHeight + 8;
-            Rectangle panel = new Rectangle(16, 275, Width - 32, panelHeight);
-            using (Brush fill = new SolidBrush(Color.FromArgb(235, 245, 252)))
-            using (Pen border = new Pen(Color.FromArgb(150, 190, 218), 1.0f))
+            using (Brush fill = new SolidBrush(Color.FromArgb(237, 246, 253)))
+            using (Pen border = new Pen(Color.FromArgb(166, 203, 230), 1.0f))
             {
-                g.FillRectangle(fill, panel);
-                g.DrawRectangle(border, panel);
+                g.FillRectangle(fill, card);
+                g.DrawRectangle(border, card);
+            }
+        }
+
+        /// <summary>卡片标题：左边一道彩色小竖条 + 名字，右边一个百分比或容量的大数字。</summary>
+        private void DrawCardHeader(Graphics g, Rectangle card, string title, string value, Color accent)
+        {
+            using (Brush bar = new SolidBrush(accent))
+            {
+                g.FillRectangle(bar, card.Left + 10, card.Top + 9, 3, 12);
             }
 
-            int left = panel.Left + 8;
-            DrawResourceMetric(g, "CPU", FormatPercent(heldCpu.Target),
-                heldCpu.Target, left, panel.Top + 6, MetricWidth,
-                Color.FromArgb(242, 126, 42));
-            DrawResourceMetric(g, "\u5185\u5b58", FormatPercent(heldMemory.Target),
-                heldMemory.Target, left + MetricWidth + 20, panel.Top + 6, MetricWidth,
-                Color.FromArgb(35, 119, 238));
+            g.DrawString(title, cardTitleFont, darkBrush, card.Left + 18, card.Top + 6);
 
-            int y = panel.Top + 6 + MetricRowHeight;
-            for (int i = 0; i < diskCount; i++)
+            if (!string.IsNullOrEmpty(value))
             {
-                double percent = i < heldDisks.Count ? heldDisks[i].Target : disks[i].Percent;
-                DrawDiskRow(g, disks[i].Label, percent, left, y, panel.Width - 16, i);
+                SizeF size = g.MeasureString(value, valueFont);
+                g.DrawString(value, valueFont, darkBrush, card.Right - 12 - size.Width, card.Top + 5);
+            }
+        }
+
+        private void DrawBar(Graphics g, int x, int y, int width, double percent, Color color)
+        {
+            using (Brush track = new SolidBrush(Color.FromArgb(206, 222, 237)))
+            using (Brush bar = new SolidBrush(color))
+            {
+                g.FillRectangle(track, x, y, width, 6);
+                int fill = (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0);
+                if (fill > 0)
+                {
+                    g.FillRectangle(bar, x, y, fill, 6);
+                }
+            }
+        }
+
+        /// <summary>一格「标签 + 值」，标签灰色、值黑色，跟任务管理器下半截那块一个排法。</summary>
+        private void DrawField(Graphics g, string label, string value, int x, int y, int labelWidth)
+        {
+            g.DrawString(label, smallFont, mutedBrush, x, y);
+            g.DrawString(value, strongFont, darkBrush, x + labelWidth, y);
+        }
+
+        private void DrawCpuCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, cpuCard);
+            DrawCardHeader(g, cpuCard, "CPU", FormatPercent(heldCpu.Target), CpuColor);
+
+            g.DrawString(FitText(g, SystemInfoProvider.CpuName, smallFont, cpuCard.Width - 24),
+                smallFont, mutedBrush, cpuCard.Left + 12, cpuCard.Top + 24);
+
+            DrawBar(g, cpuCard.Left + 12, cpuCard.Top + 42, cpuCard.Width - 24, heldCpu.Target, CpuColor);
+
+            int column = (cpuCard.Width - 24) / 3;
+            int c1 = cpuCard.Left + 12;
+            int c2 = c1 + column;
+            int c3 = c2 + column;
+
+            DrawField(g, "\u901f\u5ea6", FormatGhz(snapshot.CpuMhz), c1, cpuCard.Top + 58, 30);
+            DrawField(g, "\u57fa\u51c6\u901f\u5ea6", FormatGhz(snapshot.CpuBaseMhz), c2, cpuCard.Top + 58, 52);
+            DrawField(g, "\u8fd0\u884c\u65f6\u957f", FormatUptime(snapshot.UptimeSeconds), c3, cpuCard.Top + 58, 52);
+
+            DrawField(g, "\u8fdb\u7a0b", FormatCount(snapshot.ProcessCount), c1, cpuCard.Top + 77, 30);
+            DrawField(g, "\u7ebf\u7a0b", FormatCount(snapshot.ThreadCount), c2, cpuCard.Top + 77, 30);
+            DrawField(g, "\u53e5\u67c4", FormatCount(snapshot.HandleCount), c3, cpuCard.Top + 77, 30);
+
+            DrawField(g, "\u5185\u6838", FormatInt(SystemInfoProvider.CpuCores), c1, cpuCard.Top + 96, 30);
+            DrawField(g, "\u903b\u8f91\u5904\u7406\u5668", FormatInt(SystemInfoProvider.CpuLogical), c2, cpuCard.Top + 96, 58);
+            DrawField(g, "\u63d2\u69fd", FormatInt(SystemInfoProvider.CpuPackages), c3, cpuCard.Top + 96, 30);
+
+            DrawField(g, "L1", FormatCache(SystemInfoProvider.L1Bytes), c1, cpuCard.Top + 115, 20);
+            DrawField(g, "L2", FormatCache(SystemInfoProvider.L2Bytes), c2, cpuCard.Top + 115, 20);
+            DrawField(g, "L3", FormatCache(SystemInfoProvider.L3Bytes), c3, cpuCard.Top + 115, 20);
+        }
+
+        private void DrawMemoryCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, memoryCard);
+            DrawCardHeader(g, memoryCard, "\u5185\u5b58", FormatPercent(heldMemory.Target), MemoryColor);
+
+            string used = FormatGb(snapshot.MemoryUsedBytes) + "/" + FormatGb(snapshot.MemoryTotalBytes) + " GB";
+            g.DrawString(used, valueFont, darkBrush, memoryCard.Left + 12, memoryCard.Top + 24);
+
+            DrawBar(g, memoryCard.Left + 12, memoryCard.Top + 42, memoryCard.Width - 24, heldMemory.Target, MemoryColor);
+
+            int column = (memoryCard.Width - 24) / 3;
+            int c1 = memoryCard.Left + 12;
+            int c2 = c1 + column;
+            int c3 = c2 + column;
+
+            DrawField(g, "\u53ef\u7528", FormatGb(snapshot.MemoryAvailableBytes) + " GB", c1, memoryCard.Top + 58, 30);
+            DrawField(g, "\u5df2\u7f13\u5b58", FormatGb(snapshot.MemoryCachedBytes) + " GB", c2, memoryCard.Top + 58, 42);
+            DrawField(g, "\u901f\u5ea6", FormatMemSpeed(), c3, memoryCard.Top + 58, 30);
+
+            DrawField(g, "\u5df2\u63d0\u4ea4", FormatGb(snapshot.CommitUsedBytes) + "/" + FormatGb(snapshot.CommitLimitBytes) + " GB",
+                c1, memoryCard.Top + 79, 42);
+            DrawField(g, "\u5206\u9875\u6c60", FormatMb(snapshot.PagedPoolBytes), c2, memoryCard.Top + 79, 42);
+            DrawField(g, "\u975e\u5206\u9875", FormatMb(snapshot.NonPagedPoolBytes), c3, memoryCard.Top + 79, 42);
+
+            DrawField(g, "\u63d2\u69fd", SystemInfoProvider.MemorySlotsUsed + "/" + SystemInfoProvider.MemorySlotsTotal,
+                c1, memoryCard.Top + 98, 30);
+            DrawField(g, "\u7c7b\u578b", SystemInfoProvider.MemoryType, c2, memoryCard.Top + 98, 30);
+            DrawField(g, "\u5355\u6761", FormatModuleSize(), c3, memoryCard.Top + 98, 30);
+        }
+
+        private void DrawDiskCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            int rows = DiskRowCount();
+            if (rows <= 0)
+            {
+                return;
+            }
+
+            DrawCard(g, diskCard);
+            using (Brush bar = new SolidBrush(DiskColor))
+            {
+                g.FillRectangle(bar, diskCard.Left + 10, diskCard.Top + 9, 3, 12);
+            }
+
+            g.DrawString("\u78c1\u76d8", cardTitleFont, darkBrush, diskCard.Left + 18, diskCard.Top + 6);
+
+            DiskActivityRow[] disks = snapshot.Disks;
+            int y = diskCard.Top + 24;
+            for (int i = 0; i < rows; i++)
+            {
+                DiskActivityRow disk = disks[i];
+                double percent = i < shownDisks.Length ? shownDisks[i] : disk.Percent;
+
+                g.DrawString(FitText(g, disk.Label, strongFont, diskCard.Width - 80),
+                    strongFont, darkBrush, diskCard.Left + 12, y);
+
+                string value = FormatPercent(percent);
+                SizeF size = g.MeasureString(value, strongFont);
+                g.DrawString(value, strongFont, darkBrush, diskCard.Right - 12 - size.Width, y);
+
+                DrawBar(g, diskCard.Left + 12, y + 15, diskCard.Width - 24, percent, DiskColor);
+
+                DrawField(g, "\u8bfb\u53d6", SpeedFormatter.Format(disk.ReadBytesPerSecond) + "/s",
+                    diskCard.Left + 12, y + 25, 28);
+                DrawField(g, "\u5199\u5165", SpeedFormatter.Format(disk.WriteBytesPerSecond) + "/s",
+                    diskCard.Left + 12 + (diskCard.Width - 24) / 3, y + 25, 28);
+                DrawField(g, "\u5bb9\u91cf", FormatCapacity(disk.CapacityBytes, disk.FreeBytes),
+                    diskCard.Left + 12 + (diskCard.Width - 24) * 2 / 3, y + 25, 28);
+
                 y += DiskRowHeight;
             }
         }
 
-        /// <summary>CPU / 内存这种"一格一值"的指标：标签在上、数字在中、进度条在下。</summary>
-        private void DrawResourceMetric(Graphics g, string label, string value, double percent,
-            int x, int y, int width, Color color)
+        private void DrawGpuCard(Graphics g, SystemResourceSnapshot snapshot)
         {
-            using (Brush muted = new SolidBrush(Color.FromArgb(90, 108, 128)))
-            using (Brush dark = new SolidBrush(Color.FromArgb(32, 44, 62)))
-            using (Brush track = new SolidBrush(Color.FromArgb(210, 224, 235)))
-            using (Brush bar = new SolidBrush(color))
+            DrawCard(g, gpuCard);
+            DrawCardHeader(g, gpuCard, "GPU", FormatPercent(heldGpu.Target), GpuColor);
+
+            g.DrawString(FitText(g, SystemInfoProvider.GpuName, smallFont, gpuCard.Width - 24),
+                smallFont, mutedBrush, gpuCard.Left + 12, gpuCard.Top + 24);
+
+            DrawBar(g, gpuCard.Left + 12, gpuCard.Top + 42, gpuCard.Width - 24, heldGpu.Target, GpuColor);
+
+            int column = (gpuCard.Width - 24) / 2;
+            int c1 = gpuCard.Left + 12;
+            int c2 = c1 + column;
+
+            ulong dedicatedTotal = SystemInfoProvider.GpuDedicatedBytes;
+            string dedicated = FormatGb(snapshot.GpuDedicatedUsed) + "/" + FormatGb(dedicatedTotal) + " GB";
+            string shared = FormatGb(snapshot.GpuSharedUsed) + "/" + FormatGb(snapshot.MemoryTotalBytes / 2) + " GB";
+
+            DrawField(g, "\u4e13\u7528\u663e\u5b58", dedicated, c1, gpuCard.Top + 56, 56);
+            DrawField(g, "\u5171\u4eab\u663e\u5b58", shared, c2, gpuCard.Top + 56, 56);
+
+            DrawField(g, "\u9a71\u52a8\u7248\u672c", SystemInfoProvider.GpuDriverVersion, c1, gpuCard.Top + 79, 56);
+            DrawField(g, "\u9a71\u52a8\u65e5\u671f", SystemInfoProvider.GpuDriverDate, c2, gpuCard.Top + 79, 56);
+        }
+
+        private void DrawLinkCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, linkCard);
+
+            using (Brush bar = new SolidBrush(LinkColor))
             {
-                g.DrawString(label, smallFont, muted, x, y);
-                g.DrawString(value, valueFont, dark, x, y + 13);
-                g.FillRectangle(track, x, y + 32, width, 6);
-                g.FillRectangle(bar, x, y + 32,
-                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0), 6);
+                g.FillRectangle(bar, linkCard.Left + 10, linkCard.Top + 9, 3, 12);
+            }
+
+            g.DrawString("\u7f51\u7edc\u9002\u914d\u5668", cardTitleFont, darkBrush, linkCard.Left + 18, linkCard.Top + 6);
+
+            NetworkLinkRow[] links = snapshot.Links;
+            int rows = LinkRowCount();
+            int y = linkCard.Top + 24;
+            for (int i = 0; i < rows; i++)
+            {
+                string name = links != null && i < links.Length ? links[i].Name : "\u6ca1\u6709\u6d3b\u52a8\u7f51\u5361";
+                string link = links != null && i < links.Length ? links[i].Link : "--";
+
+                g.DrawString(FitText(g, name, smallFont, linkCard.Width - 110),
+                    smallFont, mutedBrush, linkCard.Left + 12, y);
+
+                SizeF size = g.MeasureString(link, strongFont);
+                g.DrawString(link, strongFont, darkBrush, linkCard.Right - 12 - size.Width, y);
+
+                y += LinkRowHeight;
             }
         }
 
-        /// <summary>
-        /// 一块物理磁盘占一行：左边"磁盘 0  C:"，右边活动百分比，下面一条通栏进度条。
-        /// 口径跟任务管理器那一列一样 —— 磁盘有多忙，不是磁盘用了多少空间。
-        /// </summary>
-        private void DrawDiskRow(Graphics g, string label, double percent, int x, int y, int width, int index)
+        /// <summary>型号名太长就截断加省略号，绝不让它顶到右边的百分比上。</summary>
+        private string FitText(Graphics g, string text, Font font, int maxWidth)
         {
-            Color color = index % 2 == 0
-                ? Color.FromArgb(16, 178, 92)
-                : Color.FromArgb(64, 148, 232);
-
-            using (Brush muted = new SolidBrush(Color.FromArgb(90, 108, 128)))
-            using (Brush dark = new SolidBrush(Color.FromArgb(32, 44, 62)))
-            using (Brush track = new SolidBrush(Color.FromArgb(210, 224, 235)))
-            using (Brush bar = new SolidBrush(color))
+            if (string.IsNullOrEmpty(text))
             {
-                g.DrawString(label, smallFont, muted, x, y);
-
-                string value = FormatPercent(percent);
-                SizeF size = g.MeasureString(value, smallFont);
-                g.DrawString(value, smallFont, dark, x + width - size.Width, y);
-
-                g.FillRectangle(track, x, y + 15, width, 5);
-                g.FillRectangle(bar, x, y + 15,
-                    (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0), 5);
+                return "--";
             }
+
+            if (g.MeasureString(text, font).Width <= maxWidth)
+            {
+                return text;
+            }
+
+            string result = text;
+            while (result.Length > 2 && g.MeasureString(result + "\u2026", font).Width > maxWidth)
+            {
+                result = result.Substring(0, result.Length - 1);
+            }
+
+            return result + "\u2026";
         }
 
         private static string FormatPercent(double value)
@@ -2759,6 +3085,125 @@ namespace NetSpeedBall
             }
 
             return Math.Max(0.0, Math.Min(100.0, value)).ToString("0.#") + "%";
+        }
+
+        private static string FormatGhz(double mhz)
+        {
+            if (mhz <= 0 || double.IsNaN(mhz) || double.IsInfinity(mhz))
+            {
+                return "--";
+            }
+
+            return (mhz / 1000.0).ToString("0.00") + " GHz";
+        }
+
+        private static string FormatInt(int value)
+        {
+            return value > 0 ? value.ToString("N0") : "--";
+        }
+
+        private static string FormatCount(int value)
+        {
+            return value > 0 ? value.ToString("N0") : "--";
+        }
+
+        private static string FormatGb(ulong bytes)
+        {
+            if (bytes == 0)
+            {
+                return "0.0";
+            }
+
+            return (bytes / 1073741824.0).ToString("0.0");
+        }
+
+        private static string FormatMb(ulong bytes)
+        {
+            if (bytes == 0)
+            {
+                return "0 MB";
+            }
+
+            double mb = bytes / 1048576.0;
+            if (mb >= 1024)
+            {
+                return (mb / 1024.0).ToString("0.0") + " GB";
+            }
+
+            return mb.ToString("0") + " MB";
+        }
+
+        private static string FormatCache(long bytes)
+        {
+            if (bytes <= 0)
+            {
+                return "--";
+            }
+
+            double kb = bytes / 1024.0;
+            if (kb >= 1024)
+            {
+                return (kb / 1024.0).ToString("0.#") + " MB";
+            }
+
+            return kb.ToString("0") + " KB";
+        }
+
+        private static string FormatMemSpeed()
+        {
+            int speed = SystemInfoProvider.MemorySpeedMhz;
+            return speed > 0 ? speed.ToString("N0") + " MT/s" : "--";
+        }
+
+        private static string FormatModuleSize()
+        {
+            int mb = SystemInfoProvider.MemoryModuleMb;
+            if (mb <= 0)
+            {
+                return "--";
+            }
+
+            if (mb >= 1024)
+            {
+                return (mb / 1024) + " GB";
+            }
+
+            return mb + " MB";
+        }
+
+        private static string FormatUptime(ulong seconds)
+        {
+            if (seconds == 0)
+            {
+                return "--";
+            }
+
+            TimeSpan span = TimeSpan.FromSeconds(seconds);
+            if (span.TotalDays >= 1)
+            {
+                return ((int)span.TotalDays) + "." + span.Hours.ToString("00") + ":" +
+                       span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+            }
+
+            return span.Hours + ":" + span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+        }
+
+        /// <summary>容量按「剩余/总计」写，跟任务管理器磁盘页一个口径。</summary>
+        private static string FormatCapacity(long capacity, long free)
+        {
+            if (capacity <= 0)
+            {
+                return "--";
+            }
+
+            double totalGb = capacity / 1073741824.0;
+            double freeGb = free / 1073741824.0;
+            if (totalGb >= 1024)
+            {
+                return (freeGb / 1024.0).ToString("0.0") + "/" + (totalGb / 1024.0).ToString("0.0") + " TB";
+            }
+
+            return freeGb.ToString("0") + "/" + totalGb.ToString("0") + " GB";
         }
 
         private void DrawGraph(Graphics g, Rectangle graph)
@@ -2949,10 +3394,18 @@ namespace NetSpeedBall
             if (disposing)
             {
                 titleFont.Dispose();
+                cardTitleFont.Dispose();
                 valueFont.Dispose();
+                strongFont.Dispose();
                 smallFont.Dispose();
+                darkBrush.Dispose();
+                mutedBrush.Dispose();
+                faintBrush.Dispose();
+                downBrush.Dispose();
+                upBrush.Dispose();
                 resourceMonitor.Dispose();
             }
+
             base.Dispose(disposing);
         }
     }
@@ -2966,49 +3419,136 @@ namespace NetSpeedBall
         public readonly string Label;
         /// <summary>活动时间百分比（0~100），跟任务管理器「磁盘」那一列同口径。</summary>
         public readonly double Percent;
+        /// <summary>这一秒读了多少字节。任务管理器磁盘页里那条「读取」曲线。</summary>
+        public readonly double ReadBytesPerSecond;
+        /// <summary>这一秒写了多少字节。</summary>
+        public readonly double WriteBytesPerSecond;
+        /// <summary>这块盘的总容量，按第一个盘符去问的。</summary>
+        public readonly long CapacityBytes;
+        /// <summary>这块盘还剩多少空间。</summary>
+        public readonly long FreeBytes;
 
-        public DiskActivityRow(string label, double percent)
+        public DiskActivityRow(string label, double percent, double readBytesPerSecond,
+            double writeBytesPerSecond, long capacityBytes, long freeBytes)
         {
             Label = label;
             Percent = percent;
+            ReadBytesPerSecond = readBytesPerSecond;
+            WriteBytesPerSecond = writeBytesPerSecond;
+            CapacityBytes = capacityBytes;
+            FreeBytes = freeBytes;
         }
     }
 
-    internal struct SystemResourceSnapshot
+    /// <summary>一块活动网卡：名字 + 当前链路速度。</summary>
+    internal struct NetworkLinkRow
     {
-        public readonly double CpuPercent;
-        public readonly double MemoryPercent;
-        public readonly ulong MemoryUsedBytes;
-        public readonly ulong MemoryTotalBytes;
-        /// <summary>每块物理磁盘一行，插拔 U 盘时这个数组会当场增减。</summary>
-        public readonly DiskActivityRow[] Disks;
+        public readonly string Name;
+        public readonly string Link;
 
-        public SystemResourceSnapshot(double cpuPercent, double memoryPercent,
-            ulong memoryUsedBytes, ulong memoryTotalBytes, DiskActivityRow[] disks)
+        public NetworkLinkRow(string name, string link)
         {
-            CpuPercent = cpuPercent;
-            MemoryPercent = memoryPercent;
-            MemoryUsedBytes = memoryUsedBytes;
-            MemoryTotalBytes = memoryTotalBytes;
-            Disks = disks;
+            Name = name;
+            Link = link;
         }
     }
 
+    /// <summary>
+    /// 一次采样抓到的全部系统指标。
+    ///
+    /// 字段基本照着任务管理器「性能」页抄的：CPU 那块有利用率/频率/进程/线程/句柄/核数，
+    /// 内存那块有已用/可用/已缓存/已提交/分页池，磁盘有活动率和读写速度，GPU 有占用和显存。
+    /// 用 class 而不是 struct —— 二十几个字段的 struct 每次赋值都要整块拷贝，没必要。
+    /// </summary>
+    internal sealed class SystemResourceSnapshot
+    {
+        /// <summary>还没有采样时的空快照，界面第一帧拿它兜底，省掉一路判 null。</summary>
+        public static readonly SystemResourceSnapshot Empty = new SystemResourceSnapshot();
+
+        public double CpuPercent;
+        /// <summary>CPU 当前实际跑在多少 MHz（不是标称主频）。</summary>
+        public double CpuMhz;
+        /// <summary>标称/基准频率，任务管理器 CPU 页那个「基准速度」。</summary>
+        public double CpuBaseMhz;
+
+        public double MemoryPercent;
+        public ulong MemoryUsedBytes;
+        public ulong MemoryTotalBytes;
+        public ulong MemoryAvailableBytes;
+        /// <summary>「已缓存」，对应任务管理器内存页的 Cached。</summary>
+        public ulong MemoryCachedBytes;
+        public ulong CommitUsedBytes;
+        public ulong CommitLimitBytes;
+        public ulong PagedPoolBytes;
+        public ulong NonPagedPoolBytes;
+
+        public int ProcessCount;
+        public int ThreadCount;
+        public int HandleCount;
+        public ulong UptimeSeconds;
+
+        public DiskActivityRow[] Disks = new DiskActivityRow[0];
+
+        public double GpuPercent;
+        public ulong GpuDedicatedUsed;
+        public ulong GpuSharedUsed;
+
+        public NetworkLinkRow[] Links = new NetworkLinkRow[0];
+
+        public bool NetworkOnline
+        {
+            get { return Links != null && Links.Length > 0; }
+        }
+    }
+
+    /// <summary>
+    /// 系统资源采样器：CPU、内存、磁盘、GPU、网卡，每样都按任务管理器的口径取。
+    ///
+    /// 快的东西（CPU 时间差、GlobalMemoryStatusEx）每秒读一次；
+    /// 慢的东西（枚举磁盘、枚举 GPU 引擎实例）缓存 5 秒扫一次，
+    /// 不这么分层的话，一秒一次的全量扫描会把界面动画卡成 PPT。
+    /// </summary>
     internal sealed class SystemResourceMonitor : IDisposable
     {
         /// <summary>性能计数器里的物理磁盘分类。实例名形如「0 C:」「1 D: E:」。</summary>
         private const string DiskCategory = "PhysicalDisk";
-
+        /// <summary>每个逻辑处理器都有一份的计数器，装一把抓总。</summary>
+        private const string CpuCategory = "Processor Information";
+        /// <summary>GPU 各引擎的占用率，实例名里带 engtype_3D / engtype_Copy 这种尾巴。</summary>
+        private const string GpuEngineCategory = "GPU Engine";
+        /// <summary>GPU 专用/共享显存的实际占用量。</summary>
+        private const string GpuMemoryCategory = "GPU Adapter Memory";
         /// <summary>
         /// 每隔几次采样重扫一遍磁盘列表。
         /// 每次重扫要花约 45ms（读注册表里的实例名），放在 UI 线程上每秒扫一次会卡动画，
         /// 所以 5 秒扫一次 —— 插上 U 盘最多 5 秒内出现在面板里。
         /// </summary>
         private const int DiskRescanInterval = 5;
+        /// <summary>GPU 引擎实例能有几十上百个，枚举一次更贵，也 5 秒一次。</summary>
+        private const int GpuRescanInterval = 5;
+        /// <summary>网卡列表变化很慢，5 秒扫一次足够。</summary>
+        private const int LinkRescanInterval = 5;
+        /// <summary>3D 引擎实例最多认这么多个，防止某些机器上几百个实例把一帧拖到几十毫秒。</summary>
+        private const int MaxGpuInstances = 24;
+        /// <summary>
+        /// GPU 每几拍采一次。
+        /// 实测一台开着一堆程序的机器上，GPU Engine 分类能有两三百个实例，
+        /// 逐个取值一次要几十毫秒 —— 每秒都做，界面的 60 帧动画当场变卡。
+        /// 3 秒更新一次，肉眼看利用率曲线几乎没区别，CPU 开销降到三分之一以下。
+        /// </summary>
+        private const int GpuSampleInterval = 3;
 
         private sealed class DiskCounter
         {
             public PerformanceCounter Idle;
+            public PerformanceCounter Read;
+            public PerformanceCounter Write;
+            public bool Primed;
+        }
+
+        private sealed class GpuCounter
+        {
+            public PerformanceCounter Utilization;
             public bool Primed;
         }
 
@@ -3017,37 +3557,148 @@ namespace NetSpeedBall
         private readonly List<string> diskInstances = new List<string>();
         private readonly List<DiskActivityRow> diskRows = new List<DiskActivityRow>();
 
+        private readonly Dictionary<string, GpuCounter> gpuCounters =
+            new Dictionary<string, GpuCounter>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> gpuInstances = new List<string>();
+        private PerformanceCounter gpuDedicatedCounter;
+        private PerformanceCounter gpuSharedCounter;
+        private string gpuMemoryInstance;
+
+        private PerformanceCounter cpuFrequencyCounter;
+        private PerformanceCounter cpuBaseFrequencyCounter;
+        private double cpuBaseMhz;
+        private bool cpuFrequencyPrimed;
+
+        private NetworkLinkRow[] linkRows = new NetworkLinkRow[0];
+
+        // GPU 不是每拍都采，没采的那几拍沿用上一次的数字
+        private int gpuSampleCountdown;
+        private double gpuPercentCached;
+        private ulong gpuDedicatedCached;
+        private ulong gpuSharedCached;
+
         private bool hasCpuBaseline;
         private long lastIdle;
         private long lastKernel;
         private long lastUser;
-        private int rescanCountdown;
+        private int diskRescanCountdown;
+        private int gpuRescanCountdown;
+        private int linkRescanCountdown;
 
         public void Dispose()
         {
-            foreach (DiskCounter counter in diskCounters.Values)
-            {
-                try
-                {
-                    counter.Idle.Dispose();
-                }
-                catch
-                {
-                }
+            foreach (DiskCounter counter in diskCounters.Values)            {
+                DisposeCounter(counter.Idle);
+                DisposeCounter(counter.Read);
+                DisposeCounter(counter.Write);
             }
 
             diskCounters.Clear();
             diskInstances.Clear();
+
+            foreach (GpuCounter counter in gpuCounters.Values)
+            {
+                DisposeCounter(counter.Utilization);
+            }
+
+            gpuCounters.Clear();
+            gpuInstances.Clear();
+            DisposeCounter(gpuDedicatedCounter);
+            DisposeCounter(gpuSharedCounter);
+            DisposeCounter(cpuFrequencyCounter);
+            DisposeCounter(cpuBaseFrequencyCounter);
+        }
+
+        private static void DisposeCounter(PerformanceCounter counter)
+        {
+            if (counter == null)
+            {
+                return;
+            }
+
+            try
+            {
+                counter.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>让下一拍就重新读 GPU（截图自检用，正常运行时由倒计时控制）。</summary>
+        public void ForceGpuSample()
+        {
+            gpuSampleCountdown = 1;
         }
 
         public SystemResourceSnapshot Read()
         {
-            double cpu = ReadCpuPercent();
+            SystemResourceSnapshot snapshot = new SystemResourceSnapshot();
+
+            snapshot.CpuPercent = ReadCpuPercent();
+            snapshot.CpuMhz = ReadCpuMhz();
+            snapshot.CpuBaseMhz = cpuBaseMhz;
+
+            // GetPerformanceInfo 一个调用就把任务管理器下半截的数字全给了：
+            // 进程/线程/句柄、已提交、系统缓存、分页与非分页缓冲池。
+            // 注意它返回的单位是「页」，要乘 PageSize 才是字节。
+            NativeMethods.PerformanceInformation perf = new NativeMethods.PerformanceInformation();
+            perf.Size = (uint)Marshal.SizeOf(typeof(NativeMethods.PerformanceInformation));
+            bool perfOk = false;
+            try
+            {
+                perfOk = NativeMethods.GetPerformanceInfo(ref perf, perf.Size);
+            }
+            catch
+            {
+                perfOk = false;
+            }
+
+            ulong pageSize = 4096;
+            if (perfOk)
+            {
+                long rawPage = perf.PageSize.ToInt64();
+                if (rawPage > 0)
+                {
+                    pageSize = (ulong)rawPage;
+                }
+            }
+
             ulong totalMemory = 0;
             ulong availableMemory = 0;
-            double memory = ReadMemoryPercent(ref totalMemory, ref availableMemory);
-            ulong usedMemory = totalMemory >= availableMemory ? totalMemory - availableMemory : 0;
-            return new SystemResourceSnapshot(cpu, memory, usedMemory, totalMemory, ReadDisks());
+            snapshot.MemoryPercent = ReadMemoryPercent(ref totalMemory, ref availableMemory);
+            snapshot.MemoryTotalBytes = totalMemory;
+            snapshot.MemoryAvailableBytes = availableMemory;
+            snapshot.MemoryUsedBytes = totalMemory >= availableMemory ? totalMemory - availableMemory : 0;
+
+            if (perfOk)
+            {
+                snapshot.MemoryCachedBytes = ToBytes(perf.SystemCache, pageSize);
+                snapshot.CommitUsedBytes = ToBytes(perf.CommitTotal, pageSize);
+                snapshot.CommitLimitBytes = ToBytes(perf.CommitLimit, pageSize);
+                snapshot.PagedPoolBytes = ToBytes(perf.KernelPaged, pageSize);
+                snapshot.NonPagedPoolBytes = ToBytes(perf.KernelNonpaged, pageSize);
+                snapshot.ProcessCount = (int)perf.ProcessCount;
+                snapshot.ThreadCount = (int)perf.ThreadCount;
+                snapshot.HandleCount = (int)perf.HandleCount;
+            }
+
+            snapshot.UptimeSeconds = NativeMethods.GetTickCount64() / 1000;
+            snapshot.Disks = ReadDisks();
+            ReadGpu(snapshot);
+            snapshot.Links = ReadLinks();
+            return snapshot;
+        }
+
+        private static ulong ToBytes(IntPtr pages, ulong pageSize)
+        {
+            long value = pages.ToInt64();
+            if (value <= 0)
+            {
+                return 0;
+            }
+
+            return (ulong)value * pageSize;
         }
 
         private double ReadCpuPercent()
@@ -3085,6 +3736,102 @@ namespace NetSpeedBall
             return Math.Max(0.0, Math.Min(100.0, 100.0 * (1.0 - (double)idleDelta / totalDelta)));
         }
 
+        /// <summary>
+        /// CPU 当前跑在多少 MHz。
+        ///
+        /// 任务管理器那个「速度 2.04 GHz」不是标称主频，是实时频率：
+        /// 「Processor Frequency」拿到的是基准频率（这台机器就是 2300），
+        /// 「% Processor Performance」是相对基准的百分比，两者一乘才是此刻的真实频率。
+        /// 注意基准频率不能从注册表 ~MHz 拿 —— 那玩意儿在不少机器上给的是别的数，
+        /// 一乘就把实时频率算飞了。
+        /// </summary>
+        private double ReadCpuMhz()
+        {
+            ReadCpuBaseFrequency();
+
+            if (cpuBaseMhz <= 0)
+            {
+                return 0;
+            }
+
+            if (cpuFrequencyCounter == null)
+            {
+                try
+                {
+                    cpuFrequencyCounter = new PerformanceCounter(
+                        CpuCategory, "% Processor Performance", "_Total", true);
+                }
+                catch
+                {
+                    cpuFrequencyCounter = null;
+                    return cpuBaseMhz;
+                }
+            }
+
+            try
+            {
+                float performance = cpuFrequencyCounter.NextValue();
+                if (!cpuFrequencyPrimed)
+                {
+                    cpuFrequencyPrimed = true;
+                    return cpuBaseMhz;
+                }
+
+                if (performance <= 0 || float.IsNaN(performance) || float.IsInfinity(performance))
+                {
+                    return cpuBaseMhz;
+                }
+
+                return cpuBaseMhz * performance / 100.0;
+            }
+            catch
+            {
+                return cpuBaseMhz;
+            }
+        }
+
+        /// <summary>基准频率读一次就记住，没必要每秒问一遍。</summary>
+        private void ReadCpuBaseFrequency()
+        {
+            // WMI 那边读好了就以它为准：任务管理器的「基准速度」用的就是这个值。
+            // 后台线程可能还没读完，所以每拍都探一下，读到了就覆盖掉临时值。
+            double official = SystemInfoProvider.CpuBaseMhz;
+            if (official > 0)
+            {
+                cpuBaseMhz = official;
+                return;
+            }
+
+            if (cpuBaseMhz > 0)
+            {
+                return;
+            }
+
+            try
+            {
+                if (cpuBaseFrequencyCounter == null)
+                {
+                    cpuBaseFrequencyCounter = new PerformanceCounter(
+                        CpuCategory, "Processor Frequency", "_Total", true);
+                }
+
+                float value = cpuBaseFrequencyCounter.NextValue();
+                if (value > 0 && !float.IsNaN(value) && !float.IsInfinity(value))
+                {
+                    cpuBaseMhz = value;
+                }
+            }
+            catch
+            {
+            }
+
+            // 计数器也拿不到时退回注册表那个近似值，总比显示 "--" 强
+            if (cpuBaseMhz <= 0)
+            {
+                cpuBaseMhz = SystemInfoProvider.CpuBaseMhz;
+            }
+        }
+
         private static double ReadMemoryPercent(ref ulong totalMemory, ref ulong availableMemory)
         {
             NativeMethods.MemoryStatusEx status = new NativeMethods.MemoryStatusEx();
@@ -3100,17 +3847,17 @@ namespace NetSpeedBall
         }
 
         /// <summary>
-        /// 读出每块物理磁盘的「活动时间」，口径就是任务管理器那一列：
+        /// 读出每块物理磁盘的「活动时间」和读写速度，口径就是任务管理器那一列：
         /// 活动时间 = 100 − 空闲时间，不是磁盘用了多少空间。
         ///
-        /// 磁盘列表每秒重扫一次，所以插上 U 盘（或者拔掉）这里会当场多一行、少一行，
+        /// 磁盘列表每 5 秒重扫一次，所以插上 U 盘（或者拔掉）这里会当场多一行、少一行，
         /// 不用重启程序，也不需要知道盘符 —— 计数器实例名里自带盘符。
         /// </summary>
         private DiskActivityRow[] ReadDisks()
         {
-            if (--rescanCountdown <= 0)
+            if (--diskRescanCountdown <= 0)
             {
-                rescanCountdown = DiskRescanInterval;
+                diskRescanCountdown = DiskRescanInterval;
                 RescanDisks();
             }
 
@@ -3125,6 +3872,8 @@ namespace NetSpeedBall
                 }
 
                 double percent = 0;
+                double read = 0;
+                double write = 0;
                 try
                 {
                     float idle = counter.Idle.NextValue();
@@ -3136,17 +3885,383 @@ namespace NetSpeedBall
                     }
 
                     counter.Primed = true;
+
+                    if (counter.Read != null)
+                    {
+                        read = Math.Max(0.0, counter.Read.NextValue());
+                    }
+
+                    if (counter.Write != null)
+                    {
+                        write = Math.Max(0.0, counter.Write.NextValue());
+                    }
                 }
                 catch
                 {
                     // 磁盘正好被拔掉时计数器会失效；这一拍按 0 显示，下一轮重扫会清掉它。
                     percent = 0;
+                    read = 0;
+                    write = 0;
                 }
 
-                diskRows.Add(new DiskActivityRow(FriendlyDiskName(instance), percent));
+                long capacity = 0;
+                long free = 0;
+                ReadDiskCapacity(instance, ref capacity, ref free);
+                diskRows.Add(new DiskActivityRow(FriendlyDiskName(instance), percent, read, write,
+                    capacity, free));
             }
 
             return diskRows.ToArray();
+        }
+
+        /// <summary>
+        /// 从「1 D: E:」里挑一个盘符去问容量。
+        /// 同一块物理盘上的几个分区容量不同，这里只报第一个 —— 跟任务管理器一样，
+        /// 它列的也是整块盘，不细分到分区。
+        /// </summary>
+        private static void ReadDiskCapacity(string instance, ref long capacity, ref long free)
+        {
+            int space = instance.IndexOf(' ');
+            if (space <= 0 || space + 1 >= instance.Length)
+            {
+                return;
+            }
+
+            string volumes = instance.Substring(space + 1);
+            int letterIndex = -1;
+            for (int i = 0; i + 1 < volumes.Length; i++)
+            {
+                if (char.IsLetter(volumes[i]) && volumes[i + 1] == ':')
+                {
+                    letterIndex = i;
+                    break;
+                }
+            }
+
+            if (letterIndex < 0)
+            {
+                return;
+            }
+
+            try
+            {
+                string root = volumes.Substring(letterIndex, 2) + "\\";
+                DriveInfo drive = new DriveInfo(root);
+                if (!drive.IsReady)
+                {
+                    return;
+                }
+
+                capacity = drive.TotalSize;
+                free = drive.AvailableFreeSpace;
+            }
+            catch
+            {
+                // 光驱没盘、U 盘刚拔、BitLocker 没解锁，都会走到这里，静默跳过
+            }
+        }
+
+        /// <summary>
+        /// GPU：3D 引擎利用率 + 专用/共享显存占用。
+        ///
+        /// 任务管理器那一栏是「按引擎分开算」的：3D、Copy、Video Decode 各有各的百分比，
+        /// 这里只取 3D —— 平时关心的就是它，也是游戏帧数的直接指标。
+        /// 同一个引擎在多个进程里都有实例，加起来才是整机 3D 占用。
+        /// </summary>
+        private void ReadGpu(SystemResourceSnapshot snapshot)
+        {
+            if (--gpuSampleCountdown <= 0)
+            {
+                gpuSampleCountdown = GpuSampleInterval;
+                SampleGpu();
+            }
+
+            snapshot.GpuPercent = gpuPercentCached;
+            snapshot.GpuDedicatedUsed = gpuDedicatedCached;
+            snapshot.GpuSharedUsed = gpuSharedCached;
+        }
+
+        private void SampleGpu()
+        {
+            if (--gpuRescanCountdown <= 0)
+            {
+                gpuRescanCountdown = GpuRescanInterval;
+                RescanGpu();
+            }
+
+            double total = 0;
+            for (int i = 0; i < gpuInstances.Count; i++)
+            {
+                GpuCounter counter;
+                if (!gpuCounters.TryGetValue(gpuInstances[i], out counter))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    float value = counter.Utilization.NextValue();
+                    if (counter.Primed && value > 0 && !float.IsNaN(value) && !float.IsInfinity(value))
+                    {
+                        total += value;
+                    }
+
+                    counter.Primed = true;
+                }
+                catch
+                {
+                    // 进程退出后实例就废了，下一轮重扫会清掉
+                }
+            }
+
+            gpuPercentCached = Math.Max(0.0, Math.Min(100.0, total));
+
+            if (gpuDedicatedCounter != null)
+            {
+                try
+                {
+                    gpuDedicatedCached = (ulong)Math.Max(0.0, gpuDedicatedCounter.NextValue());
+                }
+                catch
+                {
+                }
+            }
+
+            if (gpuSharedCounter != null)
+            {
+                try
+                {
+                    gpuSharedCached = (ulong)Math.Max(0.0, gpuSharedCounter.NextValue());
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void RescanGpu()
+        {
+            List<string> found = new List<string>();
+            try
+            {
+                PerformanceCounterCategory category = new PerformanceCounterCategory(GpuEngineCategory);
+                string[] names = category.GetInstanceNames();
+                for (int i = 0; i < names.Length && found.Count < MaxGpuInstances; i++)
+                {
+                    string name = names[i];
+                    if (string.IsNullOrEmpty(name))
+                    {
+                        continue;
+                    }
+
+                    // 只认 3D 引擎，其余（Copy / VideoDecode / VideoProcessing）先不掺和
+                    if (name.IndexOf("engtype_3D", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    found.Add(name);
+                }
+            }
+            catch
+            {
+                // 老系统 / 虚拟机上根本没有 GPU Engine 分类，保持原样
+                return;
+            }
+
+            List<string> stale = new List<string>();
+            foreach (string key in gpuCounters.Keys)
+            {
+                if (!found.Contains(key))
+                {
+                    stale.Add(key);
+                }
+            }
+
+            for (int i = 0; i < stale.Count; i++)
+            {
+                DisposeCounter(gpuCounters[stale[i]].Utilization);
+                gpuCounters.Remove(stale[i]);
+            }
+
+            for (int i = 0; i < found.Count; i++)
+            {
+                if (gpuCounters.ContainsKey(found[i]))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    PerformanceCounter counter = new PerformanceCounter(
+                        GpuEngineCategory, "Utilization Percentage", found[i], true);
+                    gpuCounters[found[i]] = new GpuCounter { Utilization = counter };
+                }
+                catch
+                {
+                }
+            }
+
+            gpuInstances.Clear();
+            for (int i = 0; i < found.Count; i++)
+            {
+                if (gpuCounters.ContainsKey(found[i]))
+                {
+                    gpuInstances.Add(found[i]);
+                }
+            }
+
+            RescanGpuMemory();
+        }
+
+        /// <summary>
+        /// 显存占用按「物理适配器」分组，实例名形如 luid_0x00000000_0x0000C4A8_phys_0。
+        /// 多显卡机器上取专用显存最大的那块 —— 那才是用户心里的「GPU」。
+        /// </summary>
+        private void RescanGpuMemory()
+        {
+            string best = null;
+            long bestTotal = -1;
+            string[] names = null;
+            try
+            {
+                names = new PerformanceCounterCategory(GpuMemoryCategory).GetInstanceNames();
+            }
+            catch
+            {
+                return;
+            }
+
+            for (int i = 0; i < names.Length; i++)
+            {
+                string name = names[i];
+                if (string.IsNullOrEmpty(name) || name.IndexOf("phys_", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using (PerformanceCounter probe = new PerformanceCounter(
+                        GpuMemoryCategory, "Dedicated Usage", name, true))
+                    {
+                        long value = (long)probe.NextValue();
+                        if (value > bestTotal)
+                        {
+                            bestTotal = value;
+                            best = name;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (best == null)
+            {
+                return;
+            }
+
+            // 实例没变就不重建，省掉一次分配
+            if (string.Equals(best, gpuMemoryInstance, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            DisposeCounter(gpuDedicatedCounter);
+            DisposeCounter(gpuSharedCounter);
+            gpuDedicatedCounter = null;
+            gpuSharedCounter = null;
+            gpuMemoryInstance = best;
+
+            try
+            {
+                gpuDedicatedCounter = new PerformanceCounter(
+                    GpuMemoryCategory, "Dedicated Usage", best, true);
+                gpuSharedCounter = new PerformanceCounter(
+                    GpuMemoryCategory, "Shared Usage", best, true);
+            }
+            catch
+            {
+                DisposeCounter(gpuDedicatedCounter);
+                DisposeCounter(gpuSharedCounter);
+                gpuDedicatedCounter = null;
+                gpuSharedCounter = null;
+            }
+        }
+
+        /// <summary>
+        /// 活动网卡列表。虚拟网卡（VMware、Hyper-V、VPN）平时也在，但链路速度是 0，
+        /// 直接筛掉 —— 不然真网卡会被一堆「0 bps」淹掉。
+        /// </summary>
+        private NetworkLinkRow[] ReadLinks()
+        {
+            if (--linkRescanCountdown > 0 && linkRows.Length > 0)
+            {
+                return linkRows;
+            }
+
+            linkRescanCountdown = LinkRescanInterval;
+            List<NetworkLinkRow> rows = new List<NetworkLinkRow>();
+            try
+            {
+                NetworkInterface[] interfaces = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < interfaces.Length; i++)
+                {
+                    NetworkInterface item = interfaces[i];
+                    if (item.OperationalStatus != OperationalStatus.Up)
+                    {
+                        continue;
+                    }
+
+                    if (item.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                        item.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+                    {
+                        continue;
+                    }
+
+                    long speed = 0;
+                    try
+                    {
+                        speed = item.Speed;
+                    }
+                    catch
+                    {
+                        speed = 0;
+                    }
+
+                    if (speed <= 0)
+                    {
+                        continue;
+                    }
+
+                    rows.Add(new NetworkLinkRow(item.Name, FormatLink(speed)));
+                }
+            }
+            catch
+            {
+                return linkRows;
+            }
+
+            linkRows = rows.ToArray();
+            return linkRows;
+        }
+
+        private static string FormatLink(long bitsPerSecond)
+        {
+            if (bitsPerSecond <= 0)
+            {
+                return "--";
+            }
+
+            double mbps = bitsPerSecond / 1000000.0;
+            if (mbps >= 1000)
+            {
+                return (mbps / 1000.0).ToString("0.#") + " Gbps";
+            }
+
+            return mbps.ToString("0") + " Mbps";
         }
 
         /// <summary>重扫物理磁盘列表：新增的建计数器，消失的释放掉。</summary>
@@ -3190,14 +4305,9 @@ namespace NetSpeedBall
 
             for (int i = 0; i < stale.Count; i++)
             {
-                try
-                {
-                    diskCounters[stale[i]].Idle.Dispose();
-                }
-                catch
-                {
-                }
-
+                DisposeCounter(diskCounters[stale[i]].Idle);
+                DisposeCounter(diskCounters[stale[i]].Read);
+                DisposeCounter(diskCounters[stale[i]].Write);
                 diskCounters.Remove(stale[i]);
             }
 
@@ -3208,16 +4318,35 @@ namespace NetSpeedBall
                     continue;
                 }
 
+                DiskCounter counter = new DiskCounter();
                 try
                 {
-                    PerformanceCounter counter = new PerformanceCounter(
+                    counter.Idle = new PerformanceCounter(
                         DiskCategory, "% Idle Time", found[i], true);
-                    diskCounters[found[i]] = new DiskCounter { Idle = counter };
                 }
                 catch
                 {
                     // 这块盘的活动时间读不到就跳过它，别把整个面板拖垮
+                    continue;
                 }
+
+                try
+                {
+                    counter.Read = new PerformanceCounter(
+                        DiskCategory, "Disk Read Bytes/sec", found[i], true);
+                    counter.Write = new PerformanceCounter(
+                        DiskCategory, "Disk Write Bytes/sec", found[i], true);
+                }
+                catch
+                {
+                    // 读写速度拿不到就算了，活动率还在
+                    DisposeCounter(counter.Read);
+                    DisposeCounter(counter.Write);
+                    counter.Read = null;
+                    counter.Write = null;
+                }
+
+                diskCounters[found[i]] = counter;
             }
 
             diskInstances.Clear();
@@ -3268,6 +4397,633 @@ namespace NetSpeedBall
             return volumes.Length > 0
                 ? "\u78c1\u76d8 " + number + "\uff08" + volumes + "\uff09"
                 : "\u78c1\u76d8 " + number;
+        }
+    }
+
+    /// <summary>
+    /// 开机之后就不会变的那些硬件信息：CPU 型号/核数/缓存、内存条频率和插槽、GPU 名字和驱动。
+    ///
+    /// 这些东西要么要读注册表、要么要解析固件表，全都比「取个百分比」贵得多，
+    /// 所以只读一次，读完缓存住。第一次读放在后台线程，界面先显示「--」，
+    /// 读好了自己重绘一次，用户完全感觉不到卡顿。
+    /// </summary>
+    internal static class SystemInfoProvider
+    {
+        private const string ProcessorKey = @"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+        private const string DisplayClassKey =
+            @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+        private static readonly object Sync = new object();
+        private static readonly ManualResetEventSlim Ready = new ManualResetEventSlim(false);
+        private static bool started;
+
+        private static string cpuName = "--";
+        private static double cpuBaseMhz;
+        private static int cpuCores;
+        private static int cpuPackages;
+        private static int cpuLogical;
+        private static long l1Bytes;
+        private static long l2Bytes;
+        private static long l3Bytes;
+        private static bool virtualizationEnabled;
+        private static int memorySpeedMhz;
+        private static int memorySlotsUsed;
+        private static int memorySlotsTotal = 1;
+        private static int memoryModuleMb;
+        private static string memoryType = "--";
+        private static string gpuName = "--";
+        private static string gpuDriverVersion = "--";
+        private static string gpuDriverDate = "--";
+        private static ulong gpuDedicatedBytes;
+
+        public static string CpuName { get { return cpuName; } }
+        public static double CpuBaseMhz { get { return cpuBaseMhz; } }
+        public static int CpuCores { get { return cpuCores; } }
+        public static int CpuPackages { get { return cpuPackages; } }
+        public static int CpuLogical { get { return cpuLogical; } }
+        public static long L1Bytes { get { return l1Bytes; } }
+        public static long L2Bytes { get { return l2Bytes; } }
+        public static long L3Bytes { get { return l3Bytes; } }
+        public static bool VirtualizationEnabled { get { return virtualizationEnabled; } }
+        public static int MemorySpeedMhz { get { return memorySpeedMhz; } }
+        public static int MemorySlotsUsed { get { return memorySlotsUsed; } }
+        public static int MemorySlotsTotal { get { return memorySlotsTotal; } }
+        public static int MemoryModuleMb { get { return memoryModuleMb; } }
+        public static string MemoryType { get { return memoryType; } }
+        public static string GpuName { get { return gpuName; } }
+        public static string GpuDriverVersion { get { return gpuDriverVersion; } }
+        public static string GpuDriverDate { get { return gpuDriverDate; } }
+        public static ulong GpuDedicatedBytes { get { return gpuDedicatedBytes; } }
+
+        /// <summary>
+        /// 触发一次后台加载。传进来的回调在工作线程里跑，调用方负责切回 UI 线程。
+        /// 重复调用只生效第一次。
+        /// </summary>
+        public static void EnsureLoading(Action onLoaded)
+        {
+            lock (Sync)
+            {
+                if (started)
+                {
+                    return;
+                }
+
+                started = true;
+            }
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Load();
+                }
+                catch
+                {
+                    // 任何一项读不到都只是显示「--」，绝不能让面板挂掉
+                }
+                finally
+                {
+                    Ready.Set();
+                }
+
+                if (onLoaded != null)
+                {
+                    try
+                    {
+                        onLoaded();
+                    }
+                    catch
+                    {
+                    }
+                }
+            });
+        }
+
+        /// <summary>截图自检用：等静态信息读完，最多等 timeout 毫秒。</summary>
+        public static void WaitForStaticInfo(int timeout)
+        {
+            EnsureLoading(null);
+            try
+            {
+                Ready.Wait(timeout);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void Load()
+        {
+            ReadCpuFromRegistry();
+            ReadCpuBaseFrequency();
+            ReadCpuTopology();
+            ReadMemoryModules();
+            ReadGpuFromRegistry();
+            virtualizationEnabled = SafeIsVirtualizationEnabled();
+        }
+
+        /// <summary>
+        /// 基准频率以 WMI 的 Win32_Processor.MaxClockSpeed 为准 —— 任务管理器显示的
+        /// 「基准速度」就是它。注册表的 ~MHz 和性能计数器给的都可能是别的数
+        /// （实测有些机器会报成睿频后的值），所以只拿来兜底。
+        /// </summary>
+        private static void ReadCpuBaseFrequency()
+        {
+            try
+            {
+                using (ManagementObjectSearcher searcher =
+                    new ManagementObjectSearcher("SELECT MaxClockSpeed FROM Win32_Processor"))
+                {
+                    using (ManagementObjectCollection results = searcher.Get())
+                    {
+                        foreach (ManagementObject item in results)
+                        {
+                            try
+                            {
+                                object value = item["MaxClockSpeed"];
+                                if (value != null)
+                                {
+                                    double mhz = Convert.ToDouble(value);
+                                    if (mhz > 0)
+                                    {
+                                        cpuBaseMhz = mhz;
+                                        return;
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                item.Dispose();
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // WMI 服务被关掉、权限不足都会走到这里，保留注册表那个近似值
+            }
+        }
+
+        private static void ReadCpuFromRegistry()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(ProcessorKey))
+                {
+                    if (key == null)
+                    {
+                        return;
+                    }
+
+                    object name = key.GetValue("ProcessorNameString");
+                    if (name != null)
+                    {
+                        cpuName = name.ToString().Trim();
+                    }
+
+                    object mhz = key.GetValue("~MHz");
+                    if (mhz != null)
+                    {
+                        double value = Convert.ToDouble(mhz);
+                        if (value > 0)
+                        {
+                            cpuBaseMhz = value;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            if (cpuBaseMhz <= 0)
+            {
+                cpuBaseMhz = 0;
+            }
+
+            cpuLogical = Environment.ProcessorCount;
+        }
+
+        /// <summary>
+        /// 数物理核、量三级缓存。
+        ///
+        /// 系统给的是一个可变长的「条目数组」，每条前面 4 字节是关系类型、再 4 字节是本条多长，
+        /// 所以只能按字节走，不能声明成固定结构体 —— 那是 x86 时代的老 API 才有的待遇。
+        /// 缓存要按「层级 + 大小 + 掩码 + 类型」去重：同一个缓存会被多个逻辑处理器各报一遍，
+        /// 直接累加会把 24MB 的 L3 算成 384MB。
+        /// </summary>
+        private static void ReadCpuTopology()
+        {
+            try
+            {
+                byte[] buffer = ReadProcessorTopology(0);
+                if (buffer != null)
+                {
+                    int offset = 0;
+                    int cores = 0;
+                    while (offset + 8 <= buffer.Length)
+                    {
+                        int relationship = BitConverter.ToInt32(buffer, offset);
+                        int entrySize = BitConverter.ToInt32(buffer, offset + 4);
+                        if (entrySize <= 0 || offset + entrySize > buffer.Length)
+                        {
+                            break;
+                        }
+
+                        if (relationship == 0)
+                        {
+                            cores++;
+                        }
+
+                        offset += entrySize;
+                    }
+
+                    if (cores > 0)
+                    {
+                        cpuCores = cores;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            // 一个 RelationProcessorPackage 条目 = 一个物理 CPU 插座（双路服务器就是 2）
+            try
+            {
+                byte[] buffer = ReadProcessorTopology(3);
+                if (buffer != null)
+                {
+                    int offset = 0;
+                    int packages = 0;
+                    while (offset + 8 <= buffer.Length)
+                    {
+                        int entrySize = BitConverter.ToInt32(buffer, offset + 4);
+                        if (entrySize <= 0 || offset + entrySize > buffer.Length)
+                        {
+                            break;
+                        }
+
+                        packages++;
+                        offset += entrySize;
+                    }
+
+                    if (packages > 0)
+                    {
+                        cpuPackages = packages;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                byte[] buffer = ReadProcessorTopology(2);
+                if (buffer == null)
+                {
+                    return;
+                }
+
+                Dictionary<string, int> seen = new Dictionary<string, int>();
+                long l1 = 0;
+                long l2 = 0;
+                long l3 = 0;
+                int offset = 0;
+                while (offset + 8 <= buffer.Length)
+                {
+                    int relationship = BitConverter.ToInt32(buffer, offset);
+                    int entrySize = BitConverter.ToInt32(buffer, offset + 4);
+                    if (entrySize <= 0 || offset + entrySize > buffer.Length)
+                    {
+                        break;
+                    }
+
+                    // CACHE_RELATIONSHIP：Level 在 +8，CacheSize 在 +12，Type 在 +16，
+                    // 后面 20 字节保留，GroupMask 在 +40（8 字节掩码 + 2 字节组号）
+                    if (relationship == 2 && entrySize >= 48)
+                    {
+                        int level = buffer[offset + 8];
+                        int cacheSize = BitConverter.ToInt32(buffer, offset + 12);
+                        int type = BitConverter.ToInt32(buffer, offset + 16);
+                        long mask = BitConverter.ToInt64(buffer, offset + 40);
+                        string key = level + ":" + cacheSize + ":" + type + ":" + mask;
+                        if (cacheSize > 0 && !seen.ContainsKey(key))
+                        {
+                            seen[key] = cacheSize;
+                            if (level == 1)
+                            {
+                                l1 += cacheSize;
+                            }
+                            else if (level == 2)
+                            {
+                                l2 += cacheSize;
+                            }
+                            else if (level == 3)
+                            {
+                                l3 += cacheSize;
+                            }
+                        }
+                    }
+
+                    offset += entrySize;
+                }
+
+                l1Bytes = l1;
+                l2Bytes = l2;
+                l3Bytes = l3;
+            }
+            catch
+            {
+            }
+        }
+
+        private static byte[] ReadProcessorTopology(int relationshipType)
+        {
+            uint needed = 0;
+            try
+            {
+                NativeMethods.GetLogicalProcessorInformationEx(relationshipType, null, ref needed);
+                if (needed == 0)
+                {
+                    return null;
+                }
+
+                byte[] buffer = new byte[needed];
+                if (!NativeMethods.GetLogicalProcessorInformationEx(relationshipType, buffer, ref needed))
+                {
+                    return null;
+                }
+
+                return buffer;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 内存条的频率和插槽数：只能从固件里的 SMBIOS 表读。
+        /// 结构是「定长头部 + 双零结尾的字符串区」，要一条一条往后走。
+        /// </summary>
+        private static void ReadMemoryModules()
+        {
+            try
+            {
+                uint size = NativeMethods.GetSystemFirmwareTable(NativeMethods.RsMbProvider, 0, null, 0);
+                if (size < 16 || size > 4 * 1024 * 1024)
+                {
+                    return;
+                }
+
+                byte[] buffer = new byte[size];
+                uint written = NativeMethods.GetSystemFirmwareTable(NativeMethods.RsMbProvider, 0, buffer, size);
+                if (written < 16)
+                {
+                    return;
+                }
+
+                // 头 8 字节是版本信息，第 4 个字节往后的 DWORD 是表长度
+                int tableLength = BitConverter.ToInt32(buffer, 4);
+                int end = Math.Min(buffer.Length, 8 + tableLength);
+                int position = 8;
+                int slots = 0;
+                int used = 0;
+                int bestSpeed = 0;
+
+                while (position + 4 <= end)
+                {
+                    byte type = buffer[position];
+                    byte length = buffer[position + 1];
+                    if (length < 4)
+                    {
+                        break;
+                    }
+
+                    if (type == 17 && length >= 0x16)
+                    {
+                        // Size 为 0 表示这个槽是空的；0x7FFF 表示要用扩展字段
+                        int sizeField = BitConverter.ToUInt16(buffer, position + 0x0C);
+                        int speed = BitConverter.ToUInt16(buffer, position + 0x15);
+                        int configured = length >= 0x22
+                            ? BitConverter.ToUInt16(buffer, position + 0x20)
+                            : 0;
+                        int typeCode = length >= 0x13 ? buffer[position + 0x12] : 0;
+
+                        slots++;
+                        if (sizeField != 0)
+                        {
+                            used++;
+                            int actual = configured > 0 ? configured : speed;
+                            if (actual > bestSpeed)
+                            {
+                                bestSpeed = actual;
+                            }
+
+                            // 单条容量：0x7FFF 表示超出 16 位，要读扩展字段（单位 MB）
+                            int moduleMb = sizeField;
+                            if (sizeField == 0x7FFF && length >= 0x20)
+                            {
+                                moduleMb = (int)Math.Min(int.MaxValue,
+                                    BitConverter.ToUInt32(buffer, position + 0x1C));
+                            }
+
+                            if (moduleMb > 0)
+                            {
+                                memoryModuleMb = moduleMb;
+                            }
+
+                            string typeName = MemoryTypeName(typeCode);
+                            if (typeName != null)
+                            {
+                                memoryType = typeName;
+                            }
+                        }
+                    }
+
+                    if (type == 127)
+                    {
+                        break;
+                    }
+
+                    // 跳到下一条：先走完定长区，再跨过以「00 00」结尾的字符串区
+                    int next = position + length;
+                    if (next + 1 >= end)
+                    {
+                        break;
+                    }
+
+                    if (buffer[next] == 0 && buffer[next + 1] == 0)
+                    {
+                        position = next + 2;
+                    }
+                    else
+                    {
+                        while (next + 1 < end && !(buffer[next] == 0 && buffer[next + 1] == 0))
+                        {
+                            next++;
+                        }
+
+                        position = next + 2;
+                    }
+                }
+
+                if (slots > 0)
+                {
+                    memorySlotsTotal = slots;
+                    memorySlotsUsed = used;
+                }
+
+                memorySpeedMhz = bestSpeed;
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
+        /// 显卡名字、驱动版本、专用显存：注册表里显卡类下面挂着每个适配器一个子键（0000、0001…）。
+        /// 多显卡（核显 + 独显）时挑专用显存最大的 —— 跟用户嘴上说的「我的显卡」对得上。
+        /// </summary>
+        private static void ReadGpuFromRegistry()
+        {
+            try
+            {
+                using (RegistryKey root = Registry.LocalMachine.OpenSubKey(DisplayClassKey))
+                {
+                    if (root == null)
+                    {
+                        return;
+                    }
+
+                    string[] subKeys = root.GetSubKeyNames();
+                    ulong bestMemory = 0;
+                    string bestName = null;
+                    string bestVersion = null;
+                    string bestDate = null;
+
+                    for (int i = 0; i < subKeys.Length; i++)
+                    {
+                        string sub = subKeys[i];
+                        if (sub.Length != 4)
+                        {
+                            continue;
+                        }
+
+                        using (RegistryKey key = root.OpenSubKey(sub))
+                        {
+                            if (key == null)
+                            {
+                                continue;
+                            }
+
+                            object desc = key.GetValue("DriverDesc");
+                            if (desc == null)
+                            {
+                                continue;
+                            }
+
+                            ulong memory = 0;
+                            object size = key.GetValue("HardwareInformation.qwMemorySize");
+                            if (size != null)
+                            {
+                                try
+                                {
+                                    memory = Convert.ToUInt64(size);
+                                }
+                                catch
+                                {
+                                    memory = 0;
+                                }
+                            }
+
+                            if (bestName == null || memory > bestMemory)
+                            {
+                                bestMemory = memory;
+                                bestName = desc.ToString();
+
+                                object version = key.GetValue("DriverVersion");
+                                bestVersion = version != null ? FormatDriverVersion(version.ToString()) : "--";
+
+                                object date = key.GetValue("DriverDate");
+                                bestDate = date != null ? FormatDriverDate(date.ToString()) : "--";
+                            }
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(bestName))
+                    {
+                        gpuName = bestName;
+                        gpuDriverVersion = bestVersion;
+                        gpuDriverDate = bestDate;
+                        gpuDedicatedBytes = bestMemory;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>注册表里的驱动版本号长得像「32.0.15.6102」，原样显示就行。</summary>
+        private static string FormatDriverVersion(string raw)
+        {
+            return string.IsNullOrEmpty(raw) ? "--" : raw.Trim();
+        }
+
+        /// <summary>驱动日期是「6-11-2026」这种 月-日-年，转成「2026/6/11」。</summary>
+        private static string FormatDriverDate(string raw)
+        {
+            if (string.IsNullOrEmpty(raw))
+            {
+                return "--";
+            }
+
+            DateTime parsed;
+            if (DateTime.TryParse(raw, out parsed))
+            {
+                return parsed.Year + "/" + parsed.Month + "/" + parsed.Day;
+            }
+
+            return raw.Trim();
+        }
+
+        /// <summary>SMBIOS 里的内存类型代码翻成人话，表里没认出来的就返回 null 不显示。</summary>
+        private static string MemoryTypeName(int code)
+        {
+            switch (code)
+            {
+                case 0x12: return "DDR";
+                case 0x13: return "DDR2";
+                case 0x18: return "DDR3";
+                case 0x1A: return "DDR4";
+                case 0x1B: return "LPDDR";
+                case 0x1C: return "LPDDR2";
+                case 0x1D: return "LPDDR3";
+                case 0x1E: return "LPDDR4";
+                case 0x20: return "HBM";
+                case 0x21: return "HBM2";
+                case 0x22: return "DDR5";
+                case 0x23: return "LPDDR5";
+                case 0x24: return "HBM3";
+                case 0x0F: return "SDRAM";
+                default: return null;
+            }
+        }
+
+        private static bool SafeIsVirtualizationEnabled()        {
+            try
+            {
+                return NativeMethods.IsProcessorFeaturePresent(
+                    NativeMethods.PfVirtualizationFirmwareEnabled);
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 
@@ -7037,6 +8793,10 @@ namespace NetSpeedBall
     internal static class NativeMethods
     {
         public const int WS_EX_TOOLWINDOW = 0x00000080;
+        /// <summary>SMBIOS 原始表在固件里的提供者签名，倒过来写就是 'RSMB'。</summary>
+        public const uint RsMbProvider = 0x52534D42;
+        /// <summary>「固件是否启用了虚拟化」这一项，任务管理器里的「虚拟化：已启用」就是它。</summary>
+        public const int PfVirtualizationFirmwareEnabled = 21;
         public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_NOACTIVATE = 0x08000000;
 
@@ -7082,9 +8842,56 @@ namespace NetSpeedBall
             public ulong AvailableExtendedVirtual;
         }
 
+        /// <summary>
+        /// 任务管理器「性能」页下半截那一堆数字的来源：进程数、线程数、句柄数、
+        /// 已提交、缓存、分页/非分页缓冲池，一次调用全给齐（单位是「页」，要乘 PageSize）。
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PerformanceInformation
+        {
+            public uint Size;
+            public IntPtr CommitTotal;
+            public IntPtr CommitLimit;
+            public IntPtr CommitPeak;
+            public IntPtr PhysicalTotal;
+            public IntPtr PhysicalAvailable;
+            public IntPtr SystemCache;
+            public IntPtr KernelTotal;
+            public IntPtr KernelPaged;
+            public IntPtr KernelNonpaged;
+            public IntPtr PageSize;
+            public uint HandleCount;
+            public uint ProcessCount;
+            public uint ThreadCount;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetSystemTimes(out FileTime idleTime, out FileTime kernelTime,
             out FileTime userTime);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool GetPerformanceInfo(ref PerformanceInformation info, uint size);
+
+        /// <summary>开机到现在多少毫秒。任务管理器里那个「正常运行时间」。</summary>
+        [DllImport("kernel32.dll")]
+        public static extern ulong GetTickCount64();
+
+        /// <summary>
+        /// 一次性问出「有几个物理核」「L1/L2/L3 各多大」。
+        /// relationshipType：0 = 物理核，2 = 缓存。
+        /// 先传 null 问需要多大缓冲，再按真实大小申请一次 —— 这是这套 API 的标准用法。
+        /// </summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetLogicalProcessorInformationEx(int relationshipType,
+            byte[] buffer, ref uint returnedLength);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool IsProcessorFeaturePresent(int feature);
+
+        /// <summary>读固件里的 SMBIOS 原始表，内存条的频率和插槽数只能从这里拿。</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint GetSystemFirmwareTable(uint providerSignature, uint tableId,
+            byte[] buffer, uint bufferSize);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);

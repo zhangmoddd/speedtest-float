@@ -48,6 +48,7 @@ $compilerLog = Join-Path $dist "build-errors.txt"
     /reference:System.Core.dll `
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
+    /reference:System.Management.dll `
     $source 2> $compilerLog
 
 $ErrorActionPreference = "Stop"
