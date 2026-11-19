@@ -1105,9 +1105,13 @@ namespace NetSpeedBall
         {
             trafficStore = store;
             Text = WindowTitle;
-            Size = new Size(BallSize, BallSize);
-            MinimumSize = Size;
-            MaximumSize = Size;
+
+            // 这个窗体是一张「固定像素画出来的圆」，尺寸必须自己说了算。
+            // 用 WinForms 的字体自动缩放会出事：125% 缩放下它按宋体的字宽比例把宽度
+            // 从 122 拉到 170，高度却原地不动 —— 圆就成了 170×122 的扁蛋。
+            // 所以关掉自动缩放，DPI 放大自己按比例做：122 → 152，宽高永远相等。
+            AutoScaleMode = AutoScaleMode.None;
+            int ballPixels = ScaleForDpi(BallSize);
             StartPosition = FormStartPosition.Manual;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -1117,6 +1121,12 @@ namespace NetSpeedBall
             Opacity = 0.96;
             DoubleBuffered = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+
+            // 尺寸最后再定：窗体还带着边框的时候设尺寸，Windows 会把 125% 缩放下的
+            // 边框厚度算进去（宽度凭空多 18px），圆就又被拉扁了。
+            Size = new Size(ballPixels, ballPixels);
+            MinimumSize = Size;
+            MaximumSize = Size;
 
             labelFont = new Font("Segoe UI", 6.8f, FontStyle.Bold, GraphicsUnit.Point);
             speedFont = new Font("Segoe UI", 25.0f, FontStyle.Bold, GraphicsUnit.Point);
@@ -1138,6 +1148,25 @@ namespace NetSpeedBall
                 : new Point(area.Right - Width - 28, area.Bottom - Height - 42);
             UpdateWindowRegion();
             KeepInsideWorkingArea();
+        }
+
+        /// <summary>
+        /// 把 96 DPI 下设计的像素值换算成当前屏幕的实际像素。
+        /// 96 DPI → 原样；120 DPI（125%）→ ×1.25；144 DPI（150%）→ ×1.5。
+        /// </summary>
+        private static int ScaleForDpi(int pixels)
+        {
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                {
+                    return (int)Math.Round(pixels * g.DpiX / 96.0);
+                }
+            }
+            catch
+            {
+                return pixels;
+            }
         }
 
         protected override CreateParams CreateParams
@@ -1214,9 +1243,9 @@ namespace NetSpeedBall
 
         public static void SavePreview(string path)
         {
-            using (Bitmap bitmap = new Bitmap(BallSize, BallSize))
-            using (Graphics g = Graphics.FromImage(bitmap))
             using (SpeedBallForm preview = new SpeedBallForm())
+            using (Bitmap bitmap = new Bitmap(preview.Width, preview.Height))
+            using (Graphics g = Graphics.FromImage(bitmap))
             {
                 g.Clear(Color.Transparent);
                 preview.currentSample = new SpeedSample(850.0 * 1024.0, 25.6 * 1024.0, true);
@@ -2351,35 +2380,63 @@ namespace NetSpeedBall
             new FieldDef("net.month", "本月下载/上传"),
         };
 
-        private static readonly FieldDef[] CpuFields =
+        // 分成几小撮，右键菜单每层就只剩几行，不会撑出屏幕。
+        // 合并起来的顺序就是面板上的顺序，所以拆的时候保持原来的先后。
+        private static readonly FieldDef[] CpuFreqFields =
         {
             new FieldDef("cpu.speed", "速度"),
             new FieldDef("cpu.base", "基准速度"),
+        };
+
+        private static readonly FieldDef[] CpuRunFields =
+        {
             new FieldDef("cpu.uptime", "运行时长"),
             new FieldDef("cpu.process", "进程"),
             new FieldDef("cpu.thread", "线程"),
             new FieldDef("cpu.handle", "句柄"),
+        };
+
+        private static readonly FieldDef[] CpuCoreFields =
+        {
             new FieldDef("cpu.cores", "内核"),
             new FieldDef("cpu.logical", "逻辑处理器"),
             new FieldDef("cpu.socket", "插槽"),
+        };
+
+        private static readonly FieldDef[] CpuCacheFields =
+        {
             new FieldDef("cpu.l1", "L1 缓存"),
             new FieldDef("cpu.l2", "L2 缓存"),
             new FieldDef("cpu.l3", "L3 缓存"),
         };
 
-        private static readonly FieldDef[] MemoryFields =
+        private static readonly FieldDef[] CpuFields = MergeFields(
+            CpuFreqFields, CpuRunFields, CpuCoreFields, CpuCacheFields);
+
+        private static readonly FieldDef[] MemUseFields =
         {
             new FieldDef("mem.used", "已用/总量"),
             new FieldDef("mem.available", "可用"),
             new FieldDef("mem.cached", "已缓存"),
-            new FieldDef("mem.speed", "内存速度"),
+        };
+
+        private static readonly FieldDef[] MemSystemFields =
+        {
             new FieldDef("mem.commit", "已提交"),
             new FieldDef("mem.paged", "分页缓冲池"),
             new FieldDef("mem.nonpaged", "非分页缓冲池"),
+        };
+
+        private static readonly FieldDef[] MemSpecFields =
+        {
+            new FieldDef("mem.speed", "内存速度"),
             new FieldDef("mem.slot", "插槽占用"),
             new FieldDef("mem.type", "内存类型"),
             new FieldDef("mem.module", "单条容量"),
         };
+
+        private static readonly FieldDef[] MemoryFields = MergeFields(
+            MemUseFields, MemSystemFields, MemSpecFields);
 
         private static readonly FieldDef[] DiskFields =
         {
@@ -2410,9 +2467,7 @@ namespace NetSpeedBall
             new FieldDef("nic.card", "网络适配器整块"),
         };
 
-        // 型号是卡片标题下面那行小字，跟速度/显存这些是同一张卡上的东西，
-        // 菜单里当然也该在同一个子菜单里 —— 排最前面，跟面板上的位置一致。
-        private static readonly FieldDef[] CpuGroupFields = MergeFields(CpuModelField, CpuFields);
+        // 型号是卡片标题下面那行小字，跟显存这些是同一张卡上的东西，菜单里放在一组。
         private static readonly FieldDef[] GpuGroupFields = MergeFields(GpuModelField, GpuFields);
 
         private static FieldDef[] MergeFields(params FieldDef[][] sets)
@@ -3206,8 +3261,20 @@ namespace NetSpeedBall
         private static void BuildFieldMenuItems(ToolStripItemCollection items, Action onChanged)
         {
             AddMenuGroup(items, "网络", NetworkFields, onChanged);
-            AddMenuGroup(items, "CPU", CpuGroupFields, onChanged);
-            AddMenuGroup(items, "内存", MemoryFields, onChanged);
+
+            // CPU 十二项一列太长了，靠近屏幕底边只能往上顶，所以再分四小撮。
+            ToolStripMenuItem cpu = AddSubMenu(items, "CPU", onChanged);
+            AddFieldItems(cpu.DropDownItems, CpuModelField, onChanged);
+            AddMenuGroup(cpu.DropDownItems, "频率", CpuFreqFields, onChanged);
+            AddMenuGroup(cpu.DropDownItems, "运行", CpuRunFields, onChanged);
+            AddMenuGroup(cpu.DropDownItems, "核心", CpuCoreFields, onChanged);
+            AddMenuGroup(cpu.DropDownItems, "缓存", CpuCacheFields, onChanged);
+
+            ToolStripMenuItem memory = AddSubMenu(items, "内存", onChanged);
+            AddMenuGroup(memory.DropDownItems, "占用", MemUseFields, onChanged);
+            AddMenuGroup(memory.DropDownItems, "系统", MemSystemFields, onChanged);
+            AddMenuGroup(memory.DropDownItems, "规格", MemSpecFields, onChanged);
+
             AddMenuGroup(items, "磁盘", DiskFields, onChanged);
             AddMenuGroup(items, "GPU", GpuGroupFields, onChanged);
             AddMenuGroup(items, "网卡", NicFields, onChanged);
@@ -3227,21 +3294,33 @@ namespace NetSpeedBall
             items.Add(reset);
         }
 
+        /// <summary>建一个带箭头的子菜单，顺手把"点完不收起"和展开方向都挂上去。</summary>
+        private static ToolStripMenuItem AddSubMenu(ToolStripItemCollection items, string label,
+            Action onChanged)
+        {
+            ToolStripMenuItem parent = new ToolStripMenuItem(label);
+            KeepOpenOnItemClick(parent.DropDown);
+            // 每一层都要自己判断方向，否则深层子菜单又会拐回去压住上一层
+            parent.DropDown.Opened += delegate { AlignGroupDirections(parent.DropDown); };
+            items.Add(parent);
+            return parent;
+        }
+
         /// <summary>
-        /// 往菜单里塞一组勾选项。group 传 null 表示不分组的平铺项。
+        /// 往菜单里塞一组勾选项，外面包一个同名的子菜单。
         /// CheckOnClick 让系统自己处理打勾，点击回调里只管存配置。
         /// </summary>
         private static void AddMenuGroup(ToolStripItemCollection items, string group,
             FieldDef[] defs, Action onChanged)
         {
-            ToolStripMenuItem parent = null;
-            if (group != null)
-            {
-                parent = new ToolStripMenuItem(group);
-                KeepOpenOnItemClick(parent.DropDown);
-                items.Add(parent);
-            }
+            ToolStripMenuItem parent = AddSubMenu(items, group, onChanged);
+            AddFieldItems(parent.DropDownItems, defs, onChanged);
+        }
 
+        /// <summary>把一组勾选项平铺塞进某个菜单（不建子菜单）。</summary>
+        private static void AddFieldItems(ToolStripItemCollection items, FieldDef[] defs,
+            Action onChanged)
+        {
             for (int i = 0; i < defs.Length; i++)
             {
                 FieldDef def = defs[i];
@@ -3260,14 +3339,7 @@ namespace NetSpeedBall
                     }
                 };
 
-                if (parent != null)
-                {
-                    parent.DropDownItems.Add(item);
-                }
-                else
-                {
-                    items.Add(item);
-                }
+                items.Add(item);
             }
         }
 
