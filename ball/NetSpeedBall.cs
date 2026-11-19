@@ -2411,6 +2411,22 @@ namespace NetSpeedBall
             new FieldDef("nic.card", "网络适配器整块"),
         };
 
+        // 型号是卡片标题下面那行小字，跟速度/显存这些是同一张卡上的东西，
+        // 菜单里当然也该在同一个子菜单里 —— 排最前面，跟面板上的位置一致。
+        private static readonly FieldDef[] CpuGroupFields = MergeFields(CpuModelField, CpuFields);
+        private static readonly FieldDef[] GpuGroupFields = MergeFields(GpuModelField, GpuFields);
+
+        private static FieldDef[] MergeFields(params FieldDef[][] sets)
+        {
+            List<FieldDef> all = new List<FieldDef>();
+            for (int i = 0; i < sets.Length; i++)
+            {
+                all.AddRange(sets[i]);
+            }
+
+            return all.ToArray();
+        }
+
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
         private readonly double[] smoothBuffer = new double[MaxSamples];
@@ -3140,12 +3156,10 @@ namespace NetSpeedBall
         private static void BuildFieldMenuItems(ToolStripItemCollection items, Action onChanged)
         {
             AddMenuGroup(items, "网络", NetworkFields, onChanged);
-            AddMenuGroup(items, "CPU", CpuModelField, onChanged);
-            AddMenuGroup(items, null, CpuFields, onChanged);
+            AddMenuGroup(items, "CPU", CpuGroupFields, onChanged);
             AddMenuGroup(items, "内存", MemoryFields, onChanged);
             AddMenuGroup(items, "磁盘", DiskFields, onChanged);
-            AddMenuGroup(items, "GPU", GpuModelField, onChanged);
-            AddMenuGroup(items, null, GpuFields, onChanged);
+            AddMenuGroup(items, "GPU", GpuGroupFields, onChanged);
             AddMenuGroup(items, "网卡", NicFields, onChanged);
 
             items.Add(new ToolStripSeparator());
