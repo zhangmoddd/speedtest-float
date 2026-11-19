@@ -20,8 +20,7 @@ namespace NetSpeedBall
     {
         [STAThread]
         private static void Main(string[] args)
-        {
-            // 截图自检用的两个开关必须在单实例锁之前处理：球开着的时候也要能渲染，
+        {            // 截图自检用的两个开关必须在单实例锁之前处理：球开着的时候也要能渲染，
             // 否则第二次启动会被当成"重复启动"，直接把已有的球亮出来就退出了。
             if (args != null && args.Length >= 2)
             {
@@ -3119,6 +3118,7 @@ namespace NetSpeedBall
                 SyncHeight();
                 Invalidate();
             });
+            menu.Opened += delegate { AlignGroupDirections(menu); };
 
             fieldMenu = menu;
         }
@@ -3132,7 +3132,57 @@ namespace NetSpeedBall
             ToolStripMenuItem root = new ToolStripMenuItem("\u9762\u677f\u663e\u793a\u9879");
             KeepOpenOnItemClick(root.DropDown);
             BuildFieldMenuItems(root.DropDownItems, onChanged);
+            // 位置要等展开了才知道，所以挂在 Opened 上，而不是建菜单的时候。
+            root.DropDown.Opened += delegate { AlignGroupDirections(root.DropDown); };
             return root;
+        }
+
+        /// <summary>
+        /// 让「网络 / CPU / 内存 …」这一层的子菜单统一朝「离父菜单更远」的一侧展开。
+        ///
+        /// Windows 只按屏幕还剩多少地方决定子菜单往哪边开，不管会不会压住父菜单：
+        /// 托盘菜单贴着屏幕右边时，「面板显示项」会被挤到左边，它里面的分组却还照样往右开，
+        /// 结果正好盖在「显示悬浮球」「窗口置顶」那几行上面 —— 两层菜单叠在一起，
+        /// 既难看又挡着点不到。这里把整层方向钉死，一级一级往同一个方向长。
+        /// </summary>
+        private static void AlignGroupDirections(ToolStripDropDown root)
+        {
+            if (root == null || root.IsDisposed)
+            {
+                return;
+            }
+
+            bool openLeft;
+            ToolStripDropDown owner = root.OwnerItem == null
+                ? null
+                : root.OwnerItem.Owner as ToolStripDropDown;
+
+            if (owner != null)
+            {
+                // 自己就是别人的子菜单：父菜单在右边，我就往左长，绝不回头压住它
+                openLeft = root.Left < owner.Left;
+            }
+            else
+            {
+                // 顶层菜单：右边装不下一个子菜单就往左开
+                Rectangle screen = Screen.FromPoint(root.PointToScreen(Point.Empty)).WorkingArea;
+                openLeft = root.Right + root.Width > screen.Right;
+            }
+
+            ToolStripDropDownDirection direction = openLeft
+                ? ToolStripDropDownDirection.Left
+                : ToolStripDropDownDirection.Right;
+
+            foreach (ToolStripItem item in root.Items)
+            {
+                ToolStripMenuItem menuItem = item as ToolStripMenuItem;
+                if (menuItem == null || !menuItem.HasDropDownItems)
+                {
+                    continue;
+                }
+
+                menuItem.DropDownDirection = direction;
+            }
         }
 
         /// <summary>
