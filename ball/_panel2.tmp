@@ -1,0 +1,1599 @@
+    /// <summary>
+    /// 「系统详情」面板：网络 + CPU + 内存 + 磁盘 + GPU + 网卡。
+    ///
+    /// 口径一律对齐任务管理器「性能」页：CPU 利用率是全局占用，磁盘是「活动时间」
+    /// 而不是「用了多少空间」，内存「已缓存」= 待机页 + 已修改页。
+    ///
+    /// 哪一行显示、哪一行不显示由用户自己定：在面板上点右键，勾选即生效，
+    /// 配置存在注册表里，下次打开还是这套。关掉一行之后下面的行会自动补位，
+    /// 不会在卡片里留一个空洞。
+    /// </summary>
+    internal sealed class SpeedDetailsForm : Form
+    {
+        private const int MaxSamples = 60;
+        /// <summary>资源面板最多画几块磁盘。 Dock 里插一排 U 盘也不会把窗口撑出屏幕。</summary>
+        private const int MaxDiskRows = 8;
+        /// <summary>网卡那一栏最多列几块，虚拟网卡（VMware/Hyper-V）能有一打。</summary>
+        private const int MaxLinkRows = 3;
+        /// <summary>两张卡片之间的空隙。</summary>
+        private const int CardGap = 8;
+        /// <summary>左右边距。所有卡片共用同一条竖线，视觉上才整齐。</summary>
+        private const int SideMargin = 14;
+        /// <summary>一行字段的高度。8.2pt 的字体配 19px 行距，中英文都不挤。</summary>
+        private const int TextRow = 19;
+        /// <summary>一块磁盘占的高度（标题行 + 进度条 + 读写/容量行）。</summary>
+        private const int DiskRowFull = 48;
+        /// <summary>只显示活动率时，一块磁盘占的高度。</summary>
+        private const int DiskRowTight = 27;
+        /// <summary>一行网卡占的高度。</summary>
+        private const int LinkRowHeight = 17;
+
+        // ─────────────────────── 可开关的字段 ───────────────────────
+        //
+        // id 会写进注册表，一旦发布就别改；label 是给用户看的，随便调。
+        // 顺序就是卡片里从左到右、从上到下的顺序，关掉中间的项后面的自动往前顶。
+
+        private sealed class FieldDef
+        {
+            public readonly string Id;
+            public readonly string Label;
+
+            public FieldDef(string id, string label)
+            {
+                Id = id;
+                Label = label;
+            }
+        }
+
+        private static readonly FieldDef[] NetworkFields =
+        {
+            new FieldDef("net.graph", "60 秒速度曲线"),
+            new FieldDef("net.today", "今日下载/上传"),
+            new FieldDef("net.month", "本月下载/上传"),
+        };
+
+        private static readonly FieldDef[] CpuFields =
+        {
+            new FieldDef("cpu.speed", "速度"),
+            new FieldDef("cpu.base", "基准速度"),
+            new FieldDef("cpu.uptime", "运行时长"),
+            new FieldDef("cpu.process", "进程"),
+            new FieldDef("cpu.thread", "线程"),
+            new FieldDef("cpu.handle", "句柄"),
+            new FieldDef("cpu.cores", "内核"),
+            new FieldDef("cpu.logical", "逻辑处理器"),
+            new FieldDef("cpu.socket", "插槽"),
+            new FieldDef("cpu.l1", "L1 缓存"),
+            new FieldDef("cpu.l2", "L2 缓存"),
+            new FieldDef("cpu.l3", "L3 缓存"),
+        };
+
+        private static readonly FieldDef[] MemoryFields =
+        {
+            new FieldDef("mem.used", "已用/总量"),
+            new FieldDef("mem.available", "可用"),
+            new FieldDef("mem.cached", "已缓存"),
+            new FieldDef("mem.speed", "内存速度"),
+            new FieldDef("mem.commit", "已提交"),
+            new FieldDef("mem.paged", "分页缓冲池"),
+            new FieldDef("mem.nonpaged", "非分页缓冲池"),
+            new FieldDef("mem.slot", "插槽占用"),
+            new FieldDef("mem.type", "内存类型"),
+            new FieldDef("mem.module", "单条容量"),
+        };
+
+        private static readonly FieldDef[] DiskFields =
+        {
+            new FieldDef("disk.io", "读写速度"),
+            new FieldDef("disk.capacity", "容量"),
+        };
+
+        private static readonly FieldDef[] GpuFields =
+        {
+            new FieldDef("gpu.dedicated", "专用显存"),
+            new FieldDef("gpu.shared", "共享显存"),
+            new FieldDef("gpu.driver", "驱动版本"),
+            new FieldDef("gpu.date", "驱动日期"),
+        };
+
+        private static readonly FieldDef[] GpuModelField =
+        {
+            new FieldDef("gpu.model", "显卡型号"),
+        };
+
+        private static readonly FieldDef[] CpuModelField =
+        {
+            new FieldDef("cpu.model", "CPU 型号"),
+        };
+
+        private static readonly FieldDef[] NicFields =
+        {
+            new FieldDef("nic.card", "网络适配器整块"),
+        };
+
+        private readonly double[] downloadHistory = new double[MaxSamples];
+        private readonly double[] uploadHistory = new double[MaxSamples];
+        private readonly double[] smoothBuffer = new double[MaxSamples];
+        private int sampleCount;
+        /// <summary>这 60 秒里出现过的最高速率，画在曲线右上角当比例尺的说明。</summary>
+        private double historyPeak;
+
+        private readonly TrafficStore trafficStore;
+        private SpeedSample currentSample;
+        private readonly SystemResourceMonitor resourceMonitor = new SystemResourceMonitor();
+        private SystemResourceSnapshot resourceSnapshot;
+
+        // 面板上真正画出来的数字，每帧朝采样值逼近，避免"一秒跳一下"。
+        private double shownDownload;
+        private double shownUpload;
+        private double shownCpu;
+        private double shownMemory;
+        private double shownGpu;
+        private double[] shownDisks = new double[0];
+        private bool shownPrimed;
+
+        // 带死区的目标：采样在阈值内晃就不换目标，界面上的数字才不会一直蹦。
+        private readonly HeldValue heldDownload = new HeldValue(0.25, 2048.0);
+        private readonly HeldValue heldUpload = new HeldValue(0.25, 2048.0);
+        private readonly HeldValue heldCpu = new HeldValue(0.12, 1.0);
+        private readonly HeldValue heldMemory = new HeldValue(0.06, 0.5);
+        private readonly HeldValue heldGpu = new HeldValue(0.12, 1.0);
+        private readonly List<HeldValue> heldDisks = new List<HeldValue>();
+
+        private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
+        private readonly Font cardTitleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
+        private readonly Font strongFont = new Font("Segoe UI", 8.2f, FontStyle.Bold);
+        private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
+
+        private readonly Brush darkBrush = new SolidBrush(Color.FromArgb(30, 42, 60));
+        private readonly Brush mutedBrush = new SolidBrush(Color.FromArgb(94, 112, 134));
+        private readonly Brush faintBrush = new SolidBrush(Color.FromArgb(142, 158, 176));
+        private readonly Brush downBrush = new SolidBrush(Color.FromArgb(35, 119, 238));
+        private readonly Brush upBrush = new SolidBrush(Color.FromArgb(16, 178, 92));
+
+        private static readonly Color CpuColor = Color.FromArgb(242, 126, 42);
+        private static readonly Color MemoryColor = Color.FromArgb(35, 119, 238);
+        private static readonly Color DiskColor = Color.FromArgb(16, 178, 92);
+        private static readonly Color GpuColor = Color.FromArgb(138, 96, 230);
+        private static readonly Color LinkColor = Color.FromArgb(22, 160, 170);
+
+        /// <summary>各卡片的位置，每帧按当前可见字段和磁盘/网卡数量重算一次。</summary>
+        private Rectangle cpuCard;
+        private Rectangle memoryCard;
+        private Rectangle diskCard;
+        private Rectangle gpuCard;
+        private Rectangle linkCard;
+
+        /// <summary>网络区画到哪儿结束，下面的卡片从这里开始往下排。</summary>
+        private int networkBottom;
+        /// <summary>所有卡片画完之后的位置，也就是窗口应有的高度。</summary>
+        private int contentBottom;
+
+        /// <summary>右键菜单，第一次点右键时才建（建菜单要几十毫秒，别放在构造里）。</summary>
+        private ContextMenuStrip fieldMenu;
+
+        /// <summary>鼠标是否停在关闭按钮上。用来画悬停反馈。</summary>
+        private bool closeHover;
+
+        /// <summary>
+        /// 右上角关闭按钮的点击区域。
+        ///
+        /// 这个窗口是无边框的（FormBorderStyle.None），系统不给画关闭按钮，
+        /// 所以只能自己画一个并自己判断点击 —— 否则窗口一旦显示出来，
+        /// 用户除了再点一次悬浮球之外没有任何办法关掉它。
+        /// 尺寸 26×26 是按「手指/鼠标容易命中」定的，比 ✕ 图形本身大一圈。
+        /// </summary>
+        private Rectangle CloseButtonBounds
+        {
+            get { return new Rectangle(Width - 34, 8, 26, 26); }
+        }
+
+        public SpeedDetailsForm(TrafficStore store)
+        {
+            trafficStore = store;
+            Text = "System details";
+            // 静态信息（CPU 型号、内存条频率、GPU 名字）在后台读一次，读好了自动重绘。
+            SystemInfoProvider.EnsureLoading(delegate { Invalidate(); });
+            Size = new Size(430, 780);
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(248, 252, 255);
+            DoubleBuffered = true;
+            Padding = new Padding(12);
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW;
+                return cp;
+            }
+        }
+
+        public void ResetTodayTraffic()
+        {
+            // The store itself is reset by SpeedBallApplication; just repaint.
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 面板刚被打开时先取一次最新数据，别让用户先看到几秒前的旧数字。
+        /// 只补资源那几块，流量曲线和今日/本月统计一直是最新的。
+        /// </summary>
+        public void PrimeResources()
+        {
+            resourceSnapshot = resourceMonitor.Read();
+            heldCpu.Snap(resourceSnapshot.CpuPercent);
+            heldMemory.Snap(resourceSnapshot.MemoryPercent);
+            heldGpu.Snap(resourceSnapshot.GpuPercent);
+            shownCpu = heldCpu.Target;
+            shownMemory = heldMemory.Target;
+            shownGpu = heldGpu.Target;
+
+            while (heldDisks.Count < DiskRowCount())
+            {
+                heldDisks.Add(new HeldValue(0.2, 1.0));
+            }
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                heldDisks[i].Snap(disks[i].Percent);
+                shownDisks[i] = disks[i].Percent;
+            }
+
+            SyncHeight();
+            Invalidate();
+        }
+
+        public void AddSample(SpeedSample sample)
+        {
+            currentSample = sample;
+
+            // 面板没显示的时候没必要每秒去翻性能计数器 —— 那些东西要读注册表、
+            // 枚举磁盘和 GPU 实例，白白占 CPU。流量曲线照记，资源数据等打开时再补。
+            if (Visible || resourceSnapshot == null)
+            {
+                resourceSnapshot = resourceMonitor.Read();
+                SyncHeight();
+            }
+
+            heldDownload.Update(sample.DownloadBytesPerSecond);
+            heldUpload.Update(sample.UploadBytesPerSecond);
+            heldCpu.Update(resourceSnapshot.CpuPercent);
+            heldMemory.Update(resourceSnapshot.MemoryPercent);
+            heldGpu.Update(resourceSnapshot.GpuPercent);
+
+            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            while (heldDisks.Count < diskCount)
+            {
+                heldDisks.Add(new HeldValue(0.2, 1.0));
+            }
+
+            for (int i = 0; i < diskCount; i++)
+            {
+                heldDisks[i].Update(disks[i].Percent);
+            }
+
+            if (sampleCount < MaxSamples)
+            {
+                downloadHistory[sampleCount] = sample.DownloadBytesPerSecond;
+                uploadHistory[sampleCount] = sample.UploadBytesPerSecond;
+                sampleCount++;
+            }
+            else
+            {
+                Array.Copy(downloadHistory, 1, downloadHistory, 0, MaxSamples - 1);
+                Array.Copy(uploadHistory, 1, uploadHistory, 0, MaxSamples - 1);
+                downloadHistory[MaxSamples - 1] = sample.DownloadBytesPerSecond;
+                uploadHistory[MaxSamples - 1] = sample.UploadBytesPerSecond;
+            }
+
+            double peak = 0;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                double value = downloadHistory[i] > uploadHistory[i]
+                    ? downloadHistory[i]
+                    : uploadHistory[i];
+                if (value > peak)
+                {
+                    peak = value;
+                }
+            }
+
+            historyPeak = peak;
+
+            if (!shownPrimed)
+            {
+                // 第一拍直接落位，否则一开面板就是从 0 往上爬
+                SnapShownValues();
+                shownPrimed = true;
+            }
+
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 每帧调一次：把面板上的数字朝最新采样值挪一小步。
+        ///
+        /// 采样是一秒一拍，直接画就是「这一秒 0.1、下一秒 2.3」的硬跳；
+        /// 按帧插值之后，数字、百分比和进度条都是连续爬过去的，跟火箭动画一个节奏。
+        /// </summary>
+        public void Animate(double elapsed)
+        {
+            if (!Visible)
+            {
+                // 没显示就不做动画，直接落位，免得下次打开时从几分钟前的旧数字爬过来
+                SnapShownValues();
+                return;
+            }
+
+            bool moved = false;
+
+            double down = SmoothValue.Toward(shownDownload, heldDownload.Target, elapsed, 0.5, 256.0);
+            if (down != shownDownload)
+            {
+                shownDownload = down;
+                moved = true;
+            }
+
+            double up = SmoothValue.Toward(shownUpload, heldUpload.Target, elapsed, 0.5, 256.0);
+            if (up != shownUpload)
+            {
+                shownUpload = up;
+                moved = true;
+            }
+
+            double cpu = SmoothValue.Toward(shownCpu, heldCpu.Target, elapsed, 0.5, 0.1);
+            if (cpu != shownCpu)
+            {
+                shownCpu = cpu;
+                moved = true;
+            }
+
+            double memory = SmoothValue.Toward(shownMemory, heldMemory.Target,
+                elapsed, 0.5, 0.05);
+            if (memory != shownMemory)
+            {
+                shownMemory = memory;
+                moved = true;
+            }
+
+            double gpu = SmoothValue.Toward(shownGpu, heldGpu.Target, elapsed, 0.5, 0.1);
+            if (gpu != shownGpu)
+            {
+                shownGpu = gpu;
+                moved = true;
+            }
+
+            DiskActivityRow[] disks = resourceSnapshot == null ? null : resourceSnapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+                for (int i = 0; i < count; i++)
+                {
+                    shownDisks[i] = disks[i].Percent;
+                }
+
+                moved = true;
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    double target = i < heldDisks.Count ? heldDisks[i].Target : disks[i].Percent;
+                    double value = SmoothValue.Toward(shownDisks[i], target, elapsed, 0.5, 0.1);
+                    if (value != shownDisks[i])
+                    {
+                        shownDisks[i] = value;
+                        moved = true;
+                    }
+                }
+            }
+
+            if (moved)
+            {
+                Invalidate();
+            }
+        }
+
+        private void SnapShownValues()
+        {
+            heldDownload.Snap(currentSample.DownloadBytesPerSecond);
+            heldUpload.Snap(currentSample.UploadBytesPerSecond);
+
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            heldCpu.Snap(snapshot.CpuPercent);
+            heldMemory.Snap(snapshot.MemoryPercent);
+            heldGpu.Snap(snapshot.GpuPercent);
+
+            shownDownload = heldDownload.Target;
+            shownUpload = heldUpload.Target;
+            shownCpu = heldCpu.Target;
+            shownMemory = heldMemory.Target;
+            shownGpu = heldGpu.Target;
+
+            DiskActivityRow[] disks = snapshot.Disks;
+            int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+            if (shownDisks.Length != count)
+            {
+                shownDisks = new double[count];
+            }
+
+            while (heldDisks.Count < count)
+            {
+                heldDisks.Add(new HeldValue(0.2, 1.0));
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                heldDisks[i].Snap(disks[i].Percent);
+                shownDisks[i] = heldDisks[i].Target;
+            }
+        }
+
+        /// <summary>
+        /// 磁盘数量一变就把窗口高度跟上：插个 U 盘当场多一行，拔掉当场少一行。
+        /// 变高之后底边可能已经出屏了，所以顺手按回工作区内。
+        /// </summary>
+        private void SyncHeight()
+        {
+            LayoutCards();
+            int height = contentBottom;
+            if (height == Height)
+            {
+                return;
+            }
+
+            Height = height;
+
+            try
+            {
+                Rectangle area = Screen.FromControl(this).WorkingArea;
+                if (Bottom > area.Bottom)
+                {
+                    Top = Math.Max(area.Top, area.Bottom - Height);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // ─────────────────────── 布局 ───────────────────────
+
+        /// <summary>按当前配置挑出要显示的字段，顺序保持原样。</summary>
+        private static List<FieldDef> Visible(FieldDef[] defs)
+        {
+            List<FieldDef> list = new List<FieldDef>(defs.Length);
+            for (int i = 0; i < defs.Length; i++)
+            {
+                if (PanelFieldSettings.IsVisible(defs[i].Id))
+                {
+                    list.Add(defs[i]);
+                }
+            }
+
+            return list;
+        }
+
+        private static int Rows(int fieldCount, int columns)
+        {
+            if (fieldCount <= 0)
+            {
+                return 0;
+            }
+
+            return (fieldCount + columns - 1) / columns;
+        }
+
+        /// <summary>
+        /// 网络区的高度：曲线、今日、本月三块各自可以关掉，关掉下面的就往上顶。
+        /// </summary>
+        private int MeasureNetwork()
+        {
+            int y = 72;
+            if (PanelFieldSettings.IsVisible("net.graph"))
+            {
+                y = 91 + 74 + 8;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.today"))
+            {
+                y += 40;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.month"))
+            {
+                y += 40;
+            }
+
+            return y + 6;
+        }
+
+        /// <summary>一张卡片的高度：标题区 + 字段行数 × 行高 + 底部留白。</summary>
+        private static int CardHeight(int headerHeight, int fieldRows)
+        {
+            return headerHeight + fieldRows * TextRow + 8;
+        }
+
+        /// <summary>
+        /// 从上往下依次摆卡片，顺便算出总高度。
+        ///
+        /// 绘制和算窗口高度都走这一个方法 —— 分成两份的话，改个间距就会出现
+        /// 「窗口比内容矮 20px，最底下那行被切掉」这种只有用户能看见的错。
+        /// </summary>
+        private void LayoutCards()
+        {
+            int width = Math.Max(240, Width - SideMargin * 2);
+            networkBottom = MeasureNetwork();
+            int y = networkBottom;
+
+            bool cpuModel = PanelFieldSettings.IsVisible("cpu.model");
+            int cpuHeader = (cpuModel ? 58 : 40);
+            cpuCard = new Rectangle(SideMargin, y, width,
+                CardHeight(cpuHeader, Rows(Visible(CpuFields).Count, 3)));
+            y += cpuCard.Height + CardGap;
+
+            bool memUsed = PanelFieldSettings.IsVisible("mem.used");
+            int memHeader = (memUsed ? 58 : 40);
+            memoryCard = new Rectangle(SideMargin, y, width,
+                CardHeight(memHeader, Rows(Visible(MemoryFields).Count, 3)));
+            y += memoryCard.Height + CardGap;
+
+            int disks = DiskRowCount();
+            if (disks > 0)
+            {
+                diskCard = new Rectangle(SideMargin, y, width, 24 + disks * DiskRowHeight());
+                y += diskCard.Height + CardGap;
+            }
+            else
+            {
+                diskCard = Rectangle.Empty;
+            }
+
+            bool gpuModel = PanelFieldSettings.IsVisible("gpu.model");
+            int gpuHeader = (gpuModel ? 58 : 40);
+            gpuCard = new Rectangle(SideMargin, y, width,
+                CardHeight(gpuHeader, Rows(Visible(GpuFields).Count, 2)));
+            y += gpuCard.Height + CardGap;
+
+            if (PanelFieldSettings.IsVisible("nic.card"))
+            {
+                int links = LinkRowCount();
+                linkCard = new Rectangle(SideMargin, y, width, 28 + links * LinkRowHeight);
+                y += linkCard.Height;
+            }
+            else
+            {
+                linkCard = Rectangle.Empty;
+            }
+
+            contentBottom = y + 12;
+        }
+
+        /// <summary>一块磁盘占多高：读写和容量都关掉时只留标题和进度条。</summary>
+        private static int DiskRowHeight()
+        {
+            bool details = PanelFieldSettings.IsVisible("disk.io") ||
+                           PanelFieldSettings.IsVisible("disk.capacity");
+            return details ? DiskRowFull : DiskRowTight;
+        }
+
+        private int DiskRowCount()
+        {
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            DiskActivityRow[] disks = snapshot.Disks;
+            return disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
+        }
+
+        private int LinkRowCount()
+        {
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            NetworkLinkRow[] links = snapshot.Links;
+            int count = links == null ? 0 : Math.Min(links.Length, MaxLinkRows);
+            return count > 0 ? count : 1;
+        }
+
+        /// <summary>
+        /// 把详情面板原样渲染成 PNG，只给 <c>--render-details 路径</c> 自检用。
+        /// 假数据按日常待机那种"20~50 KB/s 抖 + 偶尔一下 190 KB/s"来造，
+        /// 这样能看出真实场景下曲线是什么样，而不是一排理想化的正弦波。
+        /// </summary>
+        public static void SavePreview(string path)
+        {
+            TrafficStore store = new TrafficStore();
+            SystemInfoProvider.WaitForStaticInfo(3000);
+            using (SpeedDetailsForm form = new SpeedDetailsForm(store))
+            {
+                // 逼出窗口句柄，否则 DrawToBitmap 画出来是一张白图。
+                if (form.Handle == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                // 磁盘活动率是"两次读数之间的差值"，必须真的隔一秒取两次，
+                // 连着循环喂 60 条假数据只会算出垃圾值（间隔≈0）。
+                // GPU 也一个道理，顺手把它的采样倒计时拨到 1，两次都真采一遍。
+                form.resourceSnapshot = form.resourceMonitor.Read();
+                System.Threading.Thread.Sleep(1100);
+                form.resourceMonitor.ForceGpuSample();
+                form.resourceSnapshot = form.resourceMonitor.Read();
+
+                // 曲线历史直接写数组，不走 AddSample —— 否则每写一个点都会再读一次计数器。
+                double peak = 0;
+                for (int i = 0; i < MaxSamples; i++)
+                {
+                    double down = (28 + 16 * Math.Sin(i * 1.13) + 10 * Math.Sin(i * 2.71)) * 1024.0;
+                    if (i == 19 || i == 20)
+                    {
+                        down = 190 * 1024.0;
+                    }
+
+                    double up = (16 + 9 * Math.Sin(i * 1.7 + 1.2)) * 1024.0;
+
+                    form.downloadHistory[i] = down;
+                    form.uploadHistory[i] = up;
+                    peak = Math.Max(peak, Math.Max(down, up));
+                }
+
+                form.sampleCount = MaxSamples;
+                form.historyPeak = peak;
+                form.currentSample = new SpeedSample(form.downloadHistory[MaxSamples - 1],
+                    form.uploadHistory[MaxSamples - 1], true, 1.0, 0, 0);
+                form.SnapShownValues();
+                form.SyncHeight();
+
+                using (Bitmap bitmap = new Bitmap(form.Width, form.Height))
+                {
+                    form.DrawToBitmap(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+                    bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+        }
+
+        // ─────────────────────── 右键菜单 ───────────────────────
+
+        private void EnsureFieldMenu()
+        {
+            if (fieldMenu != null)
+            {
+                return;
+            }
+
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.ShowImageMargin = false;
+            menu.ShowCheckMargin = true;
+
+            AddMenuGroup(menu, "网络", NetworkFields);
+            AddMenuGroup(menu, "CPU", CpuModelField);
+            AddMenuGroup(menu, null, CpuFields);
+            AddMenuGroup(menu, "内存", MemoryFields);
+            AddMenuGroup(menu, "磁盘", DiskFields);
+            AddMenuGroup(menu, "GPU", GpuModelField);
+            AddMenuGroup(menu, null, GpuFields);
+            AddMenuGroup(menu, "网卡", NicFields);
+
+            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem reset = new ToolStripMenuItem("全部显示");
+            reset.Click += delegate
+            {
+                PanelFieldSettings.ShowAll();
+                PanelFieldSettings.SyncMenuChecks(menu);
+                SyncHeight();
+                Invalidate();
+            };
+            menu.Items.Add(reset);
+
+            fieldMenu = menu;
+        }
+
+        /// <summary>
+        /// 往菜单里塞一组勾选项。group 传 null 表示不分组的平铺项。
+        /// CheckOnClick 让系统自己处理打勾，点击回调里只管存配置。
+        /// </summary>
+        private void AddMenuGroup(ContextMenuStrip menu, string group, FieldDef[] defs)
+        {
+            ToolStripMenuItem parent = null;
+            if (group != null)
+            {
+                parent = new ToolStripMenuItem(group);
+                menu.Items.Add(parent);
+            }
+
+            for (int i = 0; i < defs.Length; i++)
+            {
+                FieldDef def = defs[i];
+                ToolStripMenuItem item = new ToolStripMenuItem(def.Label);
+                item.CheckOnClick = true;
+                item.Checked = PanelFieldSettings.IsVisible(def.Id);
+                item.Tag = def.Id;
+                item.CheckedChanged += delegate
+                {
+                    ToolStripMenuItem source = (ToolStripMenuItem)item;
+                    PanelFieldSettings.SetVisible((string)source.Tag, source.Checked);
+                    SyncHeight();
+                    Invalidate();
+                };
+
+                if (parent != null)
+                {
+                    parent.DropDownItems.Add(item);
+                }
+                else
+                {
+                    menu.Items.Add(item);
+                }
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+
+            if (e.Button == MouseButtons.Right)
+            {
+                EnsureFieldMenu();
+                fieldMenu.Show(this, e.Location);
+                return;
+            }
+
+            if (e.Button == MouseButtons.Left && CloseButtonBounds.Contains(e.Location))
+            {
+                closeHover = false;
+                Cursor = Cursors.Default;
+                Hide();
+            }
+        }
+
+        /// <summary>
+        /// 画右上角的关闭按钮。
+        ///
+        /// 用两条线段而不是字体里的 "✕" 字符：字号一变，字符的位置和粗细就跟着变，
+        /// 两条线可以精确控制，也不会因为系统字体缺字变成方块。
+        /// </summary>
+        private void DrawCloseButton(Graphics g)
+        {
+            Rectangle box = CloseButtonBounds;
+            if (closeHover)
+            {
+                using (Brush hover = new SolidBrush(Color.FromArgb(28, 60, 110, 180)))
+                {
+                    g.FillEllipse(hover, box);
+                }
+            }
+
+            float cx = box.X + box.Width / 2f;
+            float cy = box.Y + box.Height / 2f;
+            const float arm = 4.2f;
+
+            Color stroke = closeHover
+                ? Color.FromArgb(36, 54, 78)
+                : Color.FromArgb(132, 148, 168);
+            using (Pen pen = new Pen(stroke, 1.6f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawLine(pen, cx - arm, cy - arm, cx + arm, cy + arm);
+                g.DrawLine(pen, cx + arm, cy - arm, cx - arm, cy + arm);
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool hover = CloseButtonBounds.Contains(e.Location);
+            if (hover != closeHover)
+            {
+                closeHover = hover;
+                Cursor = hover ? Cursors.Hand : Cursors.Default;
+                Invalidate(CloseButtonBounds);
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (closeHover)
+            {
+                closeHover = false;
+                Cursor = Cursors.Default;
+                Invalidate(CloseButtonBounds);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+            LayoutCards();
+
+            Rectangle body = new Rectangle(1, 1, Width - 3, Height - 3);
+            using (GraphicsPath path = CreateRoundedRectangle(body, 18))
+            using (LinearGradientBrush background = new LinearGradientBrush(body, Color.White, Color.FromArgb(235, 247, 255), LinearGradientMode.Vertical))
+            using (Pen border = new Pen(Color.FromArgb(120, 71, 164, 226), 1.2f))
+            {
+                g.FillPath(background, path);
+                g.DrawPath(border, path);
+            }
+
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+
+            DrawNetworkSection(g, snapshot);
+
+            DrawCpuCard(g, snapshot);
+            DrawMemoryCard(g, snapshot);
+            DrawDiskCard(g, snapshot);
+            DrawGpuCard(g, snapshot);
+            DrawLinkCard(g, snapshot);
+
+            DrawCloseButton(g);
+        }
+
+        // ─────────────────────── 网络区 ───────────────────────
+
+        /// <summary>
+        /// 网络区：上下行实时速度 + 可选的 60 秒曲线、今日/本月流量。
+        /// 这几块都关掉时，整个区域只剩两行实时速度，面板会缩成一条。
+        /// </summary>
+        private void DrawNetworkSection(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            g.DrawString("\u7cfb\u7edf\u8be6\u60c5", titleFont, darkBrush, 16, 13);
+
+            string status = currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf";
+            SizeF statusSize = g.MeasureString(status, smallFont);
+            g.DrawString(status, smallFont, faintBrush, Width - 42 - statusSize.Width, 17);
+
+            g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
+            g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 178, 43);
+
+            int y = 72;
+
+            if (PanelFieldSettings.IsVisible("net.graph"))
+            {
+                g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, mutedBrush, 16, y);
+
+                // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
+                if (historyPeak > 0)
+                {
+                    string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
+                    SizeF peakSize = g.MeasureString(peakText, smallFont);
+                    g.DrawString(peakText, smallFont, mutedBrush, Width - 16 - peakSize.Width, y);
+                }
+
+                Rectangle graph = new Rectangle(16, 91, Width - 32, 74);
+                DrawGraph(g, graph);
+                y = 91 + 74 + 8;
+            }
+
+            long todayDate = TrafficStore.ToDateInt(DateTime.Today);
+            long[] todayTotals = trafficStore != null
+                ? trafficStore.GetDayTotals(todayDate)
+                : new long[] { 0, 0 };
+            DateTime monthStart = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+            long[] monthTotals = trafficStore != null
+                ? trafficStore.GetRangeTotals(TrafficStore.ToDateInt(monthStart), todayDate)
+                : new long[] { 0, 0 };
+
+            int rightColumn = (Width - 32) / 2 + 16;
+
+            if (PanelFieldSettings.IsVisible("net.today"))
+            {
+                g.DrawString("\u4eca\u65e5\u4e0b\u8f7d", smallFont, mutedBrush, 18, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[0]), valueFont, darkBrush, 18, y + 16);
+                g.DrawString("\u4eca\u65e5\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[1]), valueFont, darkBrush, rightColumn, y + 16);
+                y += 40;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.month"))
+            {
+                g.DrawString("\u672c\u6708\u4e0b\u8f7d", smallFont, mutedBrush, 18, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[0]), valueFont, darkBrush, 18, y + 16);
+                g.DrawString("\u672c\u6708\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[1]), valueFont, darkBrush, rightColumn, y + 16);
+            }
+        }
+
+        // ─────────────────────── 卡片通用绘制 ───────────────────────
+
+        /// <summary>卡片底：浅蓝一块，跟顶部网络区分开，一眼能看出"这是另一类信息"。</summary>
+        private void DrawCard(Graphics g, Rectangle card)
+        {
+            using (Brush fill = new SolidBrush(Color.FromArgb(237, 246, 253)))
+            using (Pen border = new Pen(Color.FromArgb(166, 203, 230), 1.0f))
+            {
+                g.FillRectangle(fill, card);
+                g.DrawRectangle(border, card);
+            }
+        }
+
+        /// <summary>卡片标题：左边一道彩色小竖条 + 名字，右边一个百分比或容量的大数字。</summary>
+        private void DrawCardHeader(Graphics g, Rectangle card, string title, string value, Color accent)
+        {
+            using (Brush bar = new SolidBrush(accent))
+            {
+                g.FillRectangle(bar, card.Left + 10, card.Top + 9, 3, 12);
+            }
+
+            g.DrawString(title, cardTitleFont, darkBrush, card.Left + 18, card.Top + 6);
+
+            if (!string.IsNullOrEmpty(value))
+            {
+                SizeF size = g.MeasureString(value, valueFont);
+                g.DrawString(value, valueFont, darkBrush, card.Right - 12 - size.Width, card.Top + 5);
+            }
+        }
+
+        /// <summary>副标题行：CPU 型号、内存主值、GPU 型号。没有就跳过，进度条会往上顶。</summary>
+        private void DrawCardSubTitle(Graphics g, Rectangle card, string text, bool strong)
+        {
+            float size = strong ? valueFont.Size : smallFont.Size;
+            Font font = strong ? valueFont : smallFont;
+            Brush brush = strong ? darkBrush : mutedBrush;
+            g.DrawString(FitText(g, text, font, card.Width - 24), font, brush,
+                card.Left + 12, card.Top + 24);
+        }
+
+        private void DrawBar(Graphics g, int x, int y, int width, double percent, Color color)
+        {
+            using (Brush track = new SolidBrush(Color.FromArgb(206, 222, 237)))
+            using (Brush bar = new SolidBrush(color))
+            {
+                g.FillRectangle(track, x, y, width, 6);
+                int fill = (int)Math.Round(width * Math.Min(100.0, Math.Max(0.0, percent)) / 100.0);
+                if (fill > 0)
+                {
+                    g.FillRectangle(bar, x, y, fill, 6);
+                }
+            }
+        }
+
+        /// <summary>一格「标签 + 值」，标签灰色、值黑色，跟任务管理器下半截那块一个排法。</summary>
+        private void DrawField(Graphics g, string label, string value, int x, int y)
+        {
+            g.DrawString(label, smallFont, mutedBrush, x, y);
+            float offset = g.MeasureString(label, smallFont).Width + 4;
+            g.DrawString(value, strongFont, darkBrush, x + offset, y);
+        }
+
+        /// <summary>
+        /// 按「每列一个字段」把一堆字段画成网格。关掉某一项之后，
+        /// 后面的项会依次往前顶，不会在中间留空白格。
+        /// </summary>
+        private void DrawFieldGrid(Graphics g, Rectangle card, int top, int columns,
+            List<FieldDef> fields, string[] values)
+        {
+            int columnWidth = (card.Width - 24) / columns;
+            for (int i = 0; i < fields.Count && i < values.Length; i++)
+            {
+                int column = i % columns;
+                int row = i / columns;
+                DrawField(g, fields[i].Label, values[i],
+                    card.Left + 12 + column * columnWidth, top + row * TextRow);
+            }
+        }
+
+        /// <summary>型号名太长就截断加省略号，绝不让它顶到右边的百分比上。</summary>
+        private string FitText(Graphics g, string text, Font font, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return "--";
+            }
+
+            if (g.MeasureString(text, font).Width <= maxWidth)
+            {
+                return text;
+            }
+
+            string result = text;
+            while (result.Length > 2 && g.MeasureString(result + "\u2026", font).Width > maxWidth)
+            {
+                result = result.Substring(0, result.Length - 1);
+            }
+
+            return result + "\u2026";
+        }
+
+        // ─────────────────────── CPU ───────────────────────
+
+        private void DrawCpuCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, cpuCard);
+            DrawCardHeader(g, cpuCard, "CPU", FormatPercent(heldCpu.Target), CpuColor);
+
+            bool hasModel = PanelFieldSettings.IsVisible("cpu.model");
+            if (hasModel)
+            {
+                DrawCardSubTitle(g, cpuCard, SystemInfoProvider.CpuName, false);
+            }
+
+            int barY = cpuCard.Top + (hasModel ? 42 : 24);
+            DrawBar(g, cpuCard.Left + 12, barY, cpuCard.Width - 24, heldCpu.Target, CpuColor);
+
+            List<FieldDef> fields = Visible(CpuFields);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                values[i] = CpuFieldValue(fields[i].Id, snapshot);
+            }
+
+            DrawFieldGrid(g, cpuCard, barY + 16, 3, fields, values);
+        }
+
+        private string CpuFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "cpu.speed": return FormatGhz(snapshot.CpuMhz);
+                case "cpu.base": return FormatGhz(snapshot.CpuBaseMhz);
+                case "cpu.uptime": return FormatUptime(snapshot.UptimeSeconds);
+                case "cpu.process": return FormatCount(snapshot.ProcessCount);
+                case "cpu.thread": return FormatCount(snapshot.ThreadCount);
+                case "cpu.handle": return FormatCount(snapshot.HandleCount);
+                case "cpu.cores": return FormatInt(SystemInfoProvider.CpuCores);
+                case "cpu.logical": return FormatInt(SystemInfoProvider.CpuLogical);
+                case "cpu.socket": return FormatInt(SystemInfoProvider.CpuPackages);
+                case "cpu.l1": return FormatCache(SystemInfoProvider.L1Bytes);
+                case "cpu.l2": return FormatCache(SystemInfoProvider.L2Bytes);
+                case "cpu.l3": return FormatCache(SystemInfoProvider.L3Bytes);
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 内存 ───────────────────────
+
+        private void DrawMemoryCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, memoryCard);
+            DrawCardHeader(g, memoryCard, "\u5185\u5b58", FormatPercent(heldMemory.Target), MemoryColor);
+
+            bool hasUsed = PanelFieldSettings.IsVisible("mem.used");
+            if (hasUsed)
+            {
+                string used = FormatGb(snapshot.MemoryUsedBytes) + "/" + FormatGb(snapshot.MemoryTotalBytes) + " GB";
+                DrawCardSubTitle(g, memoryCard, used, true);
+            }
+
+            int barY = memoryCard.Top + (hasUsed ? 42 : 24);
+            DrawBar(g, memoryCard.Left + 12, barY, memoryCard.Width - 24, heldMemory.Target, MemoryColor);
+
+            List<FieldDef> fields = Visible(MemoryFields);
+            List<FieldDef> grid = new List<FieldDef>(fields.Count);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                // 「已用/总量」已经画在副标题上了，网格里不再重复一遍
+                if (string.Equals(fields[i].Id, "mem.used", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                grid.Add(fields[i]);
+                values[grid.Count - 1] = MemoryFieldValue(fields[i].Id, snapshot);
+            }
+
+            DrawFieldGrid(g, memoryCard, barY + 16, 3, grid, values);
+        }
+
+        private string MemoryFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "mem.available": return FormatGb(snapshot.MemoryAvailableBytes) + " GB";
+                case "mem.cached": return FormatGb(snapshot.MemoryCachedBytes) + " GB";
+                case "mem.speed": return FormatMemSpeed();
+                case "mem.commit": return FormatGb(snapshot.CommitUsedBytes) + "/" + FormatGb(snapshot.CommitLimitBytes) + " GB";
+                case "mem.paged": return FormatMb(snapshot.PagedPoolBytes);
+                case "mem.nonpaged": return FormatMb(snapshot.NonPagedPoolBytes);
+                case "mem.slot": return SystemInfoProvider.MemorySlotsUsed + "/" + SystemInfoProvider.MemorySlotsTotal;
+                case "mem.type": return SystemInfoProvider.MemoryType;
+                case "mem.module": return FormatModuleSize();
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 磁盘 ───────────────────────
+
+        private void DrawDiskCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            int rows = DiskRowCount();
+            if (rows <= 0)
+            {
+                return;
+            }
+
+            DrawCard(g, diskCard);
+            using (Brush bar = new SolidBrush(DiskColor))
+            {
+                g.FillRectangle(bar, diskCard.Left + 10, diskCard.Top + 9, 3, 12);
+            }
+
+            g.DrawString("\u78c1\u76d8", cardTitleFont, darkBrush, diskCard.Left + 18, diskCard.Top + 6);
+
+            bool showIo = PanelFieldSettings.IsVisible("disk.io");
+            bool showCapacity = PanelFieldSettings.IsVisible("disk.capacity");
+            bool showDetails = showIo || showCapacity;
+
+            DiskActivityRow[] disks = snapshot.Disks;
+            int rowHeight = DiskRowHeight();
+            int y = diskCard.Top + 24;
+            for (int i = 0; i < rows; i++)
+            {
+                DiskActivityRow disk = disks[i];
+                double percent = i < shownDisks.Length ? shownDisks[i] : disk.Percent;
+
+                g.DrawString(FitText(g, disk.Label, strongFont, diskCard.Width - 80),
+                    strongFont, darkBrush, diskCard.Left + 12, y);
+
+                string value = FormatPercent(percent);
+                SizeF size = g.MeasureString(value, strongFont);
+                g.DrawString(value, strongFont, darkBrush, diskCard.Right - 12 - size.Width, y);
+
+                DrawBar(g, diskCard.Left + 12, y + 15, diskCard.Width - 24, percent, DiskColor);
+
+                if (showDetails)
+                {
+                    int detailsY = y + 25;
+                    int x = diskCard.Left + 12;
+                    int columnWidth = (diskCard.Width - 24) / 3;
+
+                    if (showIo)
+                    {
+                        DrawField(g, "\u8bfb\u53d6", SpeedFormatter.Format(disk.ReadBytesPerSecond) + "/s", x, detailsY);
+                        DrawField(g, "\u5199\u5165", SpeedFormatter.Format(disk.WriteBytesPerSecond) + "/s",
+                            x + columnWidth, detailsY);
+                        x += columnWidth * 2;
+                    }
+
+                    if (showCapacity)
+                    {
+                        DrawField(g, "\u5bb9\u91cf", FormatCapacity(disk.CapacityBytes, disk.FreeBytes), x, detailsY);
+                    }
+                }
+
+                y += rowHeight;
+            }
+        }
+
+        // ─────────────────────── GPU ───────────────────────
+
+        private void DrawGpuCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            DrawCard(g, gpuCard);
+            DrawCardHeader(g, gpuCard, "GPU", FormatPercent(heldGpu.Target), GpuColor);
+
+            bool hasModel = PanelFieldSettings.IsVisible("gpu.model");
+            if (hasModel)
+            {
+                DrawCardSubTitle(g, gpuCard, SystemInfoProvider.GpuName, false);
+            }
+
+            int barY = gpuCard.Top + (hasModel ? 42 : 24);
+            DrawBar(g, gpuCard.Left + 12, barY, gpuCard.Width - 24, heldGpu.Target, GpuColor);
+
+            List<FieldDef> fields = Visible(GpuFields);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                values[i] = GpuFieldValue(fields[i].Id, snapshot);
+            }
+
+            DrawFieldGrid(g, gpuCard, barY + 16, 2, fields, values);
+        }
+
+        private string GpuFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "gpu.dedicated":
+                    return FormatGb(snapshot.GpuDedicatedUsed) + "/" +
+                           FormatGb(SystemInfoProvider.GpuDedicatedBytes) + " GB";
+                case "gpu.shared":
+                    return FormatGb(snapshot.GpuSharedUsed) + "/" +
+                           FormatGb(snapshot.MemoryTotalBytes / 2) + " GB";
+                case "gpu.driver": return SystemInfoProvider.GpuDriverVersion;
+                case "gpu.date": return SystemInfoProvider.GpuDriverDate;
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 网卡 ───────────────────────
+
+        private void DrawLinkCard(Graphics g, SystemResourceSnapshot snapshot)
+        {
+            if (linkCard.IsEmpty)
+            {
+                return;
+            }
+
+            DrawCard(g, linkCard);
+
+            using (Brush bar = new SolidBrush(LinkColor))
+            {
+                g.FillRectangle(bar, linkCard.Left + 10, linkCard.Top + 9, 3, 12);
+            }
+
+            g.DrawString("\u7f51\u7edc\u9002\u914d\u5668", cardTitleFont, darkBrush, linkCard.Left + 18, linkCard.Top + 6);
+
+            NetworkLinkRow[] links = snapshot.Links;
+            int rows = LinkRowCount();
+            int y = linkCard.Top + 24;
+            for (int i = 0; i < rows; i++)
+            {
+                string name = links != null && i < links.Length ? links[i].Name : "\u6ca1\u6709\u6d3b\u52a8\u7f51\u5361";
+                string link = links != null && i < links.Length ? links[i].Link : "--";
+
+                g.DrawString(FitText(g, name, smallFont, linkCard.Width - 110),
+                    smallFont, mutedBrush, linkCard.Left + 12, y);
+
+                SizeF size = g.MeasureString(link, strongFont);
+                g.DrawString(link, strongFont, darkBrush, linkCard.Right - 12 - size.Width, y);
+
+                y += LinkRowHeight;
+            }
+        }
+
+        // ─────────────────────── 格式化 ───────────────────────
+
+        private static string FormatPercent(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+            {
+                value = 0;
+            }
+
+            return Math.Max(0.0, Math.Min(100.0, value)).ToString("0.#") + "%";
+        }
+
+        private static string FormatGhz(double mhz)
+        {
+            if (mhz <= 0 || double.IsNaN(mhz) || double.IsInfinity(mhz))
+            {
+                return "--";
+            }
+
+            return (mhz / 1000.0).ToString("0.00") + " GHz";
+        }
+
+        private static string FormatInt(int value)
+        {
+            return value > 0 ? value.ToString("N0") : "--";
+        }
+
+        private static string FormatCount(int value)
+        {
+            return value > 0 ? value.ToString("N0") : "--";
+        }
+
+        private static string FormatGb(ulong bytes)
+        {
+            if (bytes == 0)
+            {
+                return "0.0";
+            }
+
+            return (bytes / 1073741824.0).ToString("0.0");
+        }
+
+        private static string FormatMb(ulong bytes)
+        {
+            if (bytes == 0)
+            {
+                return "0 MB";
+            }
+
+            double mb = bytes / 1048576.0;
+            if (mb >= 1024)
+            {
+                return (mb / 1024.0).ToString("0.0") + " GB";
+            }
+
+            return mb.ToString("0") + " MB";
+        }
+
+        private static string FormatCache(long bytes)
+        {
+            if (bytes <= 0)
+            {
+                return "--";
+            }
+
+            double kb = bytes / 1024.0;
+            if (kb >= 1024)
+            {
+                return (kb / 1024.0).ToString("0.#") + " MB";
+            }
+
+            return kb.ToString("0") + " KB";
+        }
+
+        private static string FormatMemSpeed()
+        {
+            int speed = SystemInfoProvider.MemorySpeedMhz;
+            return speed > 0 ? speed.ToString("N0") + " MT/s" : "--";
+        }
+
+        private static string FormatModuleSize()
+        {
+            int mb = SystemInfoProvider.MemoryModuleMb;
+            if (mb <= 0)
+            {
+                return "--";
+            }
+
+            if (mb >= 1024)
+            {
+                return (mb / 1024) + " GB";
+            }
+
+            return mb + " MB";
+        }
+
+        private static string FormatUptime(ulong seconds)
+        {
+            if (seconds == 0)
+            {
+                return "--";
+            }
+
+            TimeSpan span = TimeSpan.FromSeconds(seconds);
+            if (span.TotalDays >= 1)
+            {
+                return ((int)span.TotalDays) + "." + span.Hours.ToString("00") + ":" +
+                       span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+            }
+
+            return span.Hours + ":" + span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+        }
+
+        /// <summary>容量按「剩余/总计」写，跟任务管理器磁盘页一个口径。同一块盘的多个分区要加在一起。</summary>
+        private static string FormatCapacity(long capacity, long free)
+        {
+            if (capacity <= 0)
+            {
+                return "--";
+            }
+
+            double totalGb = capacity / 1073741824.0;
+            double freeGb = free / 1073741824.0;
+            if (totalGb >= 1024)
+            {
+                return (freeGb / 1024.0).ToString("0.0") + "/" + (totalGb / 1024.0).ToString("0.0") + " TB";
+            }
+
+            return freeGb.ToString("0") + "/" + totalGb.ToString("0") + " GB";
+        }
+
+        // ─────────────────────── 曲线 ───────────────────────
+
+        private void DrawGraph(Graphics g, Rectangle graph)
+        {
+            // 底：圆角卡片 + 极淡的竖向渐变，比一块生硬的浅蓝方块耐看
+            using (GraphicsPath shape = CreateRoundedRectangle(graph, 7))
+            using (LinearGradientBrush background = new LinearGradientBrush(
+                new Rectangle(graph.Left, graph.Top, Math.Max(1, graph.Width), Math.Max(1, graph.Height * 2)),
+                Color.FromArgb(253, 254, 255), Color.FromArgb(231, 242, 253),
+                LinearGradientMode.Vertical))
+            {
+                g.FillPath(background, shape);
+            }
+
+            if (sampleCount < 2)
+            {
+                DrawGraphBorder(g, graph);
+                return;
+            }
+
+            // 比例尺以窗口内的最高值为准（下面再兜一个 512 KB/s 的地板），
+            // 这样 5 MB/s 的大下载能顶满，日常零碎流量也不会被放大成假起伏。
+            double peak = 0;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                double value = downloadHistory[i] > uploadHistory[i]
+                    ? downloadHistory[i]
+                    : uploadHistory[i];
+                if (value > peak)
+                {
+                    peak = value;
+                }
+            }
+
+            // 比例尺用线性，但设一个 512 KB/s 的地板：
+            // 后台心跳、网页聊天这种 20~50 KB/s 的流量本来就不该占满整张图，
+            // 地板把它们压成贴着底边的细线，真有下载时才会顶上去。
+            double ceiling = Math.Max(peak, 512.0 * 1024.0);
+
+            // 画线区域往里缩一圈，端点的圆点才不会压在边框上
+            Rectangle plot = new Rectangle(graph.Left + 5, graph.Top + 6,
+                graph.Width - 10, graph.Height - 12);
+
+            Color downColor = Color.FromArgb(35, 119, 238);
+            Color upColor = Color.FromArgb(16, 178, 92);
+
+            GraphicsState state = g.Save();
+            try
+            {
+                using (GraphicsPath clip = CreateRoundedRectangle(graph, 7))
+                {
+                    g.SetClip(clip);
+
+                    using (Pen grid = new Pen(Color.FromArgb(40, 110, 150, 190), 1.0f))
+                    {
+                        grid.DashStyle = DashStyle.Dash;
+                        grid.DashPattern = new float[] { 3.0f, 5.0f };
+                        for (int row = 1; row <= 2; row++)
+                        {
+                            int y = plot.Top + plot.Height * row / 3;
+                            g.DrawLine(grid, graph.Left + 1, y, graph.Right - 1, y);
+                        }
+                    }
+
+                    DrawHistoryArea(g, plot, downloadHistory, ceiling, downColor, 120);
+                    DrawHistoryArea(g, plot, uploadHistory, ceiling, upColor, 90);
+                    DrawHistoryLine(g, plot, downloadHistory, ceiling, downColor, 2.4f);
+                    DrawHistoryLine(g, plot, uploadHistory, ceiling, upColor, 1.9f);
+                }
+            }
+            finally
+            {
+                // 裁剪必须还原，否则后面的流量数字和磁盘行全被裁掉
+                g.Restore(state);
+            }
+
+            DrawHistoryDot(g, plot, downloadHistory, ceiling, downColor);
+            DrawHistoryDot(g, plot, uploadHistory, ceiling, upColor);
+
+            DrawGraphBorder(g, graph);
+        }
+
+        private static void DrawGraphBorder(Graphics g, Rectangle graph)
+        {
+            using (GraphicsPath shape = CreateRoundedRectangle(graph, 7))
+            using (Pen border = new Pen(Color.FromArgb(64, 148, 190, 226), 1.0f))
+            {
+                g.DrawPath(border, shape);
+            }
+        }
+
+        /// <summary>
+        /// 把采样值换算成坐标。纵向是线性的（地板 512 KB/s，见 DrawGraph），
+        /// 横向按当前点数铺满整条宽度 —— 刚打开面板时也不会只画左半截。
+        ///
+        /// 画之前做一次三点加权平滑：采样一秒一个，20~50 KB/s 的日常流量本身就在抖，
+        /// 直接连点会画出一排锯齿。真正的测量值没动，只是画出来的线不跟着抖。
+        /// </summary>
+        private PointF[] BuildPoints(Rectangle plot, double[] values, double ceiling)
+        {
+            for (int i = 0; i < sampleCount; i++)
+            {
+                double previous = values[i > 0 ? i - 1 : i];
+                double next = values[i < sampleCount - 1 ? i + 1 : i];
+                smoothBuffer[i] = (previous + values[i] * 2.0 + next) / 4.0;
+            }
+
+            PointF[] points = new PointF[sampleCount];
+            float span = sampleCount > 1 ? sampleCount - 1 : 1;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                float x = plot.Left + (plot.Width - 1) * i / span;
+                float ratio = (float)Math.Min(1.0, Math.Max(0.0, smoothBuffer[i]) / ceiling);
+                points[i] = new PointF(x, plot.Bottom - ratio * (plot.Height - 1));
+            }
+
+            return points;
+        }
+
+        /// <summary>曲线下面的渐变填充，让"有流量"这件事一眼看得出来。</summary>
+        private void DrawHistoryArea(Graphics g, Rectangle plot, double[] values, double ceiling,
+            Color color, int alpha)
+        {
+            PointF[] points = BuildPoints(plot, values, ceiling);
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                // 0.45 的张力 = 轻微平滑，不会把尖锐的突发抹成圆包
+                path.AddCurve(points, 0.45f);
+                path.AddLine(points[sampleCount - 1].X, plot.Bottom, points[0].X, plot.Bottom);
+                path.CloseFigure();
+
+                using (LinearGradientBrush fill = new LinearGradientBrush(
+                    new Rectangle(plot.Left, plot.Top - 2, Math.Max(1, plot.Width), Math.Max(2, plot.Height + 2)),
+                    Color.FromArgb(alpha, color), Color.FromArgb(8, color),
+                    LinearGradientMode.Vertical))
+                {
+                    g.FillPath(fill, path);
+                }
+            }
+        }
+
+        private void DrawHistoryLine(Graphics g, Rectangle plot, double[] values, double ceiling,
+            Color color, float width)
+        {
+            PointF[] points = BuildPoints(plot, values, ceiling);
+            using (Pen pen = new Pen(color, width))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                g.DrawCurve(pen, points, 0.45f);
+            }
+        }
+
+        /// <summary>最右端点一个小圆点，表示"这条线现在在这里"。</summary>
+        private void DrawHistoryDot(Graphics g, Rectangle plot, double[] values, double ceiling, Color color)
+        {
+            PointF last = BuildPoints(plot, values, ceiling)[sampleCount - 1];
+            using (Brush halo = new SolidBrush(Color.FromArgb(230, 255, 255, 255)))
+            {
+                g.FillEllipse(halo, last.X - 4.0f, last.Y - 4.0f, 8.0f, 8.0f);
+            }
+
+            using (Brush dot = new SolidBrush(color))
+            {
+                g.FillEllipse(dot, last.X - 2.6f, last.Y - 2.6f, 5.2f, 5.2f);
+            }
+        }
+
+        private static GraphicsPath CreateRoundedRectangle(Rectangle rect, int radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int diameter = radius * 2;
+            Rectangle arc = new Rectangle(rect.Location, new Size(diameter, diameter));
+            path.AddArc(arc, 180, 90);
+            arc.X = rect.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = rect.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = rect.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                titleFont.Dispose();
+                cardTitleFont.Dispose();
+                valueFont.Dispose();
+                strongFont.Dispose();
+                smallFont.Dispose();
+                darkBrush.Dispose();
+                mutedBrush.Dispose();
+                faintBrush.Dispose();
+                downBrush.Dispose();
+                upBrush.Dispose();
+                if (fieldMenu != null)
+                {
+                    fieldMenu.Dispose();
+                }
+
+                resourceMonitor.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }

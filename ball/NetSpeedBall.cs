@@ -195,7 +195,16 @@ namespace NetSpeedBall
             unitMenu.DropDownItems.Add(megabytesItem);
             unitMenu.DropDownItems.Add(megabitsItem);
             menu.Items.Add(unitMenu);
-            menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u7f51\u7edc\u8be6\u60c5", null, OnShowDetails));
+            menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u7cfb\u7edf\u8be6\u60c5", null, OnShowDetails));
+            // 面板上的右键菜单是主入口，这里再给一个托盘入口：
+            // 面板没开的时候也能先把不想看的项关掉。
+            menu.Items.Add(SpeedDetailsForm.BuildFieldMenuItem(delegate
+            {
+                if (ballForm != null)
+                {
+                    ballForm.RefreshDetailsLayout();
+                }
+            }));
             menu.Items.Add(new ToolStripMenuItem("\u6d41\u91cf\u7edf\u8ba1", null, OnShowTrafficWindow));
             menu.Items.Add(BuildPowerMenu());
             menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u4efb\u52a1\u7ba1\u7406\u5668", null, OnOpenTaskManager));
@@ -1111,6 +1120,15 @@ namespace NetSpeedBall
         {
             appIcon = icon;
             Icon = icon;
+        }
+
+        /// <summary>显示项改了之后让详情面板重排一次（窗口高度会跟着变）。</summary>
+        public void RefreshDetailsLayout()
+        {
+            if (detailsForm != null)
+            {
+                detailsForm.ApplyFieldChange();
+            }
         }
 
         public void UpdateSpeed(SpeedSample sample)
@@ -2210,6 +2228,16 @@ namespace NetSpeedBall
     /// 而不是「用了多少空间」，内存「已缓存」对应系统缓存。
     /// 目的就一个 —— 不用再开任务管理器，瞄一眼这块卡片就知道机器什么状态。
     /// </summary>
+    /// <summary>
+    /// 「系统详情」面板：网络 + CPU + 内存 + 磁盘 + GPU + 网卡。
+    ///
+    /// 口径一律对齐任务管理器「性能」页：CPU 利用率是全局占用，磁盘是「活动时间」
+    /// 而不是「用了多少空间」，内存「已缓存」= 待机页 + 已修改页。
+    ///
+    /// 哪一行显示、哪一行不显示由用户自己定：在面板上点右键，勾选即生效，
+    /// 配置存在注册表里，下次打开还是这套。关掉一行之后下面的行会自动补位，
+    /// 不会在卡片里留一个空洞。
+    /// </summary>
     internal sealed class SpeedDetailsForm : Form
     {
         private const int MaxSamples = 60;
@@ -2221,12 +2249,97 @@ namespace NetSpeedBall
         private const int CardGap = 8;
         /// <summary>左右边距。所有卡片共用同一条竖线，视觉上才整齐。</summary>
         private const int SideMargin = 14;
-        /// <summary>网络区画完的位置，下面全是资源卡片。</summary>
-        private const int NetworkBottom = 250;
-        /// <summary>一块磁盘占的高度（标题行 + 进度条 + 读写行）。</summary>
-        private const int DiskRowHeight = 48;
+        /// <summary>一行字段的高度。8.2pt 的字体配 19px 行距，中英文都不挤。</summary>
+        private const int TextRow = 19;
+        /// <summary>一块磁盘占的高度（标题行 + 进度条 + 读写/容量行）。</summary>
+        private const int DiskRowFull = 48;
+        /// <summary>只显示活动率时，一块磁盘占的高度。</summary>
+        private const int DiskRowTight = 27;
         /// <summary>一行网卡占的高度。</summary>
         private const int LinkRowHeight = 17;
+
+        // ─────────────────────── 可开关的字段 ───────────────────────
+        //
+        // id 会写进注册表，一旦发布就别改；label 是给用户看的，随便调。
+        // 顺序就是卡片里从左到右、从上到下的顺序，关掉中间的项后面的自动往前顶。
+
+        private sealed class FieldDef
+        {
+            public readonly string Id;
+            public readonly string Label;
+
+            public FieldDef(string id, string label)
+            {
+                Id = id;
+                Label = label;
+            }
+        }
+
+        private static readonly FieldDef[] NetworkFields =
+        {
+            new FieldDef("net.graph", "60 秒速度曲线"),
+            new FieldDef("net.today", "今日下载/上传"),
+            new FieldDef("net.month", "本月下载/上传"),
+        };
+
+        private static readonly FieldDef[] CpuFields =
+        {
+            new FieldDef("cpu.speed", "速度"),
+            new FieldDef("cpu.base", "基准速度"),
+            new FieldDef("cpu.uptime", "运行时长"),
+            new FieldDef("cpu.process", "进程"),
+            new FieldDef("cpu.thread", "线程"),
+            new FieldDef("cpu.handle", "句柄"),
+            new FieldDef("cpu.cores", "内核"),
+            new FieldDef("cpu.logical", "逻辑处理器"),
+            new FieldDef("cpu.socket", "插槽"),
+            new FieldDef("cpu.l1", "L1 缓存"),
+            new FieldDef("cpu.l2", "L2 缓存"),
+            new FieldDef("cpu.l3", "L3 缓存"),
+        };
+
+        private static readonly FieldDef[] MemoryFields =
+        {
+            new FieldDef("mem.used", "已用/总量"),
+            new FieldDef("mem.available", "可用"),
+            new FieldDef("mem.cached", "已缓存"),
+            new FieldDef("mem.speed", "内存速度"),
+            new FieldDef("mem.commit", "已提交"),
+            new FieldDef("mem.paged", "分页缓冲池"),
+            new FieldDef("mem.nonpaged", "非分页缓冲池"),
+            new FieldDef("mem.slot", "插槽占用"),
+            new FieldDef("mem.type", "内存类型"),
+            new FieldDef("mem.module", "单条容量"),
+        };
+
+        private static readonly FieldDef[] DiskFields =
+        {
+            new FieldDef("disk.io", "读写速度"),
+            new FieldDef("disk.capacity", "容量"),
+        };
+
+        private static readonly FieldDef[] GpuFields =
+        {
+            new FieldDef("gpu.dedicated", "专用显存"),
+            new FieldDef("gpu.shared", "共享显存"),
+            new FieldDef("gpu.driver", "驱动版本"),
+            new FieldDef("gpu.date", "驱动日期"),
+        };
+
+        private static readonly FieldDef[] GpuModelField =
+        {
+            new FieldDef("gpu.model", "显卡型号"),
+        };
+
+        private static readonly FieldDef[] CpuModelField =
+        {
+            new FieldDef("cpu.model", "CPU 型号"),
+        };
+
+        private static readonly FieldDef[] NicFields =
+        {
+            new FieldDef("nic.card", "网络适配器整块"),
+        };
 
         private readonly double[] downloadHistory = new double[MaxSamples];
         private readonly double[] uploadHistory = new double[MaxSamples];
@@ -2275,12 +2388,20 @@ namespace NetSpeedBall
         private static readonly Color GpuColor = Color.FromArgb(138, 96, 230);
         private static readonly Color LinkColor = Color.FromArgb(22, 160, 170);
 
-        /// <summary>各卡片的位置，每帧按当前磁盘/网卡数量重算一次。</summary>
+        /// <summary>各卡片的位置，每帧按当前可见字段和磁盘/网卡数量重算一次。</summary>
         private Rectangle cpuCard;
         private Rectangle memoryCard;
         private Rectangle diskCard;
         private Rectangle gpuCard;
         private Rectangle linkCard;
+
+        /// <summary>网络区画到哪儿结束，下面的卡片从这里开始往下排。</summary>
+        private int networkBottom;
+        /// <summary>所有卡片画完之后的位置，也就是窗口应有的高度。</summary>
+        private int contentBottom;
+
+        /// <summary>右键菜单，第一次点右键时才建（建菜单要几十毫秒，别放在构造里）。</summary>
+        private ContextMenuStrip fieldMenu;
 
         /// <summary>鼠标是否停在关闭按钮上。用来画悬停反馈。</summary>
         private bool closeHover;
@@ -2319,6 +2440,13 @@ namespace NetSpeedBall
             get { return true; }
         }
 
+        /// <summary>面板一露头就把 GPU 采样线程拉起来，藏起来就停掉。</summary>
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            resourceMonitor.SetActive(Visible);
+        }
+
         protected override CreateParams CreateParams
         {
             get
@@ -2332,6 +2460,13 @@ namespace NetSpeedBall
         public void ResetTodayTraffic()
         {
             // The store itself is reset by SpeedBallApplication; just repaint.
+            Invalidate();
+        }
+
+        /// <summary>显示项改了之后重排窗口：卡片高度跟着变，窗口也得跟着变。</summary>
+        public void ApplyFieldChange()
+        {
+            SyncHeight();
             Invalidate();
         }
 
@@ -2587,8 +2722,62 @@ namespace NetSpeedBall
             }
         }
 
-        /// <summary>卡片底部，也就是窗口应有的高度。</summary>
-        private int contentBottom;
+        // ─────────────────────── 布局 ───────────────────────
+
+        /// <summary>按当前配置挑出要显示的字段，顺序保持原样。</summary>
+        private static List<FieldDef> VisibleFields(FieldDef[] defs)
+        {
+            List<FieldDef> list = new List<FieldDef>(defs.Length);
+            for (int i = 0; i < defs.Length; i++)
+            {
+                if (PanelFieldSettings.IsVisible(defs[i].Id))
+                {
+                    list.Add(defs[i]);
+                }
+            }
+
+            return list;
+        }
+
+        private static int Rows(int fieldCount, int columns)
+        {
+            if (fieldCount <= 0)
+            {
+                return 0;
+            }
+
+            return (fieldCount + columns - 1) / columns;
+        }
+
+        /// <summary>
+        /// 网络区的高度：曲线、今日、本月三块各自可以关掉，关掉下面的就往上顶。
+        /// </summary>
+        private int MeasureNetwork()
+        {
+            int y = 72;
+            if (PanelFieldSettings.IsVisible("net.graph"))
+            {
+                y = 91 + 74 + 8;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.today"))
+            {
+                y += 40;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.month"))
+            {
+                y += 40;
+            }
+
+            return y + 6;
+        }
+
+        /// <summary>一张卡片的高度：标题区 + 字段行数 × 行高 + 底部留白。</summary>
+        private static int CardHeight(int headerHeight, int fieldRows)
+        {
+            return headerHeight + fieldRows * TextRow + 8;
+        }
 
         /// <summary>
         /// 从上往下依次摆卡片，顺便算出总高度。
@@ -2599,18 +2788,25 @@ namespace NetSpeedBall
         private void LayoutCards()
         {
             int width = Math.Max(240, Width - SideMargin * 2);
-            int y = NetworkBottom;
+            networkBottom = MeasureNetwork();
+            int y = networkBottom;
 
-            cpuCard = new Rectangle(SideMargin, y, width, 140);
+            bool cpuModel = PanelFieldSettings.IsVisible("cpu.model");
+            int cpuHeader = (cpuModel ? 58 : 40);
+            cpuCard = new Rectangle(SideMargin, y, width,
+                CardHeight(cpuHeader, Rows(VisibleFields(CpuFields).Count, 3)));
             y += cpuCard.Height + CardGap;
 
-            memoryCard = new Rectangle(SideMargin, y, width, 124);
+            bool memUsed = PanelFieldSettings.IsVisible("mem.used");
+            int memHeader = (memUsed ? 58 : 40);
+            memoryCard = new Rectangle(SideMargin, y, width,
+                CardHeight(memHeader, Rows(VisibleFields(MemoryFields).Count, 3)));
             y += memoryCard.Height + CardGap;
 
             int disks = DiskRowCount();
             if (disks > 0)
             {
-                diskCard = new Rectangle(SideMargin, y, width, 24 + disks * DiskRowHeight);
+                diskCard = new Rectangle(SideMargin, y, width, 24 + disks * DiskRowHeight());
                 y += diskCard.Height + CardGap;
             }
             else
@@ -2618,14 +2814,32 @@ namespace NetSpeedBall
                 diskCard = Rectangle.Empty;
             }
 
-            gpuCard = new Rectangle(SideMargin, y, width, 102);
+            bool gpuModel = PanelFieldSettings.IsVisible("gpu.model");
+            int gpuHeader = (gpuModel ? 58 : 40);
+            gpuCard = new Rectangle(SideMargin, y, width,
+                CardHeight(gpuHeader, Rows(VisibleFields(GpuFields).Count, 2)));
             y += gpuCard.Height + CardGap;
 
-            int links = LinkRowCount();
-            linkCard = new Rectangle(SideMargin, y, width, 28 + links * LinkRowHeight);
-            y += linkCard.Height;
+            if (PanelFieldSettings.IsVisible("nic.card"))
+            {
+                int links = LinkRowCount();
+                linkCard = new Rectangle(SideMargin, y, width, 28 + links * LinkRowHeight);
+                y += linkCard.Height;
+            }
+            else
+            {
+                linkCard = Rectangle.Empty;
+            }
 
             contentBottom = y + 12;
+        }
+
+        /// <summary>一块磁盘占多高：读写和容量都关掉时只留标题和进度条。</summary>
+        private static int DiskRowHeight()
+        {
+            bool details = PanelFieldSettings.IsVisible("disk.io") ||
+                           PanelFieldSettings.IsVisible("disk.capacity");
+            return details ? DiskRowFull : DiskRowTight;
         }
 
         private int DiskRowCount()
@@ -2665,6 +2879,9 @@ namespace NetSpeedBall
                 // GPU 也一个道理，顺手把它的采样倒计时拨到 1，两次都真采一遍。
                 form.resourceSnapshot = form.resourceMonitor.Read();
                 System.Threading.Thread.Sleep(1100);
+                // GPU 利用率是"两次读数之间的差值"，头一次只能建基线，得再采一次才有值
+                form.resourceMonitor.ForceGpuSample();
+                System.Threading.Thread.Sleep(700);
                 form.resourceMonitor.ForceGpuSample();
                 form.resourceSnapshot = form.resourceMonitor.Read();
 
@@ -2697,6 +2914,128 @@ namespace NetSpeedBall
                     form.DrawToBitmap(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
                     bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
                 }
+            }
+        }
+
+        // ─────────────────────── 右键菜单 ───────────────────────
+
+        private void EnsureFieldMenu()
+        {
+            if (fieldMenu != null)
+            {
+                return;
+            }
+
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.ShowImageMargin = false;
+            menu.ShowCheckMargin = true;
+            BuildFieldMenuItems(menu.Items, delegate
+            {
+                SyncHeight();
+                Invalidate();
+            });
+
+            fieldMenu = menu;
+        }
+
+        /// <summary>
+        /// 「面板显示项」整棵子菜单，托盘和面板右键共用同一份定义。
+        /// 传进来的回调在每次勾选变化后执行，调用方拿它去重排窗口。
+        /// </summary>
+        public static ToolStripMenuItem BuildFieldMenuItem(Action onChanged)
+        {
+            ToolStripMenuItem root = new ToolStripMenuItem("\u9762\u677f\u663e\u793a\u9879");
+            BuildFieldMenuItems(root.DropDownItems, onChanged);
+            return root;
+        }
+
+        private static void BuildFieldMenuItems(ToolStripItemCollection items, Action onChanged)
+        {
+            AddMenuGroup(items, "网络", NetworkFields, onChanged);
+            AddMenuGroup(items, "CPU", CpuModelField, onChanged);
+            AddMenuGroup(items, null, CpuFields, onChanged);
+            AddMenuGroup(items, "内存", MemoryFields, onChanged);
+            AddMenuGroup(items, "磁盘", DiskFields, onChanged);
+            AddMenuGroup(items, "GPU", GpuModelField, onChanged);
+            AddMenuGroup(items, null, GpuFields, onChanged);
+            AddMenuGroup(items, "网卡", NicFields, onChanged);
+
+            items.Add(new ToolStripSeparator());
+            ToolStripMenuItem reset = new ToolStripMenuItem("\u5168\u90e8\u663e\u793a");
+            ToolStripItemCollection captured = items;
+            reset.Click += delegate
+            {
+                PanelFieldSettings.ShowAll();
+                PanelFieldSettings.SyncMenuChecks(captured);
+                if (onChanged != null)
+                {
+                    onChanged();
+                }
+            };
+            items.Add(reset);
+        }
+
+        /// <summary>
+        /// 往菜单里塞一组勾选项。group 传 null 表示不分组的平铺项。
+        /// CheckOnClick 让系统自己处理打勾，点击回调里只管存配置。
+        /// </summary>
+        private static void AddMenuGroup(ToolStripItemCollection items, string group,
+            FieldDef[] defs, Action onChanged)
+        {
+            ToolStripMenuItem parent = null;
+            if (group != null)
+            {
+                parent = new ToolStripMenuItem(group);
+                items.Add(parent);
+            }
+
+            for (int i = 0; i < defs.Length; i++)
+            {
+                FieldDef def = defs[i];
+                ToolStripMenuItem item = new ToolStripMenuItem(def.Label);
+                item.CheckOnClick = true;
+                item.Checked = PanelFieldSettings.IsVisible(def.Id);
+                item.Tag = def.Id;
+                item.CheckedChanged += delegate
+                {
+                    ToolStripMenuItem source = (ToolStripMenuItem)item;
+                    PanelFieldSettings.SetVisible((string)source.Tag, source.Checked);
+                    if (onChanged != null)
+                    {
+                        onChanged();
+                    }
+                };
+
+                if (parent != null)
+                {
+                    parent.DropDownItems.Add(item);
+                }
+                else
+                {
+                    items.Add(item);
+                }
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+
+            if (e.Button == MouseButtons.Right)
+            {
+                EnsureFieldMenu();
+                // 无边框窗口默认不激活，先点一下自己再弹菜单，
+                // 免得菜单出来之后第一下点击被当成"激活窗口"吃掉。
+                Activate();
+                fieldMenu.Show(this, e.Location);
+                return;
+            }
+
+            if (e.Button == MouseButtons.Left && CloseButtonBounds.Contains(e.Location))
+            {
+                closeHover = false;
+                Cursor = Cursors.Default;
+                Hide();
             }
         }
 
@@ -2756,17 +3095,6 @@ namespace NetSpeedBall
             }
         }
 
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            base.OnMouseUp(e);
-            if (e.Button == MouseButtons.Left && CloseButtonBounds.Contains(e.Location))
-            {
-                closeHover = false;
-                Cursor = Cursors.Default;
-                Hide();
-            }
-        }
-
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -2796,13 +3124,13 @@ namespace NetSpeedBall
             DrawLinkCard(g, snapshot);
 
             DrawCloseButton(g);
-
-            // 关闭按钮最后画，标题那一行的状态文字不会压到它上面
         }
 
+        // ─────────────────────── 网络区 ───────────────────────
+
         /// <summary>
-        /// 网络区：跟原来一样 —— 上下行实时速度、60 秒曲线、今日/本月流量。
-        /// 这块是这个程序的看家本事，位置不动，用户一开就知道该看哪儿。
+        /// 网络区：上下行实时速度 + 可选的 60 秒曲线、今日/本月流量。
+        /// 这几块都关掉时，整个区域只剩两行实时速度，面板会缩成一条。
         /// </summary>
         private void DrawNetworkSection(Graphics g, SystemResourceSnapshot snapshot)
         {
@@ -2814,18 +3142,25 @@ namespace NetSpeedBall
 
             g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
             g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 178, 43);
-            g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, mutedBrush, 16, 72);
 
-            // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
-            if (historyPeak > 0)
+            int y = 72;
+
+            if (PanelFieldSettings.IsVisible("net.graph"))
             {
-                string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
-                SizeF peakSize = g.MeasureString(peakText, smallFont);
-                g.DrawString(peakText, smallFont, mutedBrush, Width - 16 - peakSize.Width, 72);
-            }
+                g.DrawString("\u6700\u8fd1 60 \u79d2", smallFont, mutedBrush, 16, y);
 
-            Rectangle graph = new Rectangle(16, 91, Width - 32, 74);
-            DrawGraph(g, graph);
+                // 曲线是自动缩放的，不标出峰值的话，"一根尖刺"就永远看不出实际量级。
+                if (historyPeak > 0)
+                {
+                    string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
+                    SizeF peakSize = g.MeasureString(peakText, smallFont);
+                    g.DrawString(peakText, smallFont, mutedBrush, Width - 16 - peakSize.Width, y);
+                }
+
+                Rectangle graph = new Rectangle(16, 91, Width - 32, 74);
+                DrawGraph(g, graph);
+                y = 91 + 74 + 8;
+            }
 
             long todayDate = TrafficStore.ToDateInt(DateTime.Today);
             long[] todayTotals = trafficStore != null
@@ -2837,15 +3172,26 @@ namespace NetSpeedBall
                 : new long[] { 0, 0 };
 
             int rightColumn = (Width - 32) / 2 + 16;
-            g.DrawString("\u4eca\u65e5\u4e0b\u8f7d", smallFont, mutedBrush, 18, 172);
-            g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[0]), valueFont, darkBrush, 18, 188);
-            g.DrawString("\u4eca\u65e5\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, 172);
-            g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[1]), valueFont, darkBrush, rightColumn, 188);
-            g.DrawString("\u672c\u6708\u4e0b\u8f7d", smallFont, mutedBrush, 18, 212);
-            g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[0]), valueFont, darkBrush, 18, 228);
-            g.DrawString("\u672c\u6708\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, 212);
-            g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[1]), valueFont, darkBrush, rightColumn, 228);
+
+            if (PanelFieldSettings.IsVisible("net.today"))
+            {
+                g.DrawString("\u4eca\u65e5\u4e0b\u8f7d", smallFont, mutedBrush, 18, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[0]), valueFont, darkBrush, 18, y + 16);
+                g.DrawString("\u4eca\u65e5\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(todayTotals[1]), valueFont, darkBrush, rightColumn, y + 16);
+                y += 40;
+            }
+
+            if (PanelFieldSettings.IsVisible("net.month"))
+            {
+                g.DrawString("\u672c\u6708\u4e0b\u8f7d", smallFont, mutedBrush, 18, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[0]), valueFont, darkBrush, 18, y + 16);
+                g.DrawString("\u672c\u6708\u4e0a\u4f20", smallFont, mutedBrush, rightColumn, y);
+                g.DrawString(SpeedFormatter.FormatTraffic(monthTotals[1]), valueFont, darkBrush, rightColumn, y + 16);
+            }
         }
+
+        // ─────────────────────── 卡片通用绘制 ───────────────────────
 
         /// <summary>卡片底：浅蓝一块，跟顶部网络区分开，一眼能看出"这是另一类信息"。</summary>
         private void DrawCard(Graphics g, Rectangle card)
@@ -2875,6 +3221,16 @@ namespace NetSpeedBall
             }
         }
 
+        /// <summary>副标题行：CPU 型号、内存主值、GPU 型号。没有就跳过，进度条会往上顶。</summary>
+        private void DrawCardSubTitle(Graphics g, Rectangle card, string text, bool strong)
+        {
+            float size = strong ? valueFont.Size : smallFont.Size;
+            Font font = strong ? valueFont : smallFont;
+            Brush brush = strong ? darkBrush : mutedBrush;
+            g.DrawString(FitText(g, text, font, card.Width - 24), font, brush,
+                card.Left + 12, card.Top + 24);
+        }
+
         private void DrawBar(Graphics g, int x, int y, int width, double percent, Color color)
         {
             using (Brush track = new SolidBrush(Color.FromArgb(206, 222, 237)))
@@ -2890,73 +3246,151 @@ namespace NetSpeedBall
         }
 
         /// <summary>一格「标签 + 值」，标签灰色、值黑色，跟任务管理器下半截那块一个排法。</summary>
-        private void DrawField(Graphics g, string label, string value, int x, int y, int labelWidth)
+        private void DrawField(Graphics g, string label, string value, int x, int y)
         {
             g.DrawString(label, smallFont, mutedBrush, x, y);
-            g.DrawString(value, strongFont, darkBrush, x + labelWidth, y);
+            float offset = g.MeasureString(label, smallFont).Width + 4;
+            g.DrawString(value, strongFont, darkBrush, x + offset, y);
         }
+
+        /// <summary>
+        /// 按「每列一个字段」把一堆字段画成网格。关掉某一项之后，
+        /// 后面的项会依次往前顶，不会在中间留空白格。
+        /// </summary>
+        private void DrawFieldGrid(Graphics g, Rectangle card, int top, int columns,
+            List<FieldDef> fields, string[] values)
+        {
+            int columnWidth = (card.Width - 24) / columns;
+            for (int i = 0; i < fields.Count && i < values.Length; i++)
+            {
+                int column = i % columns;
+                int row = i / columns;
+                DrawField(g, fields[i].Label, values[i],
+                    card.Left + 12 + column * columnWidth, top + row * TextRow);
+            }
+        }
+
+        /// <summary>型号名太长就截断加省略号，绝不让它顶到右边的百分比上。</summary>
+        private string FitText(Graphics g, string text, Font font, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return "--";
+            }
+
+            if (g.MeasureString(text, font).Width <= maxWidth)
+            {
+                return text;
+            }
+
+            string result = text;
+            while (result.Length > 2 && g.MeasureString(result + "\u2026", font).Width > maxWidth)
+            {
+                result = result.Substring(0, result.Length - 1);
+            }
+
+            return result + "\u2026";
+        }
+
+        // ─────────────────────── CPU ───────────────────────
 
         private void DrawCpuCard(Graphics g, SystemResourceSnapshot snapshot)
         {
             DrawCard(g, cpuCard);
             DrawCardHeader(g, cpuCard, "CPU", FormatPercent(heldCpu.Target), CpuColor);
 
-            g.DrawString(FitText(g, SystemInfoProvider.CpuName, smallFont, cpuCard.Width - 24),
-                smallFont, mutedBrush, cpuCard.Left + 12, cpuCard.Top + 24);
+            bool hasModel = PanelFieldSettings.IsVisible("cpu.model");
+            if (hasModel)
+            {
+                DrawCardSubTitle(g, cpuCard, SystemInfoProvider.CpuName, false);
+            }
 
-            DrawBar(g, cpuCard.Left + 12, cpuCard.Top + 42, cpuCard.Width - 24, heldCpu.Target, CpuColor);
+            int barY = cpuCard.Top + (hasModel ? 42 : 24);
+            DrawBar(g, cpuCard.Left + 12, barY, cpuCard.Width - 24, heldCpu.Target, CpuColor);
 
-            int column = (cpuCard.Width - 24) / 3;
-            int c1 = cpuCard.Left + 12;
-            int c2 = c1 + column;
-            int c3 = c2 + column;
+            List<FieldDef> fields = VisibleFields(CpuFields);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                values[i] = CpuFieldValue(fields[i].Id, snapshot);
+            }
 
-            DrawField(g, "\u901f\u5ea6", FormatGhz(snapshot.CpuMhz), c1, cpuCard.Top + 58, 30);
-            DrawField(g, "\u57fa\u51c6\u901f\u5ea6", FormatGhz(snapshot.CpuBaseMhz), c2, cpuCard.Top + 58, 52);
-            DrawField(g, "\u8fd0\u884c\u65f6\u957f", FormatUptime(snapshot.UptimeSeconds), c3, cpuCard.Top + 58, 52);
-
-            DrawField(g, "\u8fdb\u7a0b", FormatCount(snapshot.ProcessCount), c1, cpuCard.Top + 77, 30);
-            DrawField(g, "\u7ebf\u7a0b", FormatCount(snapshot.ThreadCount), c2, cpuCard.Top + 77, 30);
-            DrawField(g, "\u53e5\u67c4", FormatCount(snapshot.HandleCount), c3, cpuCard.Top + 77, 30);
-
-            DrawField(g, "\u5185\u6838", FormatInt(SystemInfoProvider.CpuCores), c1, cpuCard.Top + 96, 30);
-            DrawField(g, "\u903b\u8f91\u5904\u7406\u5668", FormatInt(SystemInfoProvider.CpuLogical), c2, cpuCard.Top + 96, 58);
-            DrawField(g, "\u63d2\u69fd", FormatInt(SystemInfoProvider.CpuPackages), c3, cpuCard.Top + 96, 30);
-
-            DrawField(g, "L1", FormatCache(SystemInfoProvider.L1Bytes), c1, cpuCard.Top + 115, 20);
-            DrawField(g, "L2", FormatCache(SystemInfoProvider.L2Bytes), c2, cpuCard.Top + 115, 20);
-            DrawField(g, "L3", FormatCache(SystemInfoProvider.L3Bytes), c3, cpuCard.Top + 115, 20);
+            DrawFieldGrid(g, cpuCard, barY + 16, 3, fields, values);
         }
+
+        private string CpuFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "cpu.speed": return FormatGhz(snapshot.CpuMhz);
+                case "cpu.base": return FormatGhz(snapshot.CpuBaseMhz);
+                case "cpu.uptime": return FormatUptime(snapshot.UptimeSeconds);
+                case "cpu.process": return FormatCount(snapshot.ProcessCount);
+                case "cpu.thread": return FormatCount(snapshot.ThreadCount);
+                case "cpu.handle": return FormatCount(snapshot.HandleCount);
+                case "cpu.cores": return FormatInt(SystemInfoProvider.CpuCores);
+                case "cpu.logical": return FormatInt(SystemInfoProvider.CpuLogical);
+                case "cpu.socket": return FormatInt(SystemInfoProvider.CpuPackages);
+                case "cpu.l1": return FormatCache(SystemInfoProvider.L1Bytes);
+                case "cpu.l2": return FormatCache(SystemInfoProvider.L2Bytes);
+                case "cpu.l3": return FormatCache(SystemInfoProvider.L3Bytes);
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 内存 ───────────────────────
 
         private void DrawMemoryCard(Graphics g, SystemResourceSnapshot snapshot)
         {
             DrawCard(g, memoryCard);
             DrawCardHeader(g, memoryCard, "\u5185\u5b58", FormatPercent(heldMemory.Target), MemoryColor);
 
-            string used = FormatGb(snapshot.MemoryUsedBytes) + "/" + FormatGb(snapshot.MemoryTotalBytes) + " GB";
-            g.DrawString(used, valueFont, darkBrush, memoryCard.Left + 12, memoryCard.Top + 24);
+            bool hasUsed = PanelFieldSettings.IsVisible("mem.used");
+            if (hasUsed)
+            {
+                string used = FormatGb(snapshot.MemoryUsedBytes) + "/" + FormatGb(snapshot.MemoryTotalBytes) + " GB";
+                DrawCardSubTitle(g, memoryCard, used, true);
+            }
 
-            DrawBar(g, memoryCard.Left + 12, memoryCard.Top + 42, memoryCard.Width - 24, heldMemory.Target, MemoryColor);
+            int barY = memoryCard.Top + (hasUsed ? 42 : 24);
+            DrawBar(g, memoryCard.Left + 12, barY, memoryCard.Width - 24, heldMemory.Target, MemoryColor);
 
-            int column = (memoryCard.Width - 24) / 3;
-            int c1 = memoryCard.Left + 12;
-            int c2 = c1 + column;
-            int c3 = c2 + column;
+            List<FieldDef> fields = VisibleFields(MemoryFields);
+            List<FieldDef> grid = new List<FieldDef>(fields.Count);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                // 「已用/总量」已经画在副标题上了，网格里不再重复一遍
+                if (string.Equals(fields[i].Id, "mem.used", StringComparison.Ordinal))
+                {
+                    continue;
+                }
 
-            DrawField(g, "\u53ef\u7528", FormatGb(snapshot.MemoryAvailableBytes) + " GB", c1, memoryCard.Top + 58, 30);
-            DrawField(g, "\u5df2\u7f13\u5b58", FormatGb(snapshot.MemoryCachedBytes) + " GB", c2, memoryCard.Top + 58, 42);
-            DrawField(g, "\u901f\u5ea6", FormatMemSpeed(), c3, memoryCard.Top + 58, 30);
+                grid.Add(fields[i]);
+                values[grid.Count - 1] = MemoryFieldValue(fields[i].Id, snapshot);
+            }
 
-            DrawField(g, "\u5df2\u63d0\u4ea4", FormatGb(snapshot.CommitUsedBytes) + "/" + FormatGb(snapshot.CommitLimitBytes) + " GB",
-                c1, memoryCard.Top + 79, 42);
-            DrawField(g, "\u5206\u9875\u6c60", FormatMb(snapshot.PagedPoolBytes), c2, memoryCard.Top + 79, 42);
-            DrawField(g, "\u975e\u5206\u9875", FormatMb(snapshot.NonPagedPoolBytes), c3, memoryCard.Top + 79, 42);
-
-            DrawField(g, "\u63d2\u69fd", SystemInfoProvider.MemorySlotsUsed + "/" + SystemInfoProvider.MemorySlotsTotal,
-                c1, memoryCard.Top + 98, 30);
-            DrawField(g, "\u7c7b\u578b", SystemInfoProvider.MemoryType, c2, memoryCard.Top + 98, 30);
-            DrawField(g, "\u5355\u6761", FormatModuleSize(), c3, memoryCard.Top + 98, 30);
+            DrawFieldGrid(g, memoryCard, barY + 16, 3, grid, values);
         }
+
+        private string MemoryFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "mem.available": return FormatGb(snapshot.MemoryAvailableBytes) + " GB";
+                case "mem.cached": return FormatGb(snapshot.MemoryCachedBytes) + " GB";
+                case "mem.speed": return FormatMemSpeed();
+                case "mem.commit": return FormatGb(snapshot.CommitUsedBytes) + "/" + FormatGb(snapshot.CommitLimitBytes) + " GB";
+                case "mem.paged": return FormatMb(snapshot.PagedPoolBytes);
+                case "mem.nonpaged": return FormatMb(snapshot.NonPagedPoolBytes);
+                case "mem.slot": return SystemInfoProvider.MemorySlotsUsed + "/" + SystemInfoProvider.MemorySlotsTotal;
+                case "mem.type": return SystemInfoProvider.MemoryType;
+                case "mem.module": return FormatModuleSize();
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 磁盘 ───────────────────────
 
         private void DrawDiskCard(Graphics g, SystemResourceSnapshot snapshot)
         {
@@ -2974,7 +3408,12 @@ namespace NetSpeedBall
 
             g.DrawString("\u78c1\u76d8", cardTitleFont, darkBrush, diskCard.Left + 18, diskCard.Top + 6);
 
+            bool showIo = PanelFieldSettings.IsVisible("disk.io");
+            bool showCapacity = PanelFieldSettings.IsVisible("disk.capacity");
+            bool showDetails = showIo || showCapacity;
+
             DiskActivityRow[] disks = snapshot.Disks;
+            int rowHeight = DiskRowHeight();
             int y = diskCard.Top + 24;
             for (int i = 0; i < rows; i++)
             {
@@ -2990,44 +3429,81 @@ namespace NetSpeedBall
 
                 DrawBar(g, diskCard.Left + 12, y + 15, diskCard.Width - 24, percent, DiskColor);
 
-                DrawField(g, "\u8bfb\u53d6", SpeedFormatter.Format(disk.ReadBytesPerSecond) + "/s",
-                    diskCard.Left + 12, y + 25, 28);
-                DrawField(g, "\u5199\u5165", SpeedFormatter.Format(disk.WriteBytesPerSecond) + "/s",
-                    diskCard.Left + 12 + (diskCard.Width - 24) / 3, y + 25, 28);
-                DrawField(g, "\u5bb9\u91cf", FormatCapacity(disk.CapacityBytes, disk.FreeBytes),
-                    diskCard.Left + 12 + (diskCard.Width - 24) * 2 / 3, y + 25, 28);
+                if (showDetails)
+                {
+                    int detailsY = y + 25;
+                    int x = diskCard.Left + 12;
+                    int columnWidth = (diskCard.Width - 24) / 3;
 
-                y += DiskRowHeight;
+                    if (showIo)
+                    {
+                        DrawField(g, "\u8bfb\u53d6", SpeedFormatter.Format(disk.ReadBytesPerSecond) + "/s", x, detailsY);
+                        DrawField(g, "\u5199\u5165", SpeedFormatter.Format(disk.WriteBytesPerSecond) + "/s",
+                            x + columnWidth, detailsY);
+                        x += columnWidth * 2;
+                    }
+
+                    if (showCapacity)
+                    {
+                        DrawField(g, "\u5bb9\u91cf", FormatCapacity(disk.CapacityBytes, disk.FreeBytes), x, detailsY);
+                    }
+                }
+
+                y += rowHeight;
             }
         }
+
+        // ─────────────────────── GPU ───────────────────────
 
         private void DrawGpuCard(Graphics g, SystemResourceSnapshot snapshot)
         {
             DrawCard(g, gpuCard);
             DrawCardHeader(g, gpuCard, "GPU", FormatPercent(heldGpu.Target), GpuColor);
 
-            g.DrawString(FitText(g, SystemInfoProvider.GpuName, smallFont, gpuCard.Width - 24),
-                smallFont, mutedBrush, gpuCard.Left + 12, gpuCard.Top + 24);
+            bool hasModel = PanelFieldSettings.IsVisible("gpu.model");
+            if (hasModel)
+            {
+                DrawCardSubTitle(g, gpuCard, SystemInfoProvider.GpuName, false);
+            }
 
-            DrawBar(g, gpuCard.Left + 12, gpuCard.Top + 42, gpuCard.Width - 24, heldGpu.Target, GpuColor);
+            int barY = gpuCard.Top + (hasModel ? 42 : 24);
+            DrawBar(g, gpuCard.Left + 12, barY, gpuCard.Width - 24, heldGpu.Target, GpuColor);
 
-            int column = (gpuCard.Width - 24) / 2;
-            int c1 = gpuCard.Left + 12;
-            int c2 = c1 + column;
+            List<FieldDef> fields = VisibleFields(GpuFields);
+            string[] values = new string[fields.Count];
+            for (int i = 0; i < fields.Count; i++)
+            {
+                values[i] = GpuFieldValue(fields[i].Id, snapshot);
+            }
 
-            ulong dedicatedTotal = SystemInfoProvider.GpuDedicatedBytes;
-            string dedicated = FormatGb(snapshot.GpuDedicatedUsed) + "/" + FormatGb(dedicatedTotal) + " GB";
-            string shared = FormatGb(snapshot.GpuSharedUsed) + "/" + FormatGb(snapshot.MemoryTotalBytes / 2) + " GB";
-
-            DrawField(g, "\u4e13\u7528\u663e\u5b58", dedicated, c1, gpuCard.Top + 56, 56);
-            DrawField(g, "\u5171\u4eab\u663e\u5b58", shared, c2, gpuCard.Top + 56, 56);
-
-            DrawField(g, "\u9a71\u52a8\u7248\u672c", SystemInfoProvider.GpuDriverVersion, c1, gpuCard.Top + 79, 56);
-            DrawField(g, "\u9a71\u52a8\u65e5\u671f", SystemInfoProvider.GpuDriverDate, c2, gpuCard.Top + 79, 56);
+            DrawFieldGrid(g, gpuCard, barY + 16, 2, fields, values);
         }
+
+        private string GpuFieldValue(string id, SystemResourceSnapshot snapshot)
+        {
+            switch (id)
+            {
+                case "gpu.dedicated":
+                    return FormatGb(snapshot.GpuDedicatedUsed) + "/" +
+                           FormatGb(SystemInfoProvider.GpuDedicatedBytes) + " GB";
+                case "gpu.shared":
+                    return FormatGb(snapshot.GpuSharedUsed) + "/" +
+                           FormatGb(snapshot.MemoryTotalBytes / 2) + " GB";
+                case "gpu.driver": return SystemInfoProvider.GpuDriverVersion;
+                case "gpu.date": return SystemInfoProvider.GpuDriverDate;
+                default: return "--";
+            }
+        }
+
+        // ─────────────────────── 网卡 ───────────────────────
 
         private void DrawLinkCard(Graphics g, SystemResourceSnapshot snapshot)
         {
+            if (linkCard.IsEmpty)
+            {
+                return;
+            }
+
             DrawCard(g, linkCard);
 
             using (Brush bar = new SolidBrush(LinkColor))
@@ -3055,27 +3531,7 @@ namespace NetSpeedBall
             }
         }
 
-        /// <summary>型号名太长就截断加省略号，绝不让它顶到右边的百分比上。</summary>
-        private string FitText(Graphics g, string text, Font font, int maxWidth)
-        {
-            if (string.IsNullOrEmpty(text))
-            {
-                return "--";
-            }
-
-            if (g.MeasureString(text, font).Width <= maxWidth)
-            {
-                return text;
-            }
-
-            string result = text;
-            while (result.Length > 2 && g.MeasureString(result + "\u2026", font).Width > maxWidth)
-            {
-                result = result.Substring(0, result.Length - 1);
-            }
-
-            return result + "\u2026";
-        }
+        // ─────────────────────── 格式化 ───────────────────────
 
         private static string FormatPercent(double value)
         {
@@ -3188,7 +3644,7 @@ namespace NetSpeedBall
             return span.Hours + ":" + span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
         }
 
-        /// <summary>容量按「剩余/总计」写，跟任务管理器磁盘页一个口径。</summary>
+        /// <summary>容量按「剩余/总计」写，跟任务管理器磁盘页一个口径。同一块盘的多个分区要加在一起。</summary>
         private static string FormatCapacity(long capacity, long free)
         {
             if (capacity <= 0)
@@ -3205,6 +3661,8 @@ namespace NetSpeedBall
 
             return freeGb.ToString("0") + "/" + totalGb.ToString("0") + " GB";
         }
+
+        // ─────────────────────── 曲线 ───────────────────────
 
         private void DrawGraph(Graphics g, Rectangle graph)
         {
@@ -3403,6 +3861,11 @@ namespace NetSpeedBall
                 faintBrush.Dispose();
                 downBrush.Dispose();
                 upBrush.Dispose();
+                if (fieldMenu != null)
+                {
+                    fieldMenu.Dispose();
+                }
+
                 resourceMonitor.Dispose();
             }
 
@@ -3410,7 +3873,6 @@ namespace NetSpeedBall
         }
     }
 
-    /// <summary>
     /// 一块物理磁盘的实时活动情况。
     /// </summary>
     internal struct DiskActivityRow
@@ -3528,15 +3990,20 @@ namespace NetSpeedBall
         private const int GpuRescanInterval = 5;
         /// <summary>网卡列表变化很慢，5 秒扫一次足够。</summary>
         private const int LinkRescanInterval = 5;
-        /// <summary>3D 引擎实例最多认这么多个，防止某些机器上几百个实例把一帧拖到几十毫秒。</summary>
-        private const int MaxGpuInstances = 24;
         /// <summary>
-        /// GPU 每几拍采一次。
-        /// 实测一台开着一堆程序的机器上，GPU Engine 分类能有两三百个实例，
-        /// 逐个取值一次要几十毫秒 —— 每秒都做，界面的 60 帧动画当场变卡。
-        /// 3 秒更新一次，肉眼看利用率曲线几乎没区别，CPU 开销降到三分之一以下。
+        /// 3D 引擎实例最多认这么多个。
+        /// 实测这台机器上有 68 个（每个开着 3D 上下文的进程一个），
+        /// 上限给到 96 是为了留余量，别把大占用进程漏掉。
         /// </summary>
-        private const int GpuSampleInterval = 3;
+        private const int MaxGpuInstances = 96;
+        /// <summary>
+        /// GPU 采样间隔（毫秒）。
+        ///
+        /// 为什么要单独开线程：3D 引擎实例实测有 68 个，逐个取一遍要二三十毫秒，
+        /// 放在 UI 线程上就是每秒卡一下。扔到后台线程之后，界面只管读缓存好的数字，
+        /// 一帧都不会掉；面板关掉时线程自动停，不白烧 CPU。
+        /// </summary>
+        private const int GpuSampleIntervalMs = 1000;
 
         private sealed class DiskCounter
         {
@@ -3571,8 +4038,10 @@ namespace NetSpeedBall
 
         private NetworkLinkRow[] linkRows = new NetworkLinkRow[0];
 
-        // GPU 不是每拍都采，没采的那几拍沿用上一次的数字
-        private int gpuSampleCountdown;
+        // GPU 在后台线程里采，UI 只读这几个缓存值
+        private readonly object gpuLock = new object();
+        private Thread gpuThread;
+        private volatile bool gpuThreadStop;
         private double gpuPercentCached;
         private ulong gpuDedicatedCached;
         private ulong gpuSharedCached;
@@ -3587,6 +4056,8 @@ namespace NetSpeedBall
 
         public void Dispose()
         {
+            StopGpuThread();
+
             foreach (DiskCounter counter in diskCounters.Values)            {
                 DisposeCounter(counter.Idle);
                 DisposeCounter(counter.Read);
@@ -3625,10 +4096,96 @@ namespace NetSpeedBall
             }
         }
 
-        /// <summary>让下一拍就重新读 GPU（截图自检用，正常运行时由倒计时控制）。</summary>
+        /// <summary>面板打开时把后台采 GPU 的线程拉起来，关掉时停掉，别在后台白烧 CPU。</summary>
+        public void SetActive(bool active)
+        {
+            if (active)
+            {
+                StartGpuThread();
+            }
+            else
+            {
+                StopGpuThread();
+            }
+        }
+
+        private void StartGpuThread()
+        {
+            lock (gpuLock)
+            {
+                if (gpuThread != null && gpuThread.IsAlive)
+                {
+                    return;
+                }
+
+                gpuThreadStop = false;
+                gpuThread = new Thread(GpuLoop);
+                gpuThread.IsBackground = true;
+                gpuThread.Name = "NetSpeedBall.GpuSampler";
+                gpuThread.Start();
+            }
+        }
+
+        private void StopGpuThread()
+        {
+            Thread thread;
+            lock (gpuLock)
+            {
+                thread = gpuThread;
+                gpuThread = null;
+                gpuThreadStop = true;
+            }
+
+            if (thread == null)
+            {
+                return;
+            }
+
+            try
+            {
+                thread.Join(1500);
+            }
+            catch
+            {
+            }
+        }
+
+        private void GpuLoop()
+        {
+            while (!gpuThreadStop)
+            {
+                lock (gpuLock)
+                {
+                    try
+                    {
+                        SampleGpuCore();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                // 分小段睡，停线程时不用等满一秒
+                for (int i = 0; i < 10 && !gpuThreadStop; i++)
+                {
+                    Thread.Sleep(GpuSampleIntervalMs / 10);
+                }
+            }
+        }
+
+        /// <summary>截图自检用：主线程立刻采一次，不等后台那一拍。</summary>
         public void ForceGpuSample()
         {
-            gpuSampleCountdown = 1;
+            lock (gpuLock)
+            {
+                try
+                {
+                    SampleGpuCore();
+                }
+                catch
+                {
+                }
+            }
         }
 
         public SystemResourceSnapshot Read()
@@ -3673,7 +4230,8 @@ namespace NetSpeedBall
 
             if (perfOk)
             {
-                snapshot.MemoryCachedBytes = ToBytes(perf.SystemCache, pageSize);
+                snapshot.MemoryCachedBytes = ReadCachedBytes(pageSize, totalMemory,
+                    ToBytes(perf.SystemCache, pageSize));
                 snapshot.CommitUsedBytes = ToBytes(perf.CommitTotal, pageSize);
                 snapshot.CommitLimitBytes = ToBytes(perf.CommitLimit, pageSize);
                 snapshot.PagedPoolBytes = ToBytes(perf.KernelPaged, pageSize);
@@ -3699,6 +4257,65 @@ namespace NetSpeedBall
             }
 
             return (ulong)value * pageSize;
+        }
+
+        /// <summary>
+        /// 算「已缓存」：待机页（Standby，按 8 个优先级 + 8 个备用优先级分组）+ 已修改页。
+        ///
+        /// 这块结构是内核直接吐的定长数组，一共 22 个指针宽度，顺序固定：
+        /// 0 零页 / 1 空闲页 / 2 已修改 / 3 已修改未写 / 4 坏页 / 5-12 待机页优先级 /
+        /// 13-20 备用优先级 / 21 页面文件里的已修改页。
+        /// 算出来的值还要过一道校验：超过物理内存总量就说明结构没对上，退回旧算法。
+        /// </summary>
+        private static ulong ReadCachedBytes(ulong pageSize, ulong totalMemory, ulong fallback)
+        {
+            try
+            {
+                int stride = IntPtr.Size;
+                int size = stride * 22;
+                byte[] buffer = new byte[size];
+                int returned = 0;
+                if (NativeMethods.NtQuerySystemInformation(
+                        NativeMethods.SystemMemoryListInformation, buffer, size, ref returned) != 0)
+                {
+                    return fallback;
+                }
+
+                long pages = ReadPointer(buffer, 2 * stride) + ReadPointer(buffer, 3 * stride);
+                for (int i = 5; i <= 20; i++)
+                {
+                    pages += ReadPointer(buffer, i * stride);
+                }
+
+                if (pages <= 0)
+                {
+                    return fallback;
+                }
+
+                ulong bytes = (ulong)pages * pageSize;
+                if (totalMemory > 0 && bytes > totalMemory)
+                {
+                    return fallback;
+                }
+
+                return bytes;
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private static long ReadPointer(byte[] buffer, int offset)
+        {
+            if (offset < 0 || offset + IntPtr.Size > buffer.Length)
+            {
+                return 0;
+            }
+
+            return IntPtr.Size == 8
+                ? BitConverter.ToInt64(buffer, offset)
+                : BitConverter.ToInt32(buffer, offset);
         }
 
         private double ReadCpuPercent()
@@ -3915,9 +4532,10 @@ namespace NetSpeedBall
         }
 
         /// <summary>
-        /// 从「1 D: E:」里挑一个盘符去问容量。
-        /// 同一块物理盘上的几个分区容量不同，这里只报第一个 —— 跟任务管理器一样，
-        /// 它列的也是整块盘，不细分到分区。
+        /// 从「1 D: E:」里把所有盘符的容量加起来。
+        ///
+        /// 一块物理盘可能分成 C: D: 两个分区，任务管理器磁盘页报的是整块盘，
+        /// 所以这里必须逐个盘符累加 —— 只取第一个会把 D: 那 243GB 直接吞掉。
         /// </summary>
         private static void ReadDiskCapacity(string instance, ref long capacity, ref long free)
         {
@@ -3928,37 +4546,36 @@ namespace NetSpeedBall
             }
 
             string volumes = instance.Substring(space + 1);
-            int letterIndex = -1;
+            long totalBytes = 0;
+            long freeBytes = 0;
+
             for (int i = 0; i + 1 < volumes.Length; i++)
             {
-                if (char.IsLetter(volumes[i]) && volumes[i + 1] == ':')
+                if (!char.IsLetter(volumes[i]) || volumes[i + 1] != ':')
                 {
-                    letterIndex = i;
-                    break;
-                }
-            }
-
-            if (letterIndex < 0)
-            {
-                return;
-            }
-
-            try
-            {
-                string root = volumes.Substring(letterIndex, 2) + "\\";
-                DriveInfo drive = new DriveInfo(root);
-                if (!drive.IsReady)
-                {
-                    return;
+                    continue;
                 }
 
-                capacity = drive.TotalSize;
-                free = drive.AvailableFreeSpace;
+                try
+                {
+                    string root = volumes.Substring(i, 2) + "\\";
+                    DriveInfo drive = new DriveInfo(root);
+                    if (drive.IsReady)
+                    {
+                        totalBytes += drive.TotalSize;
+                        freeBytes += drive.AvailableFreeSpace;
+                    }
+                }
+                catch
+                {
+                    // 光驱没盘、U 盘刚拔、BitLocker 没解锁，都会走到这里，静默跳过
+                }
+
+                i++;
             }
-            catch
-            {
-                // 光驱没盘、U 盘刚拔、BitLocker 没解锁，都会走到这里，静默跳过
-            }
+
+            capacity = totalBytes;
+            free = freeBytes;
         }
 
         /// <summary>
@@ -3970,18 +4587,17 @@ namespace NetSpeedBall
         /// </summary>
         private void ReadGpu(SystemResourceSnapshot snapshot)
         {
-            if (--gpuSampleCountdown <= 0)
+            // 这里只读后台线程算好的缓存值，一次锁的开销可以忽略
+            lock (gpuLock)
             {
-                gpuSampleCountdown = GpuSampleInterval;
-                SampleGpu();
+                snapshot.GpuPercent = gpuPercentCached;
+                snapshot.GpuDedicatedUsed = gpuDedicatedCached;
+                snapshot.GpuSharedUsed = gpuSharedCached;
             }
-
-            snapshot.GpuPercent = gpuPercentCached;
-            snapshot.GpuDedicatedUsed = gpuDedicatedCached;
-            snapshot.GpuSharedUsed = gpuSharedCached;
         }
 
-        private void SampleGpu()
+        /// <summary>必须在 gpuLock 里调：PerformanceCounter 不是线程安全的。</summary>
+        private void SampleGpuCore()
         {
             if (--gpuRescanCountdown <= 0)
             {
@@ -8301,6 +8917,168 @@ namespace NetSpeedBall
         }
     }
 
+    /// <summary>
+    /// 面板上哪些行该显示，用户自己说了算。
+    ///
+    /// 存的是「隐藏了哪些」，不是「显示了哪些」：以后版本加了新字段，
+    /// 默认就是显示的，旧配置不用迁移。注册表里存成一个逗号分隔的字符串，
+    /// 出问题时用 regedit 也能肉眼改。
+    /// </summary>
+    internal static class PanelFieldSettings
+    {
+        private const string SettingsKey = @"Software\NetSpeedBall";
+        private const string ValueName = "HiddenPanelFields";
+
+        private static readonly object Sync = new object();
+        private static HashSet<string> hidden;
+        private static bool loaded;
+
+        public static bool IsVisible(string id)
+        {
+            lock (Sync)
+            {
+                EnsureLoaded();
+                return !hidden.Contains(id);
+            }
+        }
+
+        public static void SetVisible(string id, bool visible)
+        {
+            if (string.IsNullOrEmpty(id))
+            {
+                return;
+            }
+
+            lock (Sync)
+            {
+                EnsureLoaded();
+                bool changed = visible ? hidden.Remove(id) : hidden.Add(id);
+                if (changed)
+                {
+                    Save();
+                }
+            }
+        }
+
+        public static void ShowAll()
+        {
+            lock (Sync)
+            {
+                EnsureLoaded();
+                if (hidden.Count == 0)
+                {
+                    return;
+                }
+
+                hidden.Clear();
+                Save();
+            }
+        }
+
+        /// <summary>「全部显示」之后把菜单里的勾重新同步一遍。</summary>
+        public static void SyncMenuChecks(ToolStripItemCollection items)
+        {
+            if (items == null)
+            {
+                return;
+            }
+
+            foreach (ToolStripItem item in items)
+            {
+                SyncMenuItems(item);
+            }
+        }
+
+        private static void SyncMenuItems(ToolStripItem item)
+        {
+            ToolStripMenuItem menuItem = item as ToolStripMenuItem;
+            if (menuItem == null)
+            {
+                return;
+            }
+
+            string id = menuItem.Tag as string;
+            if (id != null)
+            {
+                menuItem.Checked = IsVisible(id);
+            }
+
+            foreach (ToolStripItem child in menuItem.DropDownItems)
+            {
+                SyncMenuItems(child);
+            }
+        }
+
+        private static void EnsureLoaded()
+        {
+            if (loaded)
+            {
+                return;
+            }
+
+            loaded = true;
+            hidden = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(SettingsKey, false))
+                {
+                    if (key == null)
+                    {
+                        return;
+                    }
+
+                    string raw = key.GetValue(ValueName, string.Empty) as string;
+                    if (string.IsNullOrEmpty(raw))
+                    {
+                        return;
+                    }
+
+                    string[] parts = raw.Split(',');
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        string id = parts[i].Trim();
+                        if (id.Length > 0)
+                        {
+                            hidden.Add(id);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // 注册表读不了就当全部显示
+            }
+        }
+
+        private static void Save()
+        {
+            try
+            {
+                StringBuilder text = new StringBuilder();
+                foreach (string id in hidden)
+                {
+                    if (text.Length > 0)
+                    {
+                        text.Append(',');
+                    }
+
+                    text.Append(id);
+                }
+
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(SettingsKey))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue(ValueName, text.ToString(), RegistryValueKind.String);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
     internal static class AppSettings
     {
         private const string SettingsKey = @"Software\NetSpeedBall";
@@ -8797,6 +9575,8 @@ namespace NetSpeedBall
         public const uint RsMbProvider = 0x52534D42;
         /// <summary>「固件是否启用了虚拟化」这一项，任务管理器里的「虚拟化：已启用」就是它。</summary>
         public const int PfVirtualizationFirmwareEnabled = 21;
+        /// <summary>NtQuerySystemInformation 的「内存列表」信息类，能拿到待机/已修改页数。</summary>
+        public const int SystemMemoryListInformation = 80;
         public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_NOACTIVATE = 0x08000000;
 
@@ -8892,6 +9672,16 @@ namespace NetSpeedBall
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint GetSystemFirmwareTable(uint providerSignature, uint tableId,
             byte[] buffer, uint bufferSize);
+
+        /// <summary>
+        /// 任务管理器「已缓存」= 待机页 + 已修改页，只能从这条内核接口问。
+        /// GetPerformanceInfo 的 SystemCache 是「待机页 + 系统工作集」，比它大几百 MB，
+        /// 直接拿来当「已缓存」会跟任务管理器对不上。
+        /// 返回值 0 表示成功，非 0 是 NTSTATUS 错误码。
+        /// </summary>
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(int infoClass, byte[] buffer,
+            int length, ref int returnLength);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
