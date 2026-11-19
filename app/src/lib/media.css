@@ -207,20 +207,48 @@
   z-index: 80;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.78);
+}
+
+/* 舞台：图片能占的那块地方。
+   `flex: 1` + `min-height: 0` 是必须的 —— 少了 min-height，这一格会被内容
+   撑开，图片再大也不会自己被缩小，底下的工具栏直接被顶出窗外。 */
+.media__viewer-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 14px;
-  background: rgba(0, 0, 0, 0.72);
+  overflow: hidden;
+  /* 拖动平移时别触发浏览器自己的滚动与手势 */
+  touch-action: none;
 }
 
 .media__viewer-img {
-  max-width: 100%;
-  max-height: calc(100% - 46px);
-  /* 同样 `contain`：预览要看到整张图，不是被裁过的一块 */
+  /* 尺寸完全由 JS 算（适应窗口 / 缩放倍率）。
+     ⚠️ 这里**不能**再写 `max-width: 100%`：显式宽度也会被它夹住，
+     于是"放大"永远超不过舞台宽度 —— 那就是原来只能看、不能放大的原因。 */
+  max-width: none;
+  max-height: none;
+  /* 同样 `contain`：万一下面哪天又回到由 CSS 定尺寸，也别把图裁掉一块 */
   object-fit: contain;
   background: var(--bg-solid);
   border-radius: var(--radius-sm);
+  user-select: none;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* 超出舞台时才是可拖的，光标跟着说清楚 */
+.media__viewer-img--pannable {
+  cursor: grab;
+}
+
+.media__viewer-img--pannable:active {
+  cursor: grabbing;
 }
 
 .media__viewer-bar {
@@ -235,11 +263,51 @@
   font-size: var(--fs-xs);
 }
 
+/* 底部那条：面板只有 420px 宽，文件名 + 尺寸 + 缩放 + 关闭塞不下一行，
+   允许折行，且在窄的时候居中排 */
+.media__viewer-bar--controls {
+  flex-wrap: wrap;
+  justify-content: center;
+  row-gap: 4px;
+  align-self: center;
+}
+
 .media__viewer-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 200px;
+  max-width: 160px;
+}
+
+.media__viewer-meta {
+  color: rgba(255, 255, 255, 0.78);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.media__viewer-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+}
+
+/* 百分比本身是个按钮（点一下回到适应窗口），但长得像文字：
+   一排三个实心按钮会把「关闭」挤下去 */
+.media__viewer-zoom-value {
+  min-width: 42px;
+  padding: 3px 2px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: #fff;
+  font-family: var(--font);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.media__viewer-zoom-value:hover {
+  background: rgba(255, 255, 255, 0.16);
 }
 
 /* 预览层里的按钮要能在深色底上读清，所以自带配色，不用 `.btn` */
@@ -255,6 +323,14 @@
   font-family: var(--font);
   font-size: var(--fs-xs);
   cursor: default;
+}
+
+.media__viewer-btn--icon {
+  padding: 4px 6px;
+}
+
+.media__viewer-btn:disabled {
+  opacity: 0.35;
 }
 
 .media__viewer-btn:hover {

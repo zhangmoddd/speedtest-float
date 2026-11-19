@@ -22,6 +22,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -34,6 +35,7 @@ import {
   FileImage,
   Image as ImageIcon,
   Maximize2,
+  Minus,
   Plus,
   Send,
   Trash2,
@@ -61,7 +63,6 @@ import {
   applyMediaDeletion,
   referencedImageIdsExcluding,
   skippedNotice,
-  statsNotice,
   summarizeImport,
   thumbnailSize,
   type ImportOutcome,
@@ -448,6 +449,16 @@ export function useMediaLibrary(
       // 拿缩略图当输入会越缩越糊。
       const dataUrl = await api.mediaRead(media.id, true);
       const measured = await measureAndMakeThumb(dataUrl);
+
+      // 量到的尺寸**当场写回这个引用对象**。
+      //
+      // 这一步不能省：`media` 这个对象马上会被调用方塞进笔记的 `images[]`
+      // 存起来，而 Rust 侧导入时给的是 `width: 0, height: 0`（它不解码图片）。
+      // 不写回去，笔记里存的就是一份 0×0 的引用，之后每次打开编辑器都只能
+      // 显示「尺寸未知」—— 而盘上的 media/*.json 明明是对的，两处对不上。
+      if (measured.width > 0) media.width = measured.width;
+      if (measured.height > 0) media.height = measured.height;
+
       if (!measured.thumbBase64) {
         return "有一张图打不开，缩略图没生成（列表里会显示原图）";
       }
@@ -1045,6 +1056,20 @@ export function MediaSection({
   // 提示条只有一行，说清楚"再涨下去备份会变慢"才有用
   const bigWarning = stats ? largeLibraryNotice(stats.bytes) : null;
 
+  /**
+   * **这一条**笔记自己的图片占用。
+   *
+   * 不能拿 `media.stats` 显示在这里 —— 那是盘上整个媒体库的总和：包含
+   * 别的笔记的图，也包含笔记删掉之后留在 `media/` 里的孤儿文件。
+   * 放在缩略图下面会被读成"这条笔记有 N 张图"，而上面几行字正写着
+   * 「还没有图片」，两句话当场自相矛盾（实测：一条没有图的笔记显示
+   * 「图片 5 张 · 339 KB」）。
+   */
+  const ownBytes = images.reduce(
+    (sum, image) => sum + (Number.isFinite(image.bytes) ? image.bytes : 0),
+    0,
+  );
+
   return (
     <div className={`media${media.dropActive ? " media--drop" : ""}`}>
       <div className="media__head">
@@ -1103,12 +1128,17 @@ export function MediaSection({
         </div>
       )}
 
-      {/* 占用统计。数字走 `formatBytes`（人话），不要裸字节数 */}
-      {stats && (
-        <div className={`media__stats${bigWarning ? " media__stats--warn" : ""}`}>
-          {bigWarning ?? statsNotice(stats)}
+      {/* 占用统计。数字走 `formatBytes`（人话），不要裸字节数。
+          这一行说的是**这条笔记**，不是整个媒体库 —— 见 `ownBytes` 的说明 */}
+      {images.length > 0 && (
+        <div className="media__stats">
+          这条笔记 {images.length} 张 · {formatBytes(ownBytes)}
         </div>
       )}
+
+      {/* 媒体库整体的体积警告。只在真的越过阈值时出现，而且**必须写明
+          是媒体库** —— 它说的是盘上所有图片，不是这一条 */}
+      {bigWarning && <div className="media__stats media__stats--warn">媒体库：{bigWarning}</div>}
 
       {images.length > 0 && (
         <div className="media__empty">
@@ -1131,6 +1161,27 @@ export interface ImageViewerProps {
   /** 图片的右键菜单项来源，与缩略图格子同源（`useMediaAttachments.imageMenu`）。 */
   imageMenu: (image: MediaRef) => ContextMenuItem[];
 }
+
+/**
+ * 缩放档位：从 25% 到 400%，中间经过 100%（一个像素对一个像素）。
+ * 按钮按档位走，滚轮按倍率走（见 `WHEEL_STEP`）。
+ */
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 4;
+
+/**
+ * 「适应窗口」最多放大到几倍。
+ *
+ * 小图（表情、图标、几百像素的截图）按原始大小摆在 420px 的面板里会小得
+ * 看不清，那正是"点开大图还是很小很小"的来源。放大到装得下为止，但封顶
+ * 在这里：再往上只是把有限的像素糊成一片，没有新的信息。
+ */
+const FIT_MAX_UPSCALE = 2;
+
+/** 滚轮一格缩放多少。1.18 是试出来的：滚两格大约 ±40%，跟手又不跳。 */
+const WHEEL_STEP = 1.18;
 
 /**
  * 大图预览覆盖层。
@@ -1166,6 +1217,36 @@ export function ImageViewer({
   useEscapeToClose(onClose, () => !isContextMenuOpen());
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+
+  /**
+   * 图片**解码之后**的真实像素尺寸。
+   *
+   * 不能直接信 `image.width / image.height`：那是导入那一刻写进笔记里的引用，
+   * 而 Rust 导入时给的是 0（它不解码图片，见 `lib/api.ts` 的 `MediaRef.width`）。
+   * 早先存的笔记里全是 0，于是界面上写着「尺寸未知」，而图片明明好好的 ——
+   * 用户没法判断这张图多大、也被缩成了什么样。
+   *
+   * 以 `<img>` 自己报的 `naturalWidth/Height` 为准，元数据只当兜底，
+   * 两个都拿不到才说「尺寸未知」（那种情况只剩"图根本没读出来"）。
+   */
+  const [natural, setNatural] = useState({ w: 0, h: 0 });
+
+  /** 舞台（图片能占的那块地方）的尺寸。适应窗口与平移边界都按它算。 */
+  const [stage, setStage] = useState({ w: 0, h: 0 });
+
+  /**
+   * 缩放比。`null` = 适应窗口（跟着舞台大小自动算）；数字 = 相对**原图**的倍数。
+   *
+   * 相对原图而不是"相对当前"：百分比显示的就是真实倍率，100% 永远等于
+   * 一个像素对一个像素，不会随着窗口大小漂移。
+   */
+  const [zoom, setZoom] = useState<number | null>(null);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  /** 刚拖动过吗。拖完会补一个 click，不挡住的话"一松手预览就关了"。 */
+  const draggedRef = useRef(false);
 
   /**
    * 预览层里的菜单项：与缩略图格子上的那一份同源，只调两处。
@@ -1209,41 +1290,223 @@ export function ImageViewer({
     };
   }, [image.id]);
 
-  const size = image.width > 0 ? `${image.width}×${image.height}` : "尺寸未知";
+  const baseW = natural.w || image.width;
+  const baseH = natural.h || image.height;
+  /** 只要有一边知道尺寸就能算缩放。 */
+  const measured = baseW > 0 && baseH > 0;
+
+  /**
+   * 适应窗口的倍率。
+   *
+   * 上限**不是** 1：小图（表情、图标、几百像素的截图）按原始大小摆在
+   * 420px 的面板里会小得看不清 —— 那正是"点开大图还是很小很小"的来源。
+   * 这里让它放大到装得下为止，最多 2 倍：再往上只是把像素糊成一片。
+   */
+  const fitScale =
+    measured && stage.w > 0 && stage.h > 0
+      ? Math.min(FIT_MAX_UPSCALE, stage.w / baseW, stage.h / baseH)
+      : 1;
+
+  const scale = zoom ?? fitScale;
+  const percent = `${Math.round(scale * 100)}%`;
+  const pannable = baseW * scale > stage.w + 1 || baseH * scale > stage.h + 1;
+
+  const clampScale = (value: number) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value));
+
+  /** 平移不能把图片拖出视野：两边各露出一半就是极限。 */
+  const clampPan = (next: { x: number; y: number }, at: number) => {
+    const maxX = Math.max(0, (baseW * at - stage.w) / 2);
+    const maxY = Math.max(0, (baseH * at - stage.h) / 2);
+    return {
+      x: Math.min(maxX, Math.max(-maxX, next.x)),
+      y: Math.min(maxY, Math.max(-maxY, next.y)),
+    };
+  };
+
+  const applyZoom = (next: number | null) => {
+    if (next === null) {
+      setZoom(null);
+      setPan({ x: 0, y: 0 });
+      return;
+    }
+    const value = clampScale(next);
+    setZoom(value);
+    setPan((prev) => clampPan(prev, value));
+  };
+
+  /** 按档位缩放。用固定档位而不是每次乘 1.2：点几下就到整数倍，好读。 */
+  const stepZoom = (direction: 1 | -1) => {
+    const next =
+      direction > 0
+        ? ZOOM_STEPS.find((value) => value > scale + 0.001)
+        : [...ZOOM_STEPS].reverse().find((value) => value < scale - 0.001);
+    applyZoom(next ?? (direction > 0 ? ZOOM_MAX : ZOOM_MIN));
+  };
+
+  /**
+   * 滚轮缩放。
+   *
+   * 用原生监听而不是 React 的 `onWheel`：后者在 React 里是**被动**注册的，
+   * `preventDefault()` 不生效，滚轮会同时把面板里的内容滚走。
+   *
+   * 处理器每次渲染都换新（它要读最新的 `scale`），所以放进 ref 里，
+   * 监听本身只挂一次 —— 舞台是常驻节点，只在挂载 / 卸载时增删。
+   */
+  const wheelHandler = useRef<(event: WheelEvent) => void>(() => {});
+  wheelHandler.current = (event) => {
+    if (!measured) return;
+    event.preventDefault();
+    applyZoom(scale * (event.deltaY < 0 ? WHEEL_STEP : 1 / WHEEL_STEP));
+  };
+
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const onWheel = (event: WheelEvent) => wheelHandler.current(event);
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // 舞台尺寸跟着量：字号档位、滚动条、窗口变化都会改它，算一次是不够的
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0].contentRect;
+      setStage({ w: rect.width, h: rect.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    draggedRef.current = false;
+    // 装得下就不用拖（也拖不动）
+    if (!pannable) return;
+    dragRef.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) draggedRef.current = true;
+    setPan(clampPan({ x: drag.panX + dx, y: drag.panY + dy }, scale));
+  };
+
+  const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
 
   return (
     // 点背景关闭；里面那层要 stopPropagation，否则点图片也会关掉
-    <div className="media__viewer" onClick={onClose}>
-      {failed ? (
-        <div className="media__viewer-bar">
-          <TriangleAlert size={13} />
-          读不到这张图片，文件可能已被删除
-        </div>
-      ) : url ? (
-        <img
-          className="media__viewer-img"
-          src={url}
-          alt={image.name || "图片"}
-          draggable={false}
-          onClick={(e) => e.stopPropagation()}
-          // 右键：和缩略图格子同一套菜单（复制图片 / 键入到当前光标 / 另存为 / 删除）。
-          // `contextMenu.open` 内部会 `stopPropagation`，所以不会连带触发
-          // 外层那层"点背景关闭"
-          onContextMenu={(e) => contextMenu.open(e, () => items)}
-        />
-      ) : (
-        <div className="media__viewer-bar">
-          <FileImage size={13} />
-          正在读取…
-        </div>
-      )}
+    <div
+      className="media__viewer"
+      onClick={() => {
+        // 拖动结束浏览器会补一个 click，那不是"点背景"，不能关
+        if (draggedRef.current) {
+          draggedRef.current = false;
+          return;
+        }
+        onClose();
+      }}
+    >
+      <div
+        ref={stageRef}
+        className="media__viewer-stage"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+      >
+        {failed ? (
+          <div className="media__viewer-bar">
+            <TriangleAlert size={13} />
+            读不到这张图片，文件可能已被删除
+          </div>
+        ) : url ? (
+          <img
+            className={`media__viewer-img${pannable ? " media__viewer-img--pannable" : ""}`}
+            src={url}
+            alt={image.name || "图片"}
+            draggable={false}
+            /* 尺寸完全由 JS 算：显式宽高 + 平移量。交给 CSS 的 max-width
+               去夹的话，"放大"永远超不过舞台宽度 —— 那正是原来只能看、
+               不能放大的原因 */
+            style={
+              measured
+                ? {
+                    width: baseW * scale,
+                    height: baseH * scale,
+                    transform: `translate(${pan.x}px, ${pan.y}px)`,
+                  }
+                : undefined
+            }
+            onLoad={(event) => {
+              const img = event.currentTarget;
+              if (img.naturalWidth > 0) {
+                setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+              }
+            }}
+            onClick={(event) => event.stopPropagation()}
+            // 双击在「适应窗口」和「原始大小」之间来回
+            onDoubleClick={() => applyZoom(zoom === null ? 1 : null)}
+            // 右键：和缩略图格子同一套菜单（复制图片 / 键入到当前光标 / 另存为 / 删除）。
+            // `contextMenu.open` 内部会 `stopPropagation`，所以不会连带触发
+            // 外层那层"点背景关闭"
+            onContextMenu={(event) => contextMenu.open(event, () => items)}
+          />
+        ) : (
+          <div className="media__viewer-bar">
+            <FileImage size={13} />
+            正在读取…
+          </div>
+        )}
+      </div>
 
-      <div className="media__viewer-bar" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="media__viewer-bar media__viewer-bar--controls"
+        onClick={(event) => event.stopPropagation()}
+      >
         <span className="media__viewer-name" title={image.name}>
           {image.name || "图片"}
         </span>
-        <span>
-          {size} · {formatBytes(image.bytes)}
+        <span className="media__viewer-meta">
+          {measured ? `${baseW}×${baseH}` : "尺寸未知"} · {formatBytes(image.bytes)}
+        </span>
+        <span className="media__viewer-zoom">
+          <button
+            type="button"
+            className="media__viewer-btn media__viewer-btn--icon"
+            onClick={() => stepZoom(-1)}
+            disabled={!measured || scale <= ZOOM_MIN + 0.001}
+            title="缩小"
+          >
+            <Minus size={12} />
+          </button>
+          <button
+            type="button"
+            className="media__viewer-zoom-value"
+            onClick={() => applyZoom(null)}
+            title="点一下回到「适应窗口」"
+          >
+            {percent}
+          </button>
+          <button
+            type="button"
+            className="media__viewer-btn media__viewer-btn--icon"
+            onClick={() => stepZoom(1)}
+            disabled={!measured || scale >= ZOOM_MAX - 0.001}
+            title="放大"
+          >
+            <Plus size={12} />
+          </button>
         </span>
         <button type="button" className="media__viewer-btn" onClick={onClose}>
           <X size={12} />
