@@ -53,6 +53,8 @@ namespace NetSpeedBall
             }
 
             bool enableStartup = false;
+            bool parallelTest = false;
+            bool selfTestFields = false;
             if (args != null)
             {
                 for (int i = 0; i < args.Length; i++)
@@ -61,21 +63,39 @@ namespace NetSpeedBall
                     {
                         enableStartup = true;
                     }
+                    else if (string.Equals(args[i], "--parallel-test", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // 自检专用：另开一份互不干扰的实例，不跟用户正在用的那个抢锁
+                        parallelTest = true;
+                    }
+                    else if (string.Equals(args[i], "--self-test-fields", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // 自检专用：自动开面板、逐项隐藏，把窗口状态写进日志
+                        selfTestFields = true;
+                    }
                 }
             }
 
+            string mutexName = parallelTest
+                ? "NetSpeedBall.SingleInstance.Test." + Process.GetCurrentProcess().Id
+                : "NetSpeedBall.SingleInstance";
+
             bool createdNew;
-            using (Mutex singleInstance = new Mutex(true, "NetSpeedBall.SingleInstance", out createdNew))
+            using (Mutex singleInstance = new Mutex(true, mutexName, out createdNew))
             {
                 // 提权重启时同一个 exe 会被拉起第二次，而旧进程要过几百毫秒才退干净。
                 // 这段时间里锁还握着：新进程如果像平时那样"看到有人就退出"，结果就是两个都没了。
                 // 所以带 --enable-startup 时先等旧进程把锁放掉，最多等 8 秒。
                 bool owned = createdNew;
-                if (!owned && enableStartup)
+                if (!owned)
                 {
+                    // createdNew=false 有两种可能：
+                    // ① 真有一个实例在跑 → 抢锁会失败，走下面"亮出已有窗口"的分支；
+                    // ② 上一个实例被强杀、锁没人释放（句柄还被别的进程继承着）→ 抢得到。
+                    // 只认 createdNew 的话，② 会变成"双击毫无反应"，程序再也起不来。
                     try
                     {
-                        owned = singleInstance.WaitOne(8000);
+                        owned = singleInstance.WaitOne(enableStartup ? 8000 : 0);
                     }
                     catch (AbandonedMutexException)
                     {
@@ -107,7 +127,7 @@ namespace NetSpeedBall
                     return;
                 }
 
-                Application.Run(new SpeedBallApplication(enableStartup));
+                Application.Run(new SpeedBallApplication(enableStartup, selfTestFields && parallelTest));
             }
         }
     }
@@ -143,14 +163,18 @@ namespace NetSpeedBall
         private string powerPendingAction;
         private bool shutdownPending;
 
-        public SpeedBallApplication() : this(false)
+        public SpeedBallApplication() : this(false, false)
         {
         }
 
         /// <param name="enableElevatedStartup">
         /// 由提权重启带过来的开关：这一趟启动后把"登录时以最高权限启动"的计划任务建好。
         /// </param>
-        public SpeedBallApplication(bool enableElevatedStartup)
+        /// <param name="selfTestFields">
+        /// 自检用：启动后自动开面板、连续隐藏几项，把每一步的窗口状态写进日志。
+        /// 用来复现"取消勾选后面板消失"这类只在真实交互里出现的问题。
+        /// </param>
+        public SpeedBallApplication(bool enableElevatedStartup, bool selfTestFields)
         {
             appMonitor = new AppTrafficMonitor(trafficStore);
             ballForm = new SpeedBallForm(trafficStore);
@@ -265,6 +289,45 @@ namespace NetSpeedBall
                         "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
+
+            if (selfTestFields)
+            {
+                FormsTimer testTimer = new FormsTimer { Interval = 1500 };
+                testTimer.Tick += delegate
+                {
+                    testTimer.Stop();
+                    RunFieldSelfTest();
+                };
+                testTimer.Start();
+            }
+        }
+
+        /// <summary>
+        /// 自检：开面板，然后一项一项地隐藏，每一步都记下窗口是不是还活着。
+        /// 只有带 --parallel-test --self-test-fields 启动时才会跑，正常使用碰不到。
+        /// </summary>
+        private void RunFieldSelfTest()
+        {
+            SpeedDetailsForm.Trace("=== self test: open panel ===");
+            ballForm.ShowDetails();
+            string[] ids = { "cpu.speed", "net.graph", "nic.card", "cpu.model", "mem.speed" };
+            int index = 0;
+            FormsTimer step = new FormsTimer { Interval = 1200 };
+            step.Tick += delegate
+            {
+                if (index >= ids.Length)
+                {
+                    step.Stop();
+                    SpeedDetailsForm.Trace("=== self test done ===");
+                    return;
+                }
+
+                string id = ids[index++];
+                PanelFieldSettings.SetVisible(id, false);
+                SpeedDetailsForm.Trace("step hide " + id);
+                ballForm.RefreshDetailsLayout();
+            };
+            step.Start();
         }
 
         private void OnSampleTimer(object state)
@@ -1125,6 +1188,7 @@ namespace NetSpeedBall
         /// <summary>显示项改了之后让详情面板重排一次（窗口高度会跟着变）。</summary>
         public void RefreshDetailsLayout()
         {
+            SpeedDetailsForm.Trace("tray field change");
             if (detailsForm != null)
             {
                 detailsForm.ApplyFieldChange();
@@ -1347,7 +1411,13 @@ namespace NetSpeedBall
         {
             if (detailsForm.Visible)
             {
-                detailsForm.Hide();
+                // 面板开着的时候再点球，不再关它，只把它提到最前面。
+                //
+                // 原来是"单击开、单击关"，看着方便，实际是个陷阱：
+                // 右键球弹菜单、点完菜单项，鼠标就在球边上，手稍微一动就点到球上，
+                // 面板"啪"地消失，用户还以为是菜单干的。日志里连着复现两次都是这个原因。
+                // 关面板有明确的入口 —— 右上角的 ✕，那个不会误触。
+                detailsForm.BringToFront();
                 return;
             }
 
@@ -2444,6 +2514,7 @@ namespace NetSpeedBall
         protected override void OnVisibleChanged(EventArgs e)
         {
             base.OnVisibleChanged(e);
+            Trace("visible=" + Visible + " " + BoundsText(this));
             resourceMonitor.SetActive(Visible);
         }
 
@@ -2463,11 +2534,89 @@ namespace NetSpeedBall
             Invalidate();
         }
 
+        /// <summary>
+        /// 诊断日志：只有排查"点菜单后面板消失"这类问题时才需要看。
+        /// 写到 %LOCALAPPDATA%\NetSpeedBall\details-debug.log，正常使用时每次操作一行。
+        /// </summary>
+        public static void Trace(string message)
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "NetSpeedBall");
+                Directory.CreateDirectory(dir);
+                string file = Path.Combine(dir, "details-debug.log");
+
+                // 诊断日志只在操作时写几行，但也不能让它无限长：超过半兆就重来。
+                try
+                {
+                    FileInfo info = new FileInfo(file);
+                    if (info.Exists && info.Length > 512 * 1024)
+                    {
+                        File.Delete(file);
+                    }
+                }
+                catch
+                {
+                }
+
+                File.AppendAllText(file,
+                    DateTime.Now.ToString("HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string BoundsText(Form form)
+        {
+            return form.Width + "x" + form.Height + "@" + form.Left + "," + form.Top +
+                   " visible=" + form.Visible;
+        }
+
         /// <summary>显示项改了之后重排窗口：卡片高度跟着变，窗口也得跟着变。</summary>
         public void ApplyFieldChange()
         {
-            SyncHeight();
-            Invalidate();
+            bool wasVisible = Visible;
+            Trace("apply requested " + BoundsText(this));
+
+            // 不能在菜单的点击回调里直接改窗口尺寸：那一瞬间 ToolStrip 还在处理鼠标消息，
+            // owner 窗口突然变高变矮会打乱它关闭流程。等这轮消息处理完再动手。
+            try
+            {
+                BeginInvoke(new Action(delegate
+                {
+                    Trace("apply before " + BoundsText(this));
+                    SyncHeight();
+                    Invalidate();
+
+                    // 兜底：改显示项绝不该把面板弄没。真被谁藏了，这里当场请回来，
+                    // 日志里会留下是谁藏的（SetVisibleCore 那段会打调用栈）。
+                    if (wasVisible && !Visible)
+                    {
+                        Trace("!!! panel disappeared during field change, restoring");
+                        Show();
+                    }
+
+                    Trace("apply after " + BoundsText(this));
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+                // 窗口已经销毁，没什么可重排的
+            }
+        }
+
+        /// <summary>记下每一次被隐藏的调用栈，用来抓"面板自己消失"的真凶。</summary>
+        protected override void SetVisibleCore(bool value)
+        {
+            if (!value && Visible)
+            {
+                Trace("hide requested:\r\n" + Environment.StackTrace);
+            }
+
+            base.SetVisibleCore(value);
         }
 
         /// <summary>
@@ -2707,6 +2856,7 @@ namespace NetSpeedBall
                 return;
             }
 
+            Trace("sync height " + Height + " -> " + height);
             Height = height;
 
             try
@@ -2945,8 +3095,27 @@ namespace NetSpeedBall
         public static ToolStripMenuItem BuildFieldMenuItem(Action onChanged)
         {
             ToolStripMenuItem root = new ToolStripMenuItem("\u9762\u677f\u663e\u793a\u9879");
+            KeepOpenOnItemClick(root.DropDown);
             BuildFieldMenuItems(root.DropDownItems, onChanged);
             return root;
+        }
+
+        /// <summary>
+        /// 让这一层菜单在点完菜单项之后不要自动收起来。
+        ///
+        /// ToolStrip 默认是"点一项就关"，可改显示项的时候往往要连着调好几项，
+        /// 每点一次就得重新右键、重新展开子菜单、再一项一项找，非常烦。
+        /// 这里只拦「点菜单项」这一种关闭原因：点空白、按 Esc、切窗口照样正常关闭。
+        /// </summary>
+        private static void KeepOpenOnItemClick(ToolStripDropDown dropDown)
+        {
+            dropDown.Closing += delegate(object sender, ToolStripDropDownClosingEventArgs e)
+            {
+                if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked)
+                {
+                    e.Cancel = true;
+                }
+            };
         }
 
         private static void BuildFieldMenuItems(ToolStripItemCollection items, Action onChanged)
@@ -2986,6 +3155,7 @@ namespace NetSpeedBall
             if (group != null)
             {
                 parent = new ToolStripMenuItem(group);
+                KeepOpenOnItemClick(parent.DropDown);
                 items.Add(parent);
             }
 
@@ -3000,6 +3170,7 @@ namespace NetSpeedBall
                 {
                     ToolStripMenuItem source = (ToolStripMenuItem)item;
                     PanelFieldSettings.SetVisible((string)source.Tag, source.Checked);
+                    Trace("menu " + source.Tag + " checked=" + source.Checked);
                     if (onChanged != null)
                     {
                         onChanged();
@@ -3031,7 +3202,7 @@ namespace NetSpeedBall
                 return;
             }
 
-            if (e.Button == MouseButtons.Left && CloseButtonBounds.Contains(e.Location))
+            if (e.Button == MouseButtons.Left && closeHover && CloseButtonBounds.Contains(e.Location))
             {
                 closeHover = false;
                 Cursor = Cursors.Default;
