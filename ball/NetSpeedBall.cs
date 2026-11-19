@@ -43,6 +43,12 @@ namespace NetSpeedBall
                     TrafficWindow.SavePreview(args[1]);
                     return;
                 }
+
+                if (string.Equals(args[0], "--render-power", StringComparison.OrdinalIgnoreCase))
+                {
+                    PowerScheduleForm.SavePreview(args[1]);
+                    return;
+                }
             }
 
             bool enableStartup = false;
@@ -672,7 +678,7 @@ namespace NetSpeedBall
             AddPowerPreset(root, "2 \u5c0f\u65f6\u540e\u5173\u673a", 120);
             root.DropDownItems.Add(new ToolStripSeparator());
             root.DropDownItems.Add(new ToolStripMenuItem(
-                "\u81ea\u5b9a\u4e49\uff08\u5173\u673a / \u91cd\u542f / \u7761\u7720 / \u9501\u5b9a\uff09\u2026", null, OnPowerCustom));
+                "\u81ea\u5b9a\u4e49\uff08\u53ef\u9009\u65e5\u671f\u65f6\u95f4\uff09\u2026", null, OnPowerCustom));
             root.DropDownItems.Add(new ToolStripSeparator());
             root.DropDownItems.Add(new ToolStripMenuItem("\u7acb\u5373\u7761\u7720", null, OnSleepNow));
             root.DropDownItems.Add(new ToolStripMenuItem("\u7acb\u5373\u9501\u5b9a", null, OnLockNow));
@@ -704,7 +710,7 @@ namespace NetSpeedBall
                     return;
                 }
 
-                SchedulePower(dialog.SelectedAction, dialog.Minutes);
+                SchedulePowerAt(dialog.SelectedAction, dialog.When);
             }
         }
 
@@ -732,11 +738,35 @@ namespace NetSpeedBall
         /// </summary>
         private void SchedulePower(string action, int minutes)
         {
+            SchedulePowerAt(action, DateTime.Now.AddMinutes(minutes));
+        }
+
+        /// <summary>
+        /// 安排一次电源动作，到一个**绝对时刻**执行。
+        ///
+        /// 预设菜单（「30 分钟后关机」那些）最终也走这里：菜单给的是分钟数，
+        /// 换算成时刻之后只剩一条执行路径，不必维护两套逻辑。
+        ///
+        /// 关机和重启交给 shutdown.exe 的 /t（它接受的最大值是 315360000 秒），
+        /// 所以程序退出之后计划依然有效。代价是这个倒计时挂在系统的关机流程上，
+        /// 中途重启电脑就没了 —— 对话框里写明了这一条。
+        /// </summary>
+        private void SchedulePowerAt(string action, DateTime when)
+        {
             CancelPower(false);
 
-            if (minutes <= 0)
+            double seconds = (when - DateTime.Now).TotalSeconds;
+            if (seconds <= 0)
             {
                 ExecutePower(action);
+                return;
+            }
+
+            // 排到一年以外没有意义：没人记得住，中途也一定会重启。
+            if (seconds > 365.0 * 24 * 3600)
+            {
+                MessageBox.Show("只能安排在一年之内。", "网络测速球",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -746,7 +776,7 @@ namespace NetSpeedBall
                 string comment = action == "restart"
                     ? "\u7f51\u7edc\u6d4b\u901f\u7403\uff1a\u5b9a\u65f6\u91cd\u542f"
                     : "\u7f51\u7edc\u6d4b\u901f\u7403\uff1a\u5b9a\u65f6\u5173\u673a";
-                if (!RunShutdown(flag + " /t " + (minutes * 60) + " /c \"" + comment + "\""))
+                if (!RunShutdown(flag + " /t " + (int)Math.Ceiling(seconds) + " /c \"" + comment + "\""))
                 {
                     MessageBox.Show("\u5b89\u6392\u5931\u8d25\uff1a\u7cfb\u7edf\u62d2\u7edd\u4e86\u5173\u673a\u547d\u4ee4\u3002",
                         "\u7f51\u7edc\u6d4b\u901f\u7403", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -758,11 +788,11 @@ namespace NetSpeedBall
             else
             {
                 powerPendingAction = action;
-                powerDeadline = DateTime.Now.AddMinutes(minutes);
+                powerDeadline = when;
             }
 
-            trayIcon.ShowBalloonTip(4000, "\u5df2\u5b89\u6392" + PowerActionName(action),
-                minutes + " \u5206\u949f\u540e" + PowerActionName(action) +
+            trayIcon.ShowBalloonTip(4000, "已安排" + PowerActionName(action),
+                PowerScheduleForm.DescribeMoment(when) + PowerActionName(action) +
                 "\u3002\u8981\u53d6\u6d88\uff1a\u53f3\u952e\u60ac\u6d6e\u7403 \u2192 \u5b9a\u65f6\u5173\u673a \u2192 \u53d6\u6d88\u5b9a\u65f6\u4efb\u52a1\u3002",
                 ToolTipIcon.Info);
         }
@@ -6109,17 +6139,23 @@ namespace NetSpeedBall
     }
 
     /// <summary>
-    /// 「定时关机」的自定义对话框：选分钟数和动作（关机 / 重启 / 睡眠 / 锁定）。
+    /// 「定时关机」的自定义对话框：选一个**时刻**和动作（关机 / 重启 / 睡眠 / 锁定）。
+    ///
+    /// 两种说法都支持：从现在算多少分钟，或者直接指定哪天的几点几分。
+    /// 预设菜单只给到「2 小时后」，而实际要排的往往是「明天下午两点五分」这种，
+    /// 光靠分钟数得自己算半天，还算错。
     /// </summary>
     internal sealed class PowerScheduleForm : Form
     {
-        private readonly NumericUpDown minutesBox;
+        private readonly RadioButton modeDelay;
+        private readonly RadioButton modeMoment;
+        private readonly NumericUpDown amountBox;
+        private readonly ComboBox unitBox;
+        private readonly DateTimePicker datePicker;
+        private readonly DateTimePicker timePicker;
         private readonly ComboBox actionBox;
-
-        public int Minutes
-        {
-            get { return (int)minutesBox.Value; }
-        }
+        private readonly Label previewLabel;
+        private readonly Button okButton;
 
         public string SelectedAction
         {
@@ -6139,6 +6175,23 @@ namespace NetSpeedBall
             }
         }
 
+        /// <summary>
+        /// 用户最终选定的执行时刻。
+        /// </summary>
+        public DateTime When
+        {
+            get
+            {
+                if (modeMoment.Checked)
+                {
+                    return datePicker.Value.Date + timePicker.Value.TimeOfDay;
+                }
+
+                int amount = (int)amountBox.Value;
+                return DateTime.Now.AddMinutes(unitBox.SelectedIndex == 1 ? amount * 60 : amount);
+            }
+        }
+
         public PowerScheduleForm()
         {
             Text = "\u5b9a\u65f6\u5173\u673a";
@@ -6148,62 +6201,239 @@ namespace NetSpeedBall
             MinimizeBox = false;
             ShowInTaskbar = false;
             TopMost = true;
-            ClientSize = new Size(300, 134);
-            Font = new Font("Segoe UI", 9.0f);
+            ClientSize = new Size(396, 216);
+            Font = new Font("Microsoft YaHei UI", 9.0f);
+            BackColor = Color.White;
 
-            Label timeLabel = new Label();
-            timeLabel.Text = "\u591a\u4e45\u4e4b\u540e\uff1f";
-            timeLabel.AutoSize = true;
-            timeLabel.Location = new Point(16, 20);
-            Controls.Add(timeLabel);
+            // ---- 第一行：从现在算多少 ----
+            modeDelay = new RadioButton();
+            modeDelay.Text = "从现在算";
+            modeDelay.AutoSize = true;
+            modeDelay.Location = new Point(16, 19);
+            Controls.Add(modeDelay);
 
-            minutesBox = new NumericUpDown();
-            minutesBox.Minimum = 1;
-            minutesBox.Maximum = 1440;
-            minutesBox.Value = 30;
-            minutesBox.Location = new Point(104, 17);
-            minutesBox.Width = 70;
-            Controls.Add(minutesBox);
+            amountBox = new NumericUpDown();
+            amountBox.Minimum = 1;
+            amountBox.Maximum = 9999;
+            amountBox.Value = 30;
+            amountBox.Location = new Point(128, 17);
+            amountBox.Width = 64;
+            Controls.Add(amountBox);
 
-            Label unitLabel = new Label();
-            unitLabel.Text = "\u5206\u949f\u540e";
-            unitLabel.AutoSize = true;
-            unitLabel.Location = new Point(180, 20);
-            Controls.Add(unitLabel);
+            unitBox = new ComboBox();
+            unitBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            unitBox.Items.AddRange(new object[] { "分钟后", "小时后" });
+            unitBox.SelectedIndex = 0;
+            unitBox.Location = new Point(198, 17);
+            unitBox.Width = 76;
+            Controls.Add(unitBox);
 
+            // ---- 第二行：哪天的几点 ----
+            modeMoment = new RadioButton();
+            modeMoment.Text = "指定时刻";
+            modeMoment.AutoSize = true;
+            modeMoment.Location = new Point(16, 51);
+            modeMoment.Checked = true;
+            Controls.Add(modeMoment);
+
+            datePicker = new DateTimePicker();
+            datePicker.Format = DateTimePickerFormat.Custom;
+            datePicker.CustomFormat = "yyyy 年 M 月 d 日";
+            datePicker.Location = new Point(128, 49);
+            datePicker.Width = 148;
+            Controls.Add(datePicker);
+
+            timePicker = new DateTimePicker();
+            timePicker.Format = DateTimePickerFormat.Custom;
+            timePicker.CustomFormat = "HH:mm";
+            timePicker.ShowUpDown = true;
+            timePicker.Location = new Point(284, 49);
+            timePicker.Width = 76;
+            Controls.Add(timePicker);
+
+            // 初值给「一小时后的整五分」，比默认值更接近真实意图。
+            // 跨天时日期一起跟上，否则会得到"今天 00:30"这种已经过去的时刻。
+            DateTime soon = RoundUpToFiveMinutes(DateTime.Now.AddHours(1));
+            datePicker.Value = soon.Date;
+            timePicker.Value = soon;
+
+            // ---- 动作 ----
             Label actionLabel = new Label();
-            actionLabel.Text = "\u52a8\u4f5c";
+            actionLabel.Text = "动作";
             actionLabel.AutoSize = true;
-            actionLabel.Location = new Point(16, 58);
+            actionLabel.ForeColor = Color.FromArgb(71, 85, 105);
+            actionLabel.Location = new Point(16, 90);
             Controls.Add(actionLabel);
 
             actionBox = new ComboBox();
             actionBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            actionBox.Items.AddRange(new object[]
-            {
-                "\u5173\u673a", "\u91cd\u542f", "\u7761\u7720", "\u9501\u5b9a"
-            });
+            actionBox.Items.AddRange(new object[] { "关机", "重启", "睡眠", "锁定" });
             actionBox.SelectedIndex = 0;
-            actionBox.Location = new Point(104, 55);
-            actionBox.Width = 100;
+            actionBox.Location = new Point(128, 87);
+            actionBox.Width = 96;
             Controls.Add(actionBox);
 
-            Button okButton = new Button();
-            okButton.Text = "\u786e\u5b9a";
+            Panel divider = new Panel();
+            divider.BackColor = Color.FromArgb(232, 237, 244);
+            divider.Location = new Point(16, 124);
+            divider.Size = new Size(364, 1);
+            Controls.Add(divider);
+
+            // ---- 结果预览 ----
+            // 这一行不是装饰：日期和时间分两个框选，很容易只改了时间忘了日期，
+            // 或者把"明天"选成"今天"。这里把最终会执行的时刻写成人话再确认一遍。
+            previewLabel = new Label();
+            previewLabel.AutoSize = false;
+            previewLabel.Location = new Point(16, 132);
+            previewLabel.Size = new Size(364, 22);
+            previewLabel.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
+            Controls.Add(previewLabel);
+
+            Label hintLabel = new Label();
+            hintLabel.Text = "关机和重启由系统执行，中途重启电脑会让计划失效。";
+            hintLabel.AutoSize = false;
+            hintLabel.ForeColor = Color.FromArgb(150, 160, 175);
+            hintLabel.Font = new Font("Microsoft YaHei UI", 8.0f);
+            hintLabel.Location = new Point(16, 156);
+            hintLabel.Size = new Size(364, 20);
+            Controls.Add(hintLabel);
+
+            okButton = new Button();
+            okButton.Text = "确定";
             okButton.DialogResult = DialogResult.OK;
-            okButton.Location = new Point(148, 96);
-            okButton.Size = new Size(64, 26);
+            okButton.Location = new Point(244, 180);
+            okButton.Size = new Size(64, 28);
             Controls.Add(okButton);
 
             Button cancelButton = new Button();
-            cancelButton.Text = "\u53d6\u6d88";
+            cancelButton.Text = "取消";
             cancelButton.DialogResult = DialogResult.Cancel;
-            cancelButton.Location = new Point(220, 96);
-            cancelButton.Size = new Size(64, 26);
+            cancelButton.Location = new Point(316, 180);
+            cancelButton.Size = new Size(64, 28);
             Controls.Add(cancelButton);
 
             AcceptButton = okButton;
             CancelButton = cancelButton;
+
+            // 事件全部绑在最后。RadioButton 之间会互相取消选中，给一个
+            // Checked = true 就会触发另一个的 CheckedChanged，而那个时刻
+            // 下面的日期框、预览行、确定按钮都还没建出来。
+            modeDelay.CheckedChanged += OnModeChanged;
+            modeMoment.CheckedChanged += OnModeChanged;
+            amountBox.ValueChanged += OnModeChanged;
+            unitBox.SelectedIndexChanged += OnModeChanged;
+            datePicker.ValueChanged += OnModeChanged;
+            timePicker.ValueChanged += OnModeChanged;
+            actionBox.SelectedIndexChanged += OnModeChanged;
+
+            OnModeChanged(null, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// 把对话框原样渲染成 PNG，只给 <c>--render-power 路径</c> 自检用。
+        /// </summary>
+        public static void SavePreview(string path)
+        {
+            using (PowerScheduleForm dialog = new PowerScheduleForm())
+            {
+                // 必须先 Show 出来再画：DrawToBitmap 对还没创建句柄的子控件
+                // 会画出空白，而这里几乎全是子控件。
+                dialog.Show();
+                Application.DoEvents();
+
+                using (Bitmap bitmap = new Bitmap(dialog.Width, dialog.Height))
+                {
+                    dialog.DrawToBitmap(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+                    bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+        }
+
+        private static DateTime RoundUpToFiveMinutes(DateTime value)
+        {
+            DateTime floored = new DateTime(value.Year, value.Month, value.Day,
+                value.Hour, value.Minute, 0);
+            int add = 5 - floored.Minute % 5;
+            return floored.AddMinutes(add);
+        }
+
+        /// <summary>
+        /// 切换模式时把另一组控件禁用，同时刷新预览。
+        /// 禁用而不只是不管它：两组都在可编辑状态时，用户改错了那一组也看不出来。
+        /// </summary>
+        private void OnModeChanged(object sender, EventArgs e)
+        {
+            bool moment = modeMoment.Checked;
+            amountBox.Enabled = !moment;
+            unitBox.Enabled = !moment;
+            datePicker.Enabled = moment;
+            timePicker.Enabled = moment;
+            UpdatePreview();
+        }
+
+        private void UpdatePreview()
+        {
+            DateTime when = When;
+            string action = PowerActionText(actionBox.SelectedIndex);
+            previewLabel.Text = "将在 " + DescribeMoment(when) + " " + action + "。";
+
+            bool past = when <= DateTime.Now;
+            previewLabel.ForeColor = past
+                ? Color.FromArgb(198, 45, 45)
+                : Color.FromArgb(37, 99, 235);
+            if (past)
+            {
+                previewLabel.Text = "这个时刻已经过去了，换一个。";
+            }
+
+            okButton.Enabled = !past;
+        }
+
+        private static string PowerActionText(int index)
+        {
+            switch (index)
+            {
+                case 1:
+                    return "重启";
+                case 2:
+                    return "睡眠";
+                case 3:
+                    return "锁定";
+                default:
+                    return "关机";
+            }
+        }
+
+        /// <summary>
+        /// 把时刻写成人话：今天 14:05 / 明天 14:05 / 11 月 30 日 14:05。
+        /// 通知气泡里也用这一句，两边说法保持一致。
+        /// </summary>
+        internal static string DescribeMoment(DateTime when)
+        {
+            DateTime now = DateTime.Now;
+            string time = when.ToString("HH:mm");
+
+            if (when.Date == now.Date)
+            {
+                return "今天 " + time;
+            }
+
+            if (when.Date == now.Date.AddDays(1))
+            {
+                return "明天 " + time;
+            }
+
+            if (when.Date == now.Date.AddDays(2))
+            {
+                return "后天 " + time;
+            }
+
+            if (when.Year == now.Year)
+            {
+                return when.Month + " 月 " + when.Day + " 日 " + time;
+            }
+
+            return when.ToString("yyyy 年 M 月 d 日 ") + time;
         }
     }
 
