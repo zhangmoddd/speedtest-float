@@ -2495,6 +2495,9 @@ namespace NetSpeedBall
             Text = "System details";
             // 静态信息（CPU 型号、内存条频率、GPU 名字）在后台读一次，读好了自动重绘。
             SystemInfoProvider.EnsureLoading(delegate { Invalidate(); });
+            // 性能计数器第一次创建要花好几秒（等系统的计数器注册表），
+            // 现在就把这条最贵的路在后台走掉，别等面板打开时再让 UI 线程等。
+            resourceMonitor.PrimeAsync();
             Size = new Size(430, 780);
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -2625,10 +2628,16 @@ namespace NetSpeedBall
         /// </summary>
         public void PrimeResources()
         {
-            resourceSnapshot = resourceMonitor.Read();
-            heldCpu.Snap(resourceSnapshot.CpuPercent);
-            heldMemory.Snap(resourceSnapshot.MemoryPercent);
-            heldGpu.Snap(resourceSnapshot.GpuPercent);
+            // 预热已经跑完就同步读一次（只要几毫秒）；没跑完就用后台那份缓存，
+            // 一份都没有就先按空数据把窗口摆出来 —— 绝不能在 UI 线程上等那几秒。
+            resourceSnapshot = resourceMonitor.IsPrimed || resourceMonitor.PrimeFailed
+                ? resourceMonitor.Read()
+                : resourceMonitor.WaitForPrime(120);
+
+            SystemResourceSnapshot snapshot = resourceSnapshot ?? SystemResourceSnapshot.Empty;
+            heldCpu.Snap(snapshot.CpuPercent);
+            heldMemory.Snap(snapshot.MemoryPercent);
+            heldGpu.Snap(snapshot.GpuPercent);
             shownCpu = heldCpu.Target;
             shownMemory = heldMemory.Target;
             shownGpu = heldGpu.Target;
@@ -2638,7 +2647,7 @@ namespace NetSpeedBall
                 heldDisks.Add(new HeldValue(0.2, 1.0));
             }
 
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            DiskActivityRow[] disks = snapshot.Disks;
             int count = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
             if (shownDisks.Length != count)
             {
@@ -2661,19 +2670,29 @@ namespace NetSpeedBall
 
             // 面板没显示的时候没必要每秒去翻性能计数器 —— 那些东西要读注册表、
             // 枚举磁盘和 GPU 实例，白白占 CPU。流量曲线照记，资源数据等打开时再补。
-            if (Visible || resourceSnapshot == null)
+            //
+            // 注意这里绝不能为了"填上第一份数据"就在 UI 线程读：性能计数器的第一次
+            // 初始化实测要 4.9 秒，正好卡在启动那一刻，球会僵住。预热交给后台线程，
+            // 没预热完就先用空数据画，下一拍自然会补上。
+            if (Visible && (resourceMonitor.IsPrimed || resourceMonitor.PrimeFailed))
             {
                 resourceSnapshot = resourceMonitor.Read();
                 SyncHeight();
             }
+            else if (resourceSnapshot == null)
+            {
+                resourceSnapshot = resourceMonitor.CachedSnapshot;
+            }
+
+            SystemResourceSnapshot live = resourceSnapshot ?? SystemResourceSnapshot.Empty;
 
             heldDownload.Update(sample.DownloadBytesPerSecond);
             heldUpload.Update(sample.UploadBytesPerSecond);
-            heldCpu.Update(resourceSnapshot.CpuPercent);
-            heldMemory.Update(resourceSnapshot.MemoryPercent);
-            heldGpu.Update(resourceSnapshot.GpuPercent);
+            heldCpu.Update(live.CpuPercent);
+            heldMemory.Update(live.MemoryPercent);
+            heldGpu.Update(live.GpuPercent);
 
-            DiskActivityRow[] disks = resourceSnapshot.Disks;
+            DiskActivityRow[] disks = live.Disks;
             int diskCount = disks == null ? 0 : Math.Min(disks.Length, MaxDiskRows);
             while (heldDisks.Count < diskCount)
             {
@@ -4209,6 +4228,18 @@ namespace NetSpeedBall
 
         private NetworkLinkRow[] linkRows = new NetworkLinkRow[0];
 
+        // 性能计数器第一次被创建时，.NET 要先把整套计数器注册表灌进内存。
+        // 实测这台机器上「Processor Frequency」这一下要 4.9 秒（ReadCpuMhz 里）。
+        // 那 4.9 秒要是落在 UI 线程上，就是启动后悬浮球僵住几秒 —— 所以第一次读
+        // 永远放到后台线程去做（PrimeAsync），UI 只用读好的那份缓存。
+        private readonly object readLock = new object();
+        private readonly object primeLock = new object();
+        private readonly object primeSync = new object();
+        private Thread primeThread;
+        private bool primed;
+        private bool primeFailed;
+        private SystemResourceSnapshot primedSnapshot;
+
         // GPU 在后台线程里采，UI 只读这几个缓存值
         private readonly object gpuLock = new object();
         private Thread gpuThread;
@@ -4359,7 +4390,114 @@ namespace NetSpeedBall
             }
         }
 
+        /// <summary>后台把第一次（最贵的那次）读数跑完没有。没跑完之前 UI 别碰 Read()。</summary>
+        public bool IsPrimed
+        {
+            get { lock (primeLock) { return primed; } }
+        }
+
+        /// <summary>
+        /// 预热已经彻底失败。这种机器上就别再指望后台那份缓存了：
+        /// 退回"打开面板时同步读"，慢，但至少数字是有的。
+        /// </summary>
+        public bool PrimeFailed
+        {
+            get { lock (primeLock) { return primeFailed; } }
+        }
+
+        /// <summary>后台预热读出来的那一份，UI 线程直接拿，不用等。</summary>
+        public SystemResourceSnapshot CachedSnapshot
+        {
+            get { lock (primeLock) { return primedSnapshot; } }
+        }
+
+        /// <summary>
+        /// 起一条后台线程把第一次读数跑掉。只跑一次，重复调用无害。
+        /// 优先级压到 BelowNormal：这活是纯等待（等 Perflib 把注册表吐出来），
+        /// 不该跟开机那一刻的绘制抢 CPU。
+        /// </summary>
+        public void PrimeAsync()
+        {
+            lock (primeLock)
+            {
+                if (primeThread != null)
+                {
+                    return;
+                }
+
+                primeThread = new Thread(PrimeWorker);
+                primeThread.IsBackground = true;
+                primeThread.Name = "nsb-resource-prime";
+                primeThread.Priority = ThreadPriority.BelowNormal;
+                primeFailed = false;
+                primeThread.Start();
+            }
+        }
+
+        private void PrimeWorker()
+        {
+            try
+            {
+                Read();
+            }
+            catch
+            {
+                // 预热失败就当没预热过，面板打开时再同步读一次
+                lock (primeLock)
+                {
+                    primeThread = null;
+                    primeFailed = true;
+                }
+
+                lock (primeSync)
+                {
+                    Monitor.PulseAll(primeSync);
+                }
+                return;
+            }
+
+            lock (primeSync)
+            {
+                Monitor.PulseAll(primeSync);
+            }
+        }
+
+        /// <summary>
+        /// 等预热完成。只给"面板已经打开、但预热还没跑完"这条罕见路径用，
+        /// 最多等 timeoutMs，等不到就返回 null（面板先画空数据，下一拍自己补上）。
+        /// </summary>
+        public SystemResourceSnapshot WaitForPrime(int timeoutMs)
+        {
+            lock (primeSync)
+            {
+                if (!IsPrimed)
+                {
+                    Monitor.Wait(primeSync, timeoutMs);
+                }
+            }
+
+            return CachedSnapshot;
+        }
+
         public SystemResourceSnapshot Read()
+        {
+            // 预热线程和 UI 线程可能同时进来，PerformanceCounter 不是线程安全的，
+            // 这里串起来；后台那次跑完之后 UI 再读只要几毫秒，不会被挡太久。
+            lock (readLock)
+            {
+                SystemResourceSnapshot snapshot = ReadCore();
+                lock (primeLock)
+                {
+                    primedSnapshot = snapshot;
+                    primed = true;
+                    primeFailed = false;
+                }
+
+                return snapshot;
+            }
+        }
+
+        private SystemResourceSnapshot ReadCore()
         {
             SystemResourceSnapshot snapshot = new SystemResourceSnapshot();
 
