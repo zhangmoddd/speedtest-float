@@ -1103,6 +1103,8 @@ namespace NetSpeedBall
         private bool closingForExit;
         private Rectangle dockArea;
         private DateTime lastAnimationFrame = DateTime.UtcNow;
+        /// <summary>画球时的缩放比例。正常绘制 = DPI 比例，离屏出图 = 1（图就是 122 见方）。</summary>
+        private float drawScale = UiScale.Factor;
         /// <summary>右键菜单关掉的时刻，用来挡掉"菜单刚关、手一抖点到球"的那一下。</summary>
         private DateTime menuClosedUtc = DateTime.MinValue;
         private static readonly TimeSpan MenuClickGuard = TimeSpan.FromMilliseconds(400);
@@ -1148,11 +1150,11 @@ namespace NetSpeedBall
             MinimumSize = Size;
             MaximumSize = Size;
 
-            labelFont = new Font("Segoe UI", 6.8f, FontStyle.Bold, GraphicsUnit.Point);
-            speedFont = new Font("Segoe UI", 25.0f, FontStyle.Bold, GraphicsUnit.Point);
-            unitFont = new Font("Segoe UI", 8.8f, FontStyle.Regular, GraphicsUnit.Point);
-            statFont = new Font("Segoe UI", 10.5f, FontStyle.Bold, GraphicsUnit.Point);
-            statArrowFont = new Font("Segoe UI", 12.5f, FontStyle.Bold, GraphicsUnit.Point);
+            labelFont = UiScale.Font(6.8f, FontStyle.Bold);
+            speedFont = UiScale.Font(25.0f, FontStyle.Bold);
+            unitFont = UiScale.Font(8.8f, FontStyle.Regular);
+            statFont = UiScale.Font(10.5f, FontStyle.Bold);
+            statArrowFont = UiScale.Font(12.5f, FontStyle.Bold);
 
             animationTimer = new FormsTimer { Interval = 33 };
             animationTimer.Tick += OnAnimationTick;
@@ -1246,9 +1248,11 @@ namespace NetSpeedBall
         /// <summary>用户在设置里改了缩放：球按新比例换尺寸，形状必须还是正圆。</summary>
         public void ApplyUiScale()
         {
+            drawScale = UiScale.Factor;
             int pixels = UiScale.Px(BallSize);
             if (Width == pixels && Height == pixels)
             {
+                Invalidate();
                 return;
             }
 
@@ -1305,6 +1309,7 @@ namespace NetSpeedBall
             using (Bitmap bitmap = new Bitmap(preview.Width, preview.Height))
             using (Graphics g = Graphics.FromImage(bitmap))
             {
+                // 按当前 DPI 出图，跟屏幕上看到的一模一样
                 g.Clear(Color.Transparent);
                 preview.currentSample = new SpeedSample(850.0 * 1024.0, 25.6 * 1024.0, true);
                 preview.heldDownload.Snap(850.0 * 1024.0);
@@ -1694,8 +1699,11 @@ namespace NetSpeedBall
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            // 球里所有坐标都按 96 DPI 的 122×122 设计稿写，画之前整体乘 DPI 比例。
+            // 不这么做的话字号会跟着 DPI 变大、文字位置却不动，数字就会压到下面的单位上。
+            g.ScaleTransform(drawScale, drawScale);
 
-            Rectangle rect = new Rectangle(5, 5, Width - 11, Height - 11);
+            Rectangle rect = new Rectangle(5, 5, BallSize - 11, BallSize - 11);
             if (launchAnimating || overLaunchPad)
             {
                 DrawLaunchRocketMode(g, rect);
@@ -1982,8 +1990,8 @@ namespace NetSpeedBall
         {
             if (!currentSample.HasAnyAdapter)
             {
-                DrawCenteredLine(g, "\u79bb\u7ebf", speedFont, 35, Color.FromArgb(28, 34, 48), Width - 30);
-                DrawCenteredLine(g, "WAITING", unitFont, 70, Color.FromArgb(104, 118, 136), Width - 44);
+                DrawCenteredLine(g, "\u79bb\u7ebf", speedFont, 35, Color.FromArgb(28, 34, 48), BallSize - 30);
+                DrawCenteredLine(g, "WAITING", unitFont, 70, Color.FromArgb(104, 118, 136), BallSize - 44);
                 return;
             }
 
@@ -1994,8 +2002,8 @@ namespace NetSpeedBall
             string up = SpeedFormatter.FormatCompact(heldUpload.Target);
 
             // 三行文字上移 5px，给沿外圈顺时针经过下方的火箭留出空间。
-            DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), Width - 30);
-            DrawCenteredLine(g, main.Unit, unitFont, 61, Color.FromArgb(70, 84, 102), Width - 48);
+            DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), BallSize - 30);
+            DrawCenteredLine(g, main.Unit, unitFont, 61, Color.FromArgb(70, 84, 102), BallSize - 48);
             DrawStatPair(g, "\u2191", up, "\u2193", down, 79);
         }
 
@@ -2023,7 +2031,7 @@ namespace NetSpeedBall
                     downArrow, down, arrowGap, pairGap);
             }
 
-            float x = (Width - total) / 2.0f;
+            float x = (BallSize - total) / 2.0f;
             float numY = y;
             float arrowY = y - (arrowFont.Height - valueFont.Height) / 2.0f;
 
