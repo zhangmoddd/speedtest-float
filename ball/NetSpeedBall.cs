@@ -906,6 +906,10 @@ namespace NetSpeedBall
                 try
                 {
                     ballForm.ApplyUiScale();
+                    if (trafficWindow != null && !trafficWindow.IsDisposed)
+                    {
+                        trafficWindow.ApplyUiScale();
+                    }
                 }
                 catch
                 {
@@ -1258,6 +1262,10 @@ namespace NetSpeedBall
             if (detailsForm != null)
             {
                 detailsForm.ApplyUiScale();
+            }
+            if (launchPadForm != null)
+            {
+                launchPadForm.ApplyUiScale();
             }
 
             Invalidate();
@@ -6252,13 +6260,20 @@ namespace NetSpeedBall
         private static readonly Color Track = Color.FromArgb(237, 241, 247);
 
         private readonly TrafficStore store;
-        private readonly Font sectionFont = new Font("Microsoft YaHei UI", 9.2f, FontStyle.Bold);
-        private readonly Font valueFont = new Font("Microsoft YaHei UI", 14.5f, FontStyle.Bold);
-        private readonly Font smallFont = new Font("Microsoft YaHei UI", 8.6f, FontStyle.Regular);
-        private readonly Font tinyFont = new Font("Microsoft YaHei UI", 7.8f, FontStyle.Regular);
+        private Font sectionFont;
+        private Font valueFont;
+        private Font smallFont;
+        private Font tinyFont;
         private readonly ToolTip toolTip = new ToolTip();
         private readonly FormsTimer refreshTimer;
         private readonly MonthCalendar calendar;
+
+        /// <summary>设计稿的客户区尺寸。真实尺寸 = 它 × DPI 比例。</summary>
+        private const int LW = 720;
+        private const int LH = 760;
+
+        /// <summary>当前 DPI 比例。坐标全按 96 DPI 写，画之前整体乘它。</summary>
+        private float uiScale;
 
         // 顶部那一排全是自绘的：原生 Button 是灰底 3D 边，跟下面的卡片放在一起
         // 像两个年代的软件拼起来的。命中区在构造时算好，点击靠坐标判断。
@@ -6284,7 +6299,11 @@ namespace NetSpeedBall
         {
             store = trafficStore;
             Text = "流量统计";
-            ClientSize = new Size(720, 760);
+            // 自绘界面，尺寸和字体都由自己按 DPI 算，别让 WinForms 自动缩放（它只会拉宽）
+            AutoScaleMode = AutoScaleMode.None;
+            uiScale = UiScale.Factor;
+            BuildFonts();
+            ClientSize = new Size(UiScale.Px(LW), UiScale.Px(LH));
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -6329,9 +6348,59 @@ namespace NetSpeedBall
             refreshTimer.Start();
         }
 
-        /// <summary>
-        /// 算好顶部控件的命中区。布局只依赖固定的 ClientSize，所以只算一次。
-        /// </summary>
+        private void BuildFonts()
+        {
+            if (sectionFont != null)
+            {
+                sectionFont.Dispose();
+            }
+            if (valueFont != null)
+            {
+                valueFont.Dispose();
+            }
+            if (smallFont != null)
+            {
+                smallFont.Dispose();
+            }
+            if (tinyFont != null)
+            {
+                tinyFont.Dispose();
+            }
+
+            sectionFont = UiScale.Font(9.2f, FontStyle.Bold, "Microsoft YaHei UI");
+            valueFont = UiScale.Font(14.5f, FontStyle.Bold, "Microsoft YaHei UI");
+            smallFont = UiScale.Font(8.6f, FontStyle.Regular, "Microsoft YaHei UI");
+            tinyFont = UiScale.Font(7.8f, FontStyle.Regular, "Microsoft YaHei UI");
+        }
+
+        /// <summary>鼠标给的是真实像素，判断命中前换算回设计稿坐标。</summary>
+        private Point ToLogical(Point point)
+        {
+            if (uiScale <= 0)
+            {
+                return point;
+            }
+
+            return new Point((int)Math.Round(point.X / uiScale), (int)Math.Round(point.Y / uiScale));
+        }
+
+        /// <summary>用户改了缩放：字体、客户区、命中区全部重算。</summary>
+        public void ApplyUiScale()
+        {
+            float next = UiScale.Factor;
+            if (Math.Abs(next - uiScale) < 0.01f)
+            {
+                return;
+            }
+
+            uiScale = next;
+            BuildFonts();
+            ClientSize = new Size(UiScale.Px(LW), UiScale.Px(LH));
+            LayoutChrome();
+            Invalidate();
+        }
+
+        /// <summary>算好顶部控件的命中区。布局只依赖固定的 ClientSize，所以只算一次。</summary>
         private void LayoutChrome()
         {
             // 五个快捷范围做成一条分段控件：整组一个浅色底，选中项白底加粗。
@@ -6353,7 +6422,7 @@ namespace NetSpeedBall
             // 右侧两个日期胶囊，右对齐
             const int chipHeight = 30;
             const int chipWidth = 104;
-            int right = ClientSize.Width - PadX;
+            int right = LW - PadX;
             chipRects[1] = new Rectangle(right - chipWidth, segTop, chipWidth, chipHeight);
             chipRects[0] = new Rectangle(chipRects[1].Left - chipWidth - 26, segTop, chipWidth, chipHeight);
         }
@@ -6488,8 +6557,9 @@ namespace NetSpeedBall
         {
             base.OnMouseMove(e);
 
-            int preset = HitPreset(e.Location);
-            int chip = chipRects[0].Contains(e.Location) ? 0 : (chipRects[1].Contains(e.Location) ? 1 : -1);
+            Point point = ToLogical(e.Location);
+            int preset = HitPreset(point);
+            int chip = chipRects[0].Contains(point) ? 0 : (chipRects[1].Contains(point) ? 1 : -1);
             Cursor = (preset >= 0 || chip >= 0) ? Cursors.Hand : Cursors.Default;
 
             bool chromeDirty = preset != hoverPreset || chip != hoverChip;
@@ -6502,10 +6572,10 @@ namespace NetSpeedBall
 
             int index = -1;
             if (rangeDays.Count > 0 && chartPlot.Width > 0 && chartSlot > 0 &&
-                e.X >= chartPlot.Left && e.X <= chartPlot.Right &&
-                e.Y >= chartPlot.Top - 24 && e.Y <= chartPlot.Bottom)
+                point.X >= chartPlot.Left && point.X <= chartPlot.Right &&
+                point.Y >= chartPlot.Top - 24 && point.Y <= chartPlot.Bottom)
             {
-                index = (e.X - chartPlot.Left) / chartSlot;
+                index = (point.X - chartPlot.Left) / chartSlot;
                 if (index < 0 || index >= rangeDays.Count)
                 {
                     index = -1;
@@ -6520,10 +6590,10 @@ namespace NetSpeedBall
             hoverDayIndex = index;
             if (index >= 0)
             {
-                DayPoint point = rangeDays[index];
-                DateTime day = TrafficStore.FromDateInt(point.Date);
+                DayPoint dayPoint = rangeDays[index];
+                DateTime day = TrafficStore.FromDateInt(dayPoint.Date);
                 toolTip.SetToolTip(this, day.ToString("M月d日 ddd") + "\r\n下载 " +
-                    SpeedFormatter.Format(point.Rx) + "\r\n上传 " + SpeedFormatter.Format(point.Tx));
+                    SpeedFormatter.Format(dayPoint.Rx) + "\r\n上传 " + SpeedFormatter.Format(dayPoint.Tx));
             }
             else
             {
@@ -6572,18 +6642,19 @@ namespace NetSpeedBall
                 calendar.Visible = false;
             }
 
-            int preset = HitPreset(e.Location);
+            Point point = ToLogical(e.Location);
+            int preset = HitPreset(point);
             if (preset >= 0)
             {
                 ApplyPreset(presetTags[preset]);
                 return;
             }
 
-            if (chipRects[0].Contains(e.Location))
+            if (chipRects[0].Contains(point))
             {
                 OpenCalendar(true);
             }
-            else if (chipRects[1].Contains(e.Location))
+            else if (chipRects[1].Contains(point))
             {
                 OpenCalendar(false);
             }
@@ -6599,11 +6670,12 @@ namespace NetSpeedBall
             calendar.SetDate(current);
 
             Rectangle chip = chipRects[from ? 0 : 1];
-            int left = Math.Min(chip.Left, ClientSize.Width - calendar.Width - 8);
-            int top = chip.Bottom + 4;
+            // 日历是原生控件，坐标是真实像素，而 chipRects 是设计稿坐标，这里换算一次
+            int left = Math.Min(UiScale.Px(chip.Left), ClientSize.Width - calendar.Width - 8);
+            int top = UiScale.Px(chip.Bottom + 4);
             if (top + calendar.Height > ClientSize.Height - 8)
             {
-                top = chip.Top - calendar.Height - 4;
+                top = UiScale.Px(chip.Top) - calendar.Height - 4;
             }
 
             calendar.Location = new Point(Math.Max(4, left), Math.Max(4, top));
@@ -6618,6 +6690,8 @@ namespace NetSpeedBall
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            // 画布整体按 DPI 放大，下面的坐标全按 96 DPI 的设计稿写
+            g.ScaleTransform(uiScale, uiScale);
 
             DrawChrome(g);
 
@@ -6640,7 +6714,7 @@ namespace NetSpeedBall
             using (Brush note = new SolidBrush(Faint))
             {
                 g.DrawString("排行榜按 TCP 连接统计，不含 UDP/QUIC 与协议头开销 · 数据只存本机，年占用不足 1 MB",
-                    tinyFont, note, PadX, ClientSize.Height - 22);
+                    tinyFont, note, PadX, LH - 22);
             }
         }
 
@@ -6721,7 +6795,7 @@ namespace NetSpeedBall
             long perDay = total / dayCount;
 
             const int gap = 12;
-            int width = (ClientSize.Width - PadX * 2 - gap * 3) / 4;
+            int width = (LW - PadX * 2 - gap * 3) / 4;
             string[] labels = { "下载", "上传", "合计", "日均" };
             string[] values =
             {
@@ -6763,7 +6837,7 @@ namespace NetSpeedBall
 
         private void DrawDailyChart(Graphics g)
         {
-            Rectangle panel = new Rectangle(PadX, 152, ClientSize.Width - PadX * 2, ChartHeight);
+            Rectangle panel = new Rectangle(PadX, 152, LW - PadX * 2, ChartHeight);
             DrawCardSurface(g, panel);
 
             using (Brush heading = new SolidBrush(Ink))
@@ -6957,7 +7031,7 @@ namespace NetSpeedBall
 
         private void DrawRankList(Graphics g)
         {
-            Rectangle card = new Rectangle(PadX, 388, ClientSize.Width - PadX * 2, 340);
+            Rectangle card = new Rectangle(PadX, 388, LW - PadX * 2, 340);
             DrawCardSurface(g, card);
 
             using (Brush heading = new SolidBrush(Ink))
@@ -7216,10 +7290,15 @@ namespace NetSpeedBall
     {
         private bool active;
 
+        /// <summary>设计稿尺寸；真实尺寸 = 它 × DPI 比例。</summary>
+        private const int LW = 258;
+        private const int LH = 148;
+
         public LaunchPadForm()
         {
             Text = "LaunchPad";
-            Size = new Size(258, 148);
+            AutoScaleMode = AutoScaleMode.None;
+            Size = new Size(UiScale.Px(LW), UiScale.Px(LH));
             MinimumSize = Size;
             MaximumSize = Size;
             StartPosition = FormStartPosition.Manual;
@@ -7275,13 +7354,33 @@ namespace NetSpeedBall
             UpdateWindowRegion();
         }
 
+        /// <summary>DPI 改了：按下新比例换尺寸，形状不会变形。</summary>
+        public void ApplyUiScale()
+        {
+            Size target = new Size(UiScale.Px(LW), UiScale.Px(LH));
+            if (Size == target)
+            {
+                return;
+            }
+
+            MinimumSize = Size.Empty;
+            MaximumSize = Size.Empty;
+            Size = target;
+            MinimumSize = target;
+            MaximumSize = target;
+            UpdateWindowRegion();
+            Invalidate();
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            // 坐标按 96 DPI 的设计稿写，整体按 DPI 放大
+            g.ScaleTransform(UiScale.Factor, UiScale.Factor);
 
-            Rectangle rect = new Rectangle(3, 3, Width - 7, Height - 7);
+            Rectangle rect = new Rectangle(3, 3, LW - 7, LH - 7);
             using (GraphicsPath shell = CreateRoundedRectangle(rect, 28))
             using (LinearGradientBrush background = new LinearGradientBrush(rect,
                        active ? Color.FromArgb(252, 255, 255) : Color.FromArgb(252, 253, 255),
@@ -7293,7 +7392,7 @@ namespace NetSpeedBall
                 g.DrawPath(edge, shell);
             }
 
-            PointF center = new PointF(Width / 2.0f, 76.0f);
+            PointF center = new PointF(LW / 2.0f, 76.0f);
             DrawEnergyRings(g, center);
             DrawPadBase(g);
         }
@@ -9152,6 +9251,9 @@ namespace NetSpeedBall
         public PowerScheduleForm()
         {
             Text = "\u5b9a\u65f6\u5173\u673a";
+            // 这个对话框是原生控件拼的，坐标按 96 DPI 设计稿写死，
+            // 构造完再统一乘一次 DPI 比例 —— WinForms 自带的自动缩放只会拉宽，靠不住。
+            AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;
@@ -9284,6 +9386,60 @@ namespace NetSpeedBall
             actionBox.SelectedIndexChanged += OnModeChanged;
 
             OnModeChanged(null, EventArgs.Empty);
+
+            ScaleForDpi();
+        }
+
+        /// <summary>
+        /// 按当前 DPI 把对话框和里面每个控件一起放大。
+        ///
+        /// 只放位置和尺寸，不放字体 —— 字体是「磅」，系统已经按 DPI 放大过一次了，
+        /// 再乘一遍就成了两倍大，字会从框里挤出去。
+        /// </summary>
+        private void ScaleForDpi()
+        {
+            float scale = UiScale.Factor;
+            if (Math.Abs(scale - 1f) < 0.01f)
+            {
+                return;
+            }
+
+            SuspendLayout();
+            ClientSize = new Size(UiScale.Px(396), UiScale.Px(216));
+            ScaleControls(this, 396, 216);
+            ResumeLayout(true);
+        }
+
+        private static void ScaleControls(Control parent, int designWidth, int designHeight)
+        {
+            foreach (Control control in parent.Controls)
+            {
+                int left = control.Left;
+                int top = control.Top;
+                int width = control.Width;
+                int height = control.Height;
+                // 右下角对齐的控件：按到右边界/下边界的距离算，放大后依然贴边
+                bool rightAligned = left + width >= designWidth - 4;
+                bool bottomAligned = top + height >= designHeight - 4;
+
+                if (!control.AutoSize)
+                {
+                    int newWidth = UiScale.Px(width);
+                    int newHeight = UiScale.Px(height);
+                    control.Size = new Size(newWidth, newHeight);
+                    control.Left = rightAligned
+                        ? UiScale.Px(designWidth) - newWidth - UiScale.Px(designWidth - left - width)
+                        : UiScale.Px(left);
+                    control.Top = bottomAligned
+                        ? UiScale.Px(designHeight) - newHeight - UiScale.Px(designHeight - top - height)
+                        : UiScale.Px(top);
+                }
+                else
+                {
+                    control.Left = UiScale.Px(left);
+                    control.Top = UiScale.Px(top);
+                }
+            }
         }
 
         /// <summary>
@@ -10370,7 +10526,12 @@ namespace NetSpeedBall
         /// <summary>按设计稿的磅值造字体，单位用像素 —— 这样只有画布变换会放大它，不会翻倍。</summary>
         public static Font Font(float points, FontStyle style)
         {
-            return new Font("Segoe UI", points * 96f / 72f, style, GraphicsUnit.Pixel);
+            return Font(points, style, "Segoe UI");
+        }
+
+        public static Font Font(float points, FontStyle style, string family)
+        {
+            return new Font(family, points * 96f / 72f, style, GraphicsUnit.Pixel);
         }
 
         private static int ReadDpi()
