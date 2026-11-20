@@ -38,6 +38,46 @@ namespace NetSpeedBall
                     return;
                 }
 
+                if (string.Equals(args[0], "--diag", StringComparison.OrdinalIgnoreCase))
+                {
+                    System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                    sb.AppendLine("UiScale.Dpi=" + UiScale.DpiValue + " Factor=" + UiScale.Factor);
+                    using (SpeedBallForm f = new SpeedBallForm())
+                    {
+                        sb.AppendLine("DeviceDpi=" + f.DeviceDpi + " AutoScaleMode=" + f.AutoScaleMode
+                            + " WinDpi=" + NativeMethods.GetDpiForWindow(f.Handle)
+                            + " SysDpi=" + NativeMethods.GetDpiForSystem());
+                        sb.AppendLine("ctor     Size=" + f.Width + "x" + f.Height + " Client=" + f.ClientSize.Width + "x" + f.ClientSize.Height);
+                        IntPtr probe = f.Handle;
+                        sb.AppendLine("handle   Size=" + f.Width + "x" + f.Height + " Client=" + f.ClientSize.Width + "x" + f.ClientSize.Height);
+                        f.Show();
+                        Application.DoEvents();
+                        sb.AppendLine("show     Size=" + f.Width + "x" + f.Height + " Client=" + f.ClientSize.Width + "x" + f.ClientSize.Height);
+                        if (f.Region != null)
+                        {
+                            RectangleF b = f.Region.GetBounds(f.CreateGraphics());
+                            sb.AppendLine("Region   " + b.Width + "x" + b.Height + " at " + b.X + "," + b.Y);
+                        }
+                        sb.AppendLine("Min=" + f.MinimumSize + " Max=" + f.MaximumSize);
+
+                        if (args.Length >= 3)
+                        {
+                            // 真实屏幕截图：验证的是"窗口自己画在屏幕 DC 上"的效果，
+                            // 和离屏出图（Bitmap DC）不是同一条路径。
+                            System.Threading.Thread.Sleep(300);
+                            Application.DoEvents();
+                            using (Bitmap shot = new Bitmap(f.Width, f.Height))
+                            using (Graphics sg = Graphics.FromImage(shot))
+                            {
+                                sg.CopyFromScreen(f.Left, f.Top, 0, 0, new Size(f.Width, f.Height));
+                                shot.Save(args[2], System.Drawing.Imaging.ImageFormat.Png);
+                            }
+                        }
+                    }
+                    System.IO.File.WriteAllText(args[1], sb.ToString());
+                    return;
+                }
+
                 if (string.Equals(args[0], "--render-details", StringComparison.OrdinalIgnoreCase))
                 {
                     SpeedDetailsForm.SavePreview(args[1]);
@@ -1076,6 +1116,9 @@ namespace NetSpeedBall
         private Font unitFont;
         private Font statFont;
         private Font statArrowFont;
+        /// <summary>球中间那行速率数字和单位的常驻字体（每帧复用，别再 new）。</summary>
+        private Font rateFont;
+        private Font rateUnitFont;
         private Icon appIcon;
         private bool overLaunchPad;
         private bool launchAnimating;
@@ -1109,8 +1152,21 @@ namespace NetSpeedBall
         private bool closingForExit;
         private Rectangle dockArea;
         private DateTime lastAnimationFrame = DateTime.UtcNow;
-        /// <summary>画球时的缩放比例。正常绘制 = DPI 比例，离屏出图 = 1（图就是 122 见方）。</summary>
-        private float drawScale = UiScale.Factor;
+
+        /// <summary>
+        /// 画球时的缩放比例 —— 不缓存、不查 DPI，直接按「窗口实际边长 ÷ 122」算。
+        ///
+        /// 之前是缓存一个 drawScale 字段，一旦它和窗口尺寸对不上（DPI 读数有偏差、
+        /// 窗口被系统或别的代码改过），内容就会画到球外面。现在两边同源，不可能再错。
+        /// </summary>
+        private float DrawScale
+        {
+            get
+            {
+                int side = Math.Min(Width, Height);
+                return side > 0 ? side / (float)BallSize : 1.0f;
+            }
+        }
 
         /// <summary>出图时用的版式编号（0 = 正式版式），只给对比图用。</summary>
         private int previewVariant;
@@ -1164,6 +1220,8 @@ namespace NetSpeedBall
             unitFont = UiScale.Font(8.8f, FontStyle.Regular);
             statFont = UiScale.Font(10.5f, FontStyle.Bold);
             statArrowFont = UiScale.Font(12.5f, FontStyle.Bold);
+            rateFont = UiScale.Font(22.0f, FontStyle.Bold);
+            rateUnitFont = UiScale.Font(8.5f, FontStyle.Regular);
 
             animationTimer = new FormsTimer { Interval = 33 };
             animationTimer.Tick += OnAnimationTick;
@@ -1257,20 +1315,23 @@ namespace NetSpeedBall
         /// <summary>用户在设置里改了缩放：球按新比例换尺寸，形状必须还是正圆。</summary>
         public void ApplyUiScale()
         {
-            drawScale = UiScale.Factor;
             int pixels = UiScale.Px(BallSize);
-            if (Width == pixels && Height == pixels)
+            if (Width != pixels || Height != pixels)
             {
-                Invalidate();
-                return;
+                // 以球心为锚点放大缩小：改缩放之后球停在原地长大，不会突然跳到屏幕另一头。
+                Point center = new Point(Left + Width / 2, Top + Height / 2);
+
+                MinimumSize = Size.Empty;
+                MaximumSize = Size.Empty;
+                Size = new Size(pixels, pixels);
+                MinimumSize = Size;
+                MaximumSize = Size;
+
+                Left = center.X - Width / 2;
+                Top = center.Y - Height / 2;
+                UpdateWindowRegion();
             }
 
-            MinimumSize = Size.Empty;
-            MaximumSize = Size.Empty;
-            Size = new Size(pixels, pixels);
-            MinimumSize = Size;
-            MaximumSize = Size;
-            UpdateWindowRegion();
             KeepInsideWorkingArea();
             if (detailsForm != null)
             {
@@ -1696,6 +1757,37 @@ namespace NetSpeedBall
             }
 
             base.WndProc(ref m);
+
+            // 用户改了缩放 / 把球拖到另一块屏：系统会送来新 DPI，
+            // 这里立刻按新比例重排，不用重启程序。
+            if (m.Msg == NativeMethods.WM_DPICHANGED)
+            {
+                UiScale.Adopt((int)(m.WParam.ToInt64() & 0xFFFF));
+                ApplyUiScale();
+            }
+        }
+
+        /// <summary>
+        /// 球是「固定像素画出来的圆」，宽高必须永远相等。
+        ///
+        /// 只要有任意一条路径（系统 DPI 变更、WinForms 自动缩放、外部 SetWindowPos）
+        /// 把其中一边改了，这里立刻拉回正方形 —— 从根上杜绝"球被压扁"。
+        /// </summary>
+        protected override void SetBoundsCore(int x, int y, int width, int height, BoundsSpecified specified)
+        {
+            if (width > 0 && height > 0 && width != height)
+            {
+                int side = Math.Max(width, height);
+                width = side;
+                height = side;
+            }
+
+            base.SetBoundsCore(x, y, width, height, specified);
+        }
+
+        /// <summary>自绘界面自己按 DPI 重排，不让 WinForms 再按字体比例缩一遍（它只会越缩越歪）。</summary>
+        protected override void ScaleControl(SizeF factor, BoundsSpecified specified)
+        {
         }
 
         protected override void OnSizeChanged(EventArgs e)
@@ -1714,9 +1806,11 @@ namespace NetSpeedBall
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-            // 球里所有坐标都按 96 DPI 的 122×122 设计稿写，画之前整体乘 DPI 比例。
-            // 不这么做的话字号会跟着 DPI 变大、文字位置却不动，数字就会压到下面的单位上。
-            g.ScaleTransform(drawScale, drawScale);
+            // 球里所有坐标都按 96 DPI 的 122×122 设计稿写。
+            // 缩放比例不缓存、不查 DPI，直接由「窗口实际边长 ÷ 设计稿边长」得出：
+            // 这样内容永远和窗口严丝合缝，DPI 读数偏差、系统拉伸都不会让它错位。
+            float scale = DrawScale;
+            g.ScaleTransform(scale, scale);
 
             Rectangle rect = new Rectangle(5, 5, BallSize - 11, BallSize - 11);
             if (launchAnimating || overLaunchPad)
@@ -2018,14 +2112,19 @@ namespace NetSpeedBall
 
             // 数字别太贪大：球是 122 见方，25 磅的数字会把单位挤到身上，
             // 22 磅配上下面留出的空档才是能看的样子。
-            Font bigFont = UiScale.Font(22.0f, FontStyle.Bold);
-            Font smallUnitFont = UiScale.Font(8.5f, FontStyle.Regular);
+            //
+            // 字体必须是常驻实例：这里每秒要画 30 帧，每帧 new Font 又不 Dispose，
+            // GDI 句柄几分钟就耗光，之后文字会突然画不出来 —— 之前就是这个坑。
+            Font bigFont = rateFont;
+            Font smallUnitFont = rateUnitFont;
+            Font variantFont = null;
             int numberY = 27;
             int unitY = 63;
             int statY = 85;
             if (previewVariant == 1)
             {
-                bigFont = UiScale.Font(20.0f, FontStyle.Bold);
+                variantFont = UiScale.Font(20.0f, FontStyle.Bold);
+                bigFont = variantFont;
                 numberY = 29;
                 unitY = 62;
                 statY = 83;
@@ -2040,15 +2139,26 @@ namespace NetSpeedBall
             }
             else if (previewVariant == 3)
             {
-                bigFont = UiScale.Font(18.0f, FontStyle.Bold);
+                variantFont = UiScale.Font(18.0f, FontStyle.Bold);
+                bigFont = variantFont;
                 numberY = 31;
                 unitY = 61;
                 statY = 82;
             }
 
-            DrawCenteredLine(g, main.Value, bigFont, numberY, Color.FromArgb(20, 27, 42), BallSize - 30);
-            DrawCenteredLine(g, main.Unit, smallUnitFont, unitY, Color.FromArgb(70, 84, 102), BallSize - 48);
-            DrawStatPair(g, "\u2191", up, "\u2193", down, statY);
+            try
+            {
+                DrawCenteredLine(g, main.Value, bigFont, numberY, Color.FromArgb(20, 27, 42), BallSize - 30);
+                DrawCenteredLine(g, main.Unit, smallUnitFont, unitY, Color.FromArgb(70, 84, 102), BallSize - 48);
+                DrawStatPair(g, "\u2191", up, "\u2193", down, statY);
+            }
+            finally
+            {
+                if (variantFont != null)
+                {
+                    variantFont.Dispose();
+                }
+            }
         }
 
         private void DrawStatPair(Graphics g, string upArrow, string up, string downArrow, string down, int y)
@@ -2192,7 +2302,10 @@ namespace NetSpeedBall
             using (Brush shadow = new SolidBrush(shadowColor))
             using (Brush foreground = new SolidBrush(color))
             {
-                float x = (Width - size.Width) / 2.0f;
+                // 这里的坐标系是「96 DPI 设计稿」：g 已经被 DrawSurface 整体缩放过，
+                // 所以居中要用设计稿宽度 BallSize，绝不能用窗口的真实像素 Width
+                // —— 两者在 125%/150% 下差一倍比例，文字会一路往右漂。
+                float x = (BallSize - size.Width) / 2.0f;
                 g.DrawString(text, drawFont, shadow, x + 1, y + 1);
                 g.DrawString(text, drawFont, foreground, x, y);
             }
@@ -2414,6 +2527,8 @@ namespace NetSpeedBall
                 if (unitFont != null) unitFont.Dispose();
                 if (statFont != null) statFont.Dispose();
                 if (statArrowFont != null) statArrowFont.Dispose();
+                if (rateFont != null) rateFont.Dispose();
+                if (rateUnitFont != null) rateUnitFont.Dispose();
                 if (appIcon != null) appIcon.Dispose();
                 if (launchPadForm != null) launchPadForm.Dispose();
                 if (detailsForm != null) detailsForm.Dispose();
@@ -2624,6 +2739,9 @@ namespace NetSpeedBall
         /// <summary>当前 DPI 比例（96 DPI = 1.0）。面板里所有坐标都按 96 DPI 写，画的时候整体乘它。</summary>
         private float uiScale;
 
+        /// <summary>用户设定缩放对应的比例（屏幕装不下时 uiScale 会比它小）。</summary>
+        private float targetScale;
+
         /// <summary>设计稿宽度。窗口实际宽度 = 这个值 × DPI 比例。</summary>
         private const int DesignWidth = 430;
 
@@ -2668,11 +2786,14 @@ namespace NetSpeedBall
         public void ApplyUiScale()
         {
             float next = UiScale.Factor;
-            if (Math.Abs(next - uiScale) < 0.01f)
+            // 和「用户设定的比例」比，不是和 uiScale 比 —— 屏幕装不下时 uiScale
+            // 会被主动压低，拿它做比较会让面板每秒重排一次、一直抖。
+            if (Math.Abs(next - targetScale) < 0.01f)
             {
                 return;
             }
 
+            targetScale = next;
             uiScale = next;
             BuildFonts();
             Width = UiScale.Px(DesignWidth);
@@ -2736,8 +2857,36 @@ namespace NetSpeedBall
 
         private Rectangle ToPhysical(Rectangle rect)
         {
-            return new Rectangle(UiScale.Px(rect.X), UiScale.Px(rect.Y),
-                UiScale.Px(rect.Width), UiScale.Px(rect.Height));
+            // 用面板自己的 uiScale，不用全局 DPI：两者混用的话，
+            // 关闭按钮这类"点到才算"的区域会和画出来的位置差几像素。
+            return new Rectangle(
+                (int)Math.Round(rect.X * uiScale),
+                (int)Math.Round(rect.Y * uiScale),
+                (int)Math.Round(rect.Width * uiScale),
+                (int)Math.Round(rect.Height * uiScale));
+        }
+
+        /// <summary>
+        /// 把绘制比例对齐到窗口实际宽度 —— 窗口宽度是唯一事实来源。
+        ///
+        /// 这样即使 DPI 读数、系统缩放、窗体尺寸三者里有一个不对劲，
+        /// 面板内容也永远和窗口同宽，不会出现"字画到面板外面"或"下半截被裁掉"。
+        /// </summary>
+        private void SyncScaleFromWindow()
+        {
+            int width = ClientSize.Width;
+            if (width <= 0)
+            {
+                return;
+            }
+
+            float next = width / (float)DesignWidth;
+            if (next < 0.3f || next > 6.0f)
+            {
+                return;
+            }
+
+            uiScale = next;
         }
 
         public SpeedDetailsForm(TrafficStore store)
@@ -2754,6 +2903,7 @@ namespace NetSpeedBall
             // 绝不能让 WinForms 按字体自动缩放 —— 它只放大宽度、不放大高度，卡片会歪。
             AutoScaleMode = AutoScaleMode.None;
             uiScale = UiScale.Factor;
+            targetScale = uiScale;
             BuildFonts();
             Size = new Size(UiScale.Px(DesignWidth), UiScale.Px(780));
             FormBorderStyle = FormBorderStyle.None;
@@ -2768,6 +2918,25 @@ namespace NetSpeedBall
         protected override bool ShowWithoutActivation
         {
             get { return true; }
+        }
+
+        /// <summary>
+        /// 自绘面板自己按 DPI 重排，不让 WinForms 再缩一遍。
+        /// 两套缩放叠在一起时，宽度按字号比例、高度按窗口比例，卡片就会错位。
+        /// </summary>
+        protected override void ScaleControl(SizeF factor, BoundsSpecified specified)
+        {
+        }
+
+        /// <summary>用户在设置里改了缩放：立刻按新 DPI 重排，不用等下一秒的轮询。</summary>
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == NativeMethods.WM_DPICHANGED)
+            {
+                UiScale.Adopt((int)(m.WParam.ToInt64() & 0xFFFF));
+                ApplyUiScale();
+            }
         }
 
         /// <summary>面板一露头就把 GPU 采样线程拉起来，藏起来就停掉。</summary>
@@ -3125,9 +3294,61 @@ namespace NetSpeedBall
         /// </summary>
         private void SyncHeight()
         {
+            if (syncingHeight)
+            {
+                return;
+            }
+
+            syncingHeight = true;
+            try
+            {
+                SyncHeightCore();
+            }
+            finally
+            {
+                syncingHeight = false;
+            }
+        }
+
+        private bool syncingHeight;
+
+        private void SyncHeightCore()
+        {
             LayoutCards();
-            // contentBottom 是逻辑像素，窗口高度得乘回 DPI 比例
-            int height = UiScale.Px(contentBottom);
+            // contentBottom 是设计稿单位，窗口高度要按面板自己的比例换回真实像素。
+            // 这里必须用 uiScale 而不是全局 UiScale.Factor：两者只要有一丝不一致，
+            // 窗口就会比内容高一截或矮一截（矮了就是底部被裁、字叠在一起）。
+            float scale = uiScale;
+
+            // 屏幕装不下时整体缩一档，而不是让窗口超出屏幕被 Windows 夹住 ——
+            // 一旦被夹住，底部那几张卡片就永远看不到了（200% 缩放下必现）。
+            int maxHeight = 0;
+            try
+            {
+                maxHeight = Screen.FromControl(this).WorkingArea.Height - 24;
+            }
+            catch
+            {
+            }
+
+            if (maxHeight > 0 && contentBottom > 0)
+            {
+                float fitScale = maxHeight / (float)contentBottom;
+                if (fitScale < scale)
+                {
+                    scale = Math.Max(0.5f, fitScale);
+                }
+            }
+
+            int width = (int)Math.Round(DesignWidth * scale);
+            int height = (int)Math.Round(contentBottom * scale);
+            uiScale = scale;
+
+            if (width != Width)
+            {
+                Width = width;
+            }
+
             if (height == Height)
             {
                 return;
@@ -3615,11 +3836,23 @@ namespace NetSpeedBall
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-            // 整个画布按 DPI 放大，下面的坐标全按 96 DPI 写，缩放到 150% 时
+            // 画之前先按「窗口实际宽度 ÷ 设计稿宽度」校准比例。
+            // 不查 DPI、不用缓存值：窗口被谁改了尺寸，这一帧就跟着改，
+            // 内容和窗口永远同宽，字不会画出面板外面。
+            SyncScaleFromWindow();
+            // 整个画布按比例放大，下面的坐标全按 96 DPI 写，缩放到 150% 时
             // 边框、行距、字号一起放大，不会出现「字变大了格子没变大」的重叠。
             g.ScaleTransform(uiScale, uiScale);
 
             LayoutCards();
+
+            // 内容高度和窗口高度对不上就当场校正：首次打开、插拔磁盘、
+            // 改显示项都会走到这里，永远不会出现"底部空一块"或"底部被裁"。
+            // 先比较再调用，避免每帧都去问一次屏幕工作区。
+            if (Math.Abs(Height - contentBottom * uiScale) > 1.0f)
+            {
+                SyncHeight();
+            }
 
             Rectangle body = new Rectangle(1, 1, UWidth - 3, UHeight - 3);
             using (GraphicsPath path = CreateRoundedRectangle(body, 18))
@@ -6318,6 +6551,9 @@ namespace NetSpeedBall
         /// <summary>当前 DPI 比例。坐标全按 96 DPI 写，画之前整体乘它。</summary>
         private float uiScale;
 
+        /// <summary>用户设定缩放对应的比例（屏幕装不下时 uiScale 会比它小）。</summary>
+        private float targetScale;
+
         // 顶部那一排全是自绘的：原生 Button 是灰底 3D 边，跟下面的卡片放在一起
         // 像两个年代的软件拼起来的。命中区在构造时算好，点击靠坐标判断。
         private readonly Rectangle[] presetRects = new Rectangle[5];
@@ -6345,8 +6581,8 @@ namespace NetSpeedBall
             // 自绘界面，尺寸和字体都由自己按 DPI 算，别让 WinForms 自动缩放（它只会拉宽）
             AutoScaleMode = AutoScaleMode.None;
             uiScale = UiScale.Factor;
+            targetScale = uiScale;
             BuildFonts();
-            ClientSize = new Size(UiScale.Px(LW), UiScale.Px(LH));
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -6368,7 +6604,9 @@ namespace NetSpeedBall
                 // 取不到就算了，不值得为图标让窗口开不出来
             }
 
-            LayoutChrome();
+            // 尺寸统一走 ApplyScale：它会顺带处理"屏幕装不下就整体缩小"，
+            // 免得 200% 缩放下窗口比屏幕还高、底部应用排行永远看不到。
+            ApplyScale(targetScale);
 
             // 日期选择用一个常驻的 MonthCalendar，点胶囊时挪过去弹出来。
             // 用 DateTimePicker 的话外观改不动（灰底 + 系统下拉箭头），
@@ -6427,18 +6665,62 @@ namespace NetSpeedBall
             return new Point((int)Math.Round(point.X / uiScale), (int)Math.Round(point.Y / uiScale));
         }
 
+        /// <summary>
+        /// 自绘窗口自己按 DPI 重排，不让 WinForms 再缩一遍。
+        /// 尤其这里还有原生 MonthCalendar 子控件，两套缩放叠加会把它弹到窗口外面去。
+        /// </summary>
+        protected override void ScaleControl(SizeF factor, BoundsSpecified specified)
+        {
+        }
+
+        /// <summary>用户在设置里改了缩放：立刻按新 DPI 重排，不用等下一秒的轮询。</summary>
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == NativeMethods.WM_DPICHANGED)
+            {
+                UiScale.Adopt((int)(m.WParam.ToInt64() & 0xFFFF));
+                ApplyUiScale();
+            }
+        }
+
         /// <summary>用户改了缩放：字体、客户区、命中区全部重算。</summary>
         public void ApplyUiScale()
         {
             float next = UiScale.Factor;
-            if (Math.Abs(next - uiScale) < 0.01f)
+            if (Math.Abs(next - targetScale) < 0.01f)
             {
                 return;
             }
 
-            uiScale = next;
+            targetScale = next;
+            ApplyScale(next);
+        }
+
+        /// <summary>按比例定客户区尺寸。屏幕高度装不下时整体压一档，保证底部内容永远看得到。</summary>
+        private void ApplyScale(float scale)
+        {
+            int maxHeight = 0;
+            try
+            {
+                maxHeight = Screen.FromControl(this).WorkingArea.Height - 120;
+            }
+            catch
+            {
+            }
+
+            if (maxHeight > 0)
+            {
+                float fit = maxHeight / (float)LH;
+                if (fit < scale)
+                {
+                    scale = Math.Max(0.5f, fit);
+                }
+            }
+
+            uiScale = scale;
             BuildFonts();
-            ClientSize = new Size(UiScale.Px(LW), UiScale.Px(LH));
+            ClientSize = new Size((int)Math.Round(LW * scale), (int)Math.Round(LH * scale));
             LayoutChrome();
             Invalidate();
         }
@@ -6713,12 +6995,13 @@ namespace NetSpeedBall
             calendar.SetDate(current);
 
             Rectangle chip = chipRects[from ? 0 : 1];
-            // 日历是原生控件，坐标是真实像素，而 chipRects 是设计稿坐标，这里换算一次
-            int left = Math.Min(UiScale.Px(chip.Left), ClientSize.Width - calendar.Width - 8);
-            int top = UiScale.Px(chip.Bottom + 4);
+            // 日历是原生控件，坐标是真实像素，而 chipRects 是设计稿坐标，这里换算一次。
+            // 用面板自己的 uiScale 而不是全局 DPI，否则两者一有偏差日历就弹歪。
+            int left = Math.Min((int)Math.Round(chip.Left * uiScale), ClientSize.Width - calendar.Width - 8);
+            int top = (int)Math.Round((chip.Bottom + 4) * uiScale);
             if (top + calendar.Height > ClientSize.Height - 8)
             {
-                top = UiScale.Px(chip.Top) - calendar.Height - 4;
+                top = (int)Math.Round(chip.Top * uiScale) - calendar.Height - 4;
             }
 
             calendar.Location = new Point(Math.Max(4, left), Math.Max(4, top));
@@ -6733,7 +7016,17 @@ namespace NetSpeedBall
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-            // 画布整体按 DPI 放大，下面的坐标全按 96 DPI 的设计稿写
+            // 比例以「客户区实际宽度 ÷ 设计稿宽度」为准：窗口被谁改了尺寸都不会错位。
+            int clientWidth = ClientSize.Width;
+            if (clientWidth > 0)
+            {
+                float next = clientWidth / (float)LW;
+                if (next > 0.3f && next < 6.0f)
+                {
+                    uiScale = next;
+                }
+            }
+            // 画布整体按比例放大，下面的坐标全按 96 DPI 的设计稿写
             g.ScaleTransform(uiScale, uiScale);
 
             DrawChrome(g);
@@ -7360,6 +7653,11 @@ namespace NetSpeedBall
             get { return true; }
         }
 
+        /// <summary>自绘界面自己按 DPI 重排，不让 WinForms 再缩一遍。</summary>
+        protected override void ScaleControl(SizeF factor, BoundsSpecified specified)
+        {
+        }
+
         protected override CreateParams CreateParams
         {
             get
@@ -7420,8 +7718,9 @@ namespace NetSpeedBall
             base.OnPaint(e);
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            // 坐标按 96 DPI 的设计稿写，整体按 DPI 放大
-            g.ScaleTransform(UiScale.Factor, UiScale.Factor);
+            // 坐标按 96 DPI 的设计稿写，比例直接由窗口实际宽度反推 —— 不查 DPI
+            float scale = Width > 0 ? Width / (float)LW : UiScale.Factor;
+            g.ScaleTransform(scale, scale);
 
             Rectangle rect = new Rectangle(3, 3, LW - 7, LH - 7);
             using (GraphicsPath shell = CreateRoundedRectangle(rect, 28))
@@ -10380,6 +10679,15 @@ namespace NetSpeedBall
         public const uint ErrorNotFound = 1168;
         public const int HwndBroadcast = 0xFFFF;
 
+        /// <summary>WM_DPICHANGED：窗口所在显示器的 DPI 变了（用户改了缩放，或拖到另一块屏）。</summary>
+        public const int WM_DPICHANGED = 0x02E0;
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForSystem();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr hwnd);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct FileTime
         {
@@ -10542,6 +10850,21 @@ namespace NetSpeedBall
             get { return dpi; }
         }
 
+        /// <summary>
+        /// 直接采用一个已知的 DPI（来自 WM_DPICHANGED 的 wParam）。
+        /// 返回 true 表示比例确实变了，调用方要重新排一遍。
+        /// </summary>
+        public static bool Adopt(int value)
+        {
+            if (value < 72 || value > 480 || value == dpi)
+            {
+                return false;
+            }
+
+            dpi = value;
+            return true;
+        }
+
         /// <summary>重新读一次系统 DPI，返回 true 表示用户刚改过缩放。</summary>
         public static bool Refresh()
         {
@@ -10579,6 +10902,29 @@ namespace NetSpeedBall
 
         private static int ReadDpi()
         {
+            // 自查用：设了 NETSPEEDBALL_DPI 就按这个值画，方便在一台机器上
+            // 直接看 100% / 125% / 150% / 200% 的排版，不用真去改系统缩放。
+            string forced = Environment.GetEnvironmentVariable("NETSPEEDBALL_DPI");
+            int value;
+            if (!string.IsNullOrEmpty(forced) && int.TryParse(forced, out value) && value >= 72 && value <= 480)
+            {
+                return value;
+            }
+
+            // GetDpiForSystem 是 Win10 1607+ 的接口，在 PerMonitorV2 进程里
+            // 用户改完缩放它马上就变 —— 这是"不重启也能跟上"的关键。
+            try
+            {
+                uint systemDpi = NativeMethods.GetDpiForSystem();
+                if (systemDpi >= 72 && systemDpi <= 480)
+                {
+                    return (int)systemDpi;
+                }
+            }
+            catch
+            {
+            }
+
             try
             {
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
