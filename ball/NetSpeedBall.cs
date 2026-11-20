@@ -2016,7 +2016,7 @@ namespace NetSpeedBall
             float pairGap = 7.0f;
             // The ball is a circular window and its bottom edge is much narrower than
             // the form, so keep this row inside the safe chord width of the circle.
-            float maxWidth = Width - 34.0f;
+            float maxWidth = BallSize - 34.0f;
             float total = MeasureStatRow(g, upArrow, arrowFont, up, valueFont,
                 downArrow, down, arrowGap, pairGap);
             if (total > maxWidth)
