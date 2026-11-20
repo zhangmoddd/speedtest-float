@@ -899,6 +899,19 @@ namespace NetSpeedBall
 
         private void OnPowerTick(object sender, EventArgs e)
         {
+            // 用户可能在"设置 → 显示 → 缩放"里改了比例。程序不重启也要跟着变，
+            // 所以每秒瞄一眼系统 DPI，变了就把球和面板重新按新比例摆一遍。
+            if (UiScale.Refresh())
+            {
+                try
+                {
+                    ballForm.ApplyUiScale();
+                }
+                catch
+                {
+                }
+            }
+
             if (powerPendingAction == null || DateTime.Now < powerDeadline)
             {
                 return;
@@ -1086,6 +1099,9 @@ namespace NetSpeedBall
         private bool closingForExit;
         private Rectangle dockArea;
         private DateTime lastAnimationFrame = DateTime.UtcNow;
+        /// <summary>右键菜单关掉的时刻，用来挡掉"菜单刚关、手一抖点到球"的那一下。</summary>
+        private DateTime menuClosedUtc = DateTime.MinValue;
+        private static readonly TimeSpan MenuClickGuard = TimeSpan.FromMilliseconds(400);
         private static readonly Color LaunchTransparentColor = Color.FromArgb(240, 248, 255);
 
         private enum DockEdge
@@ -1111,7 +1127,7 @@ namespace NetSpeedBall
             // 从 122 拉到 170，高度却原地不动 —— 圆就成了 170×122 的扁蛋。
             // 所以关掉自动缩放，DPI 放大自己按比例做：122 → 152，宽高永远相等。
             AutoScaleMode = AutoScaleMode.None;
-            int ballPixels = ScaleForDpi(BallSize);
+            int ballPixels = UiScale.Px(BallSize);
             StartPosition = FormStartPosition.Manual;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -1211,6 +1227,40 @@ namespace NetSpeedBall
         {
             appIcon = icon;
             Icon = icon;
+        }
+
+        /// <summary>右键菜单一关就记下时间，后面那一下点击要放过。</summary>
+        protected override void OnContextMenuStripChanged(EventArgs e)
+        {
+            base.OnContextMenuStripChanged(e);
+            if (ContextMenuStrip != null)
+            {
+                ContextMenuStrip.Closed += delegate { menuClosedUtc = DateTime.UtcNow; };
+            }
+        }
+
+        /// <summary>用户在设置里改了缩放：球按新比例换尺寸，形状必须还是正圆。</summary>
+        public void ApplyUiScale()
+        {
+            int pixels = UiScale.Px(BallSize);
+            if (Width == pixels && Height == pixels)
+            {
+                return;
+            }
+
+            MinimumSize = Size.Empty;
+            MaximumSize = Size.Empty;
+            Size = new Size(pixels, pixels);
+            MinimumSize = Size;
+            MaximumSize = Size;
+            UpdateWindowRegion();
+            KeepInsideWorkingArea();
+            if (detailsForm != null)
+            {
+                detailsForm.ApplyUiScale();
+            }
+
+            Invalidate();
         }
 
         /// <summary>显示项改了之后让详情面板重排一次（窗口高度会跟着变）。</summary>
@@ -1439,13 +1489,17 @@ namespace NetSpeedBall
         {
             if (detailsForm.Visible)
             {
-                // 面板开着的时候再点球，不再关它，只把它提到最前面。
+                // 再点一下球就把面板收起来 —— 跟原版一样，单击开、单击关。
                 //
-                // 原来是"单击开、单击关"，看着方便，实际是个陷阱：
-                // 右键球弹菜单、点完菜单项，鼠标就在球边上，手稍微一动就点到球上，
-                // 面板"啪"地消失，用户还以为是菜单干的。日志里连着复现两次都是这个原因。
-                // 关面板有明确的入口 —— 右上角的 ✕，那个不会误触。
-                detailsForm.BringToFront();
+                // 唯一要防的误触：从右键菜单点完菜单项，鼠标就停在球边上，
+                // 手稍微一动就点到球上，面板"啪"地消失，用户还以为是菜单干的。
+                // 所以菜单刚关掉的那零点几秒内，这一下点击不算数。
+                if (DateTime.UtcNow - menuClosedUtc < MenuClickGuard)
+                {
+                    return;
+                }
+
+                detailsForm.Hide();
                 return;
             }
 
@@ -2510,11 +2564,69 @@ namespace NetSpeedBall
         private readonly HeldValue heldGpu = new HeldValue(0.12, 1.0);
         private readonly List<HeldValue> heldDisks = new List<HeldValue>();
 
-        private readonly Font titleFont = new Font("Segoe UI", 12.0f, FontStyle.Bold);
-        private readonly Font cardTitleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold);
-        private readonly Font valueFont = new Font("Segoe UI", 10.0f, FontStyle.Bold);
-        private readonly Font strongFont = new Font("Segoe UI", 8.2f, FontStyle.Bold);
-        private readonly Font smallFont = new Font("Segoe UI", 8.2f, FontStyle.Regular);
+        private Font titleFont;
+        private Font cardTitleFont;
+        private Font valueFont;
+        private Font strongFont;
+        private Font smallFont;
+
+        /// <summary>当前 DPI 比例（96 DPI = 1.0）。面板里所有坐标都按 96 DPI 写，画的时候整体乘它。</summary>
+        private float uiScale;
+
+        /// <summary>设计稿宽度。窗口实际宽度 = 这个值 × DPI 比例。</summary>
+        private const int DesignWidth = 430;
+
+        /// <summary>画图时的逻辑宽度（永远 430），和窗口的真实像素宽度区分开。</summary>
+        private int UWidth
+        {
+            get { return DesignWidth; }
+        }
+
+        /// <summary>画图时的逻辑高度，由真实像素高度换算回来。</summary>
+        private int UHeight
+        {
+            get { return uiScale > 0 ? (int)Math.Round(Height / uiScale) : Height; }
+        }
+
+        /// <summary>字体一律按 96 DPI 的像素尺寸造，缩放交给画布的整体变换。</summary>
+        private void BuildFonts()
+        {
+            DisposeFont(ref titleFont);
+            DisposeFont(ref cardTitleFont);
+            DisposeFont(ref valueFont);
+            DisposeFont(ref strongFont);
+            DisposeFont(ref smallFont);
+
+            titleFont = UiScale.Font(12.0f, FontStyle.Bold);
+            cardTitleFont = UiScale.Font(9.5f, FontStyle.Bold);
+            valueFont = UiScale.Font(10.0f, FontStyle.Bold);
+            strongFont = UiScale.Font(8.2f, FontStyle.Bold);
+            smallFont = UiScale.Font(8.2f, FontStyle.Regular);
+        }
+
+        private static void DisposeFont(ref Font font)
+        {
+            if (font != null)
+            {
+                font.Dispose();
+                font = null;
+            }
+        }
+
+        /// <summary>DPI 变了（用户在设置里改了缩放）：重新算尺寸和字体，面板跟着变。</summary>
+        public void ApplyUiScale()
+        {
+            float next = UiScale.Factor;
+            if (Math.Abs(next - uiScale) < 0.01f)
+            {
+                return;
+            }
+
+            uiScale = next;
+            BuildFonts();
+            Width = UiScale.Px(DesignWidth);
+            SyncHeight();
+        }
 
         private readonly Brush darkBrush = new SolidBrush(Color.FromArgb(30, 42, 60));
         private readonly Brush mutedBrush = new SolidBrush(Color.FromArgb(94, 112, 134));
@@ -2556,7 +2668,25 @@ namespace NetSpeedBall
         /// </summary>
         private Rectangle CloseButtonBounds
         {
-            get { return new Rectangle(Width - 34, 8, 26, 26); }
+            // 逻辑坐标（96 DPI 设计稿），判断点击时要把鼠标坐标换算过来
+            get { return new Rectangle(UWidth - 34, 8, 26, 26); }
+        }
+
+        /// <summary>鼠标给的是真实像素，先换算回设计稿坐标再判断。</summary>
+        private Point ToLogical(Point point)
+        {
+            if (uiScale <= 0)
+            {
+                return point;
+            }
+
+            return new Point((int)Math.Round(point.X / uiScale), (int)Math.Round(point.Y / uiScale));
+        }
+
+        private Rectangle ToPhysical(Rectangle rect)
+        {
+            return new Rectangle(UiScale.Px(rect.X), UiScale.Px(rect.Y),
+                UiScale.Px(rect.Width), UiScale.Px(rect.Height));
         }
 
         public SpeedDetailsForm(TrafficStore store)
@@ -2568,7 +2698,13 @@ namespace NetSpeedBall
             // 性能计数器第一次创建要花好几秒（等系统的计数器注册表），
             // 现在就把这条最贵的路在后台走掉，别等面板打开时再让 UI 线程等。
             resourceMonitor.PrimeAsync();
-            Size = new Size(430, 780);
+
+            // 面板是纯手工画的，尺寸由自己算：设计稿 430 宽，缩放到 125% 就是 537。
+            // 绝不能让 WinForms 按字体自动缩放 —— 它只放大宽度、不放大高度，卡片会歪。
+            AutoScaleMode = AutoScaleMode.None;
+            uiScale = UiScale.Factor;
+            BuildFonts();
+            Size = new Size(UiScale.Px(DesignWidth), UiScale.Px(780));
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -2939,7 +3075,8 @@ namespace NetSpeedBall
         private void SyncHeight()
         {
             LayoutCards();
-            int height = contentBottom;
+            // contentBottom 是逻辑像素，窗口高度得乘回 DPI 比例
+            int height = UiScale.Px(contentBottom);
             if (height == Height)
             {
                 return;
@@ -3026,7 +3163,7 @@ namespace NetSpeedBall
         /// </summary>
         private void LayoutCards()
         {
-            int width = Math.Max(240, Width - SideMargin * 2);
+            int width = Math.Max(240, UWidth - SideMargin * 2);
             networkBottom = MeasureNetwork();
             int y = networkBottom;
 
@@ -3357,7 +3494,7 @@ namespace NetSpeedBall
                 return;
             }
 
-            if (e.Button == MouseButtons.Left && closeHover && CloseButtonBounds.Contains(e.Location))
+            if (e.Button == MouseButtons.Left && closeHover && CloseButtonBounds.Contains(ToLogical(e.Location)))
             {
                 closeHover = false;
                 Cursor = Cursors.Default;
@@ -3401,12 +3538,12 @@ namespace NetSpeedBall
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            bool hover = CloseButtonBounds.Contains(e.Location);
+            bool hover = CloseButtonBounds.Contains(ToLogical(e.Location));
             if (hover != closeHover)
             {
                 closeHover = hover;
                 Cursor = hover ? Cursors.Hand : Cursors.Default;
-                Invalidate(CloseButtonBounds);
+                Invalidate(ToPhysical(CloseButtonBounds));
             }
         }
 
@@ -3417,7 +3554,7 @@ namespace NetSpeedBall
             {
                 closeHover = false;
                 Cursor = Cursors.Default;
-                Invalidate(CloseButtonBounds);
+                Invalidate(ToPhysical(CloseButtonBounds));
             }
         }
 
@@ -3427,10 +3564,13 @@ namespace NetSpeedBall
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            // 整个画布按 DPI 放大，下面的坐标全按 96 DPI 写，缩放到 150% 时
+            // 边框、行距、字号一起放大，不会出现「字变大了格子没变大」的重叠。
+            g.ScaleTransform(uiScale, uiScale);
 
             LayoutCards();
 
-            Rectangle body = new Rectangle(1, 1, Width - 3, Height - 3);
+            Rectangle body = new Rectangle(1, 1, UWidth - 3, UHeight - 3);
             using (GraphicsPath path = CreateRoundedRectangle(body, 18))
             using (LinearGradientBrush background = new LinearGradientBrush(body, Color.White, Color.FromArgb(235, 247, 255), LinearGradientMode.Vertical))
             using (Pen border = new Pen(Color.FromArgb(120, 71, 164, 226), 1.2f))
@@ -3464,7 +3604,7 @@ namespace NetSpeedBall
 
             string status = currentSample.HasAnyAdapter ? "\u8fde\u63a5\u6b63\u5e38" : "\u7f51\u7edc\u79bb\u7ebf";
             SizeF statusSize = g.MeasureString(status, smallFont);
-            g.DrawString(status, smallFont, faintBrush, Width - 42 - statusSize.Width, 17);
+            g.DrawString(status, smallFont, faintBrush, UWidth - 42 - statusSize.Width, 17);
 
             g.DrawString("\u4e0b\u8f7d  " + SpeedFormatter.FormatMegabytes(heldDownload.Target), valueFont, downBrush, 16, 43);
             g.DrawString("\u4e0a\u4f20  " + SpeedFormatter.FormatMegabytes(heldUpload.Target), valueFont, upBrush, 178, 43);
@@ -3480,10 +3620,10 @@ namespace NetSpeedBall
                 {
                     string peakText = "\u5cf0\u503c " + SpeedFormatter.Format(historyPeak) + "/s";
                     SizeF peakSize = g.MeasureString(peakText, smallFont);
-                    g.DrawString(peakText, smallFont, mutedBrush, Width - 16 - peakSize.Width, y);
+                    g.DrawString(peakText, smallFont, mutedBrush, UWidth - 16 - peakSize.Width, y);
                 }
 
-                Rectangle graph = new Rectangle(16, 91, Width - 32, 74);
+                Rectangle graph = new Rectangle(16, 91, UWidth - 32, 74);
                 DrawGraph(g, graph);
                 y = 91 + 74 + 8;
             }
@@ -3497,7 +3637,7 @@ namespace NetSpeedBall
                 ? trafficStore.GetRangeTotals(TrafficStore.ToDateInt(monthStart), todayDate)
                 : new long[] { 0, 0 };
 
-            int rightColumn = (Width - 32) / 2 + 16;
+            int rightColumn = (UWidth - 32) / 2 + 16;
 
             if (PanelFieldSettings.IsVisible("net.today"))
             {
@@ -10179,6 +10319,74 @@ namespace NetSpeedBall
 
         [DllImport("user32.dll")]
         public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    }
+
+    /// <summary>
+    /// 全程序的 DPI 换算。
+    ///
+    /// 这个软件的界面全是自己一笔一笔画的，坐标都按 96 DPI 的设计稿写死。
+    /// 用户把缩放改成 125% / 150% 时，如果只让系统把字号放大、坐标不变，
+    /// 就会出现「字把格子撑爆、两列字叠在一起」。所以统一在这里算一个比例：
+    /// 窗口尺寸乘它、画布整体 ScaleTransform 乘它，字号按像素造（不再随 DPI 自动变）。
+    /// </summary>
+    internal static class UiScale
+    {
+        private static int dpi = ReadDpi();
+
+        public static float Factor
+        {
+            get { return dpi / 96.0f; }
+        }
+
+        public static int DpiValue
+        {
+            get { return dpi; }
+        }
+
+        /// <summary>重新读一次系统 DPI，返回 true 表示用户刚改过缩放。</summary>
+        public static bool Refresh()
+        {
+            int current = ReadDpi();
+            if (current == dpi)
+            {
+                return false;
+            }
+
+            dpi = current;
+            return true;
+        }
+
+        /// <summary>把设计稿像素换算成真实像素。</summary>
+        public static int Px(int designPixels)
+        {
+            return (int)Math.Round(designPixels * Factor);
+        }
+
+        public static float Px(float designPixels)
+        {
+            return (float)(designPixels * Factor);
+        }
+
+        /// <summary>按设计稿的磅值造字体，单位用像素 —— 这样只有画布变换会放大它，不会翻倍。</summary>
+        public static Font Font(float points, FontStyle style)
+        {
+            return new Font("Segoe UI", points * 96f / 72f, style, GraphicsUnit.Pixel);
+        }
+
+        private static int ReadDpi()
+        {
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+                {
+                    return g.DpiX > 0 ? (int)Math.Round(g.DpiX) : 96;
+                }
+            }
+            catch
+            {
+                return 96;
+            }
+        }
     }
 }
 
