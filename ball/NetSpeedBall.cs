@@ -28,7 +28,13 @@ namespace NetSpeedBall
                 Application.SetCompatibleTextRenderingDefault(false);
                 if (string.Equals(args[0], "--render-preview", StringComparison.OrdinalIgnoreCase))
                 {
-                    SpeedBallForm.SavePreview(args[1]);
+                    int variant = 0;
+                    if (args.Length >= 3)
+                    {
+                        int.TryParse(args[2], out variant);
+                    }
+
+                    SpeedBallForm.SavePreview(args[1], variant);
                     return;
                 }
 
@@ -1105,6 +1111,9 @@ namespace NetSpeedBall
         private DateTime lastAnimationFrame = DateTime.UtcNow;
         /// <summary>画球时的缩放比例。正常绘制 = DPI 比例，离屏出图 = 1（图就是 122 见方）。</summary>
         private float drawScale = UiScale.Factor;
+
+        /// <summary>出图时用的版式编号（0 = 正式版式），只给对比图用。</summary>
+        private int previewVariant;
         /// <summary>右键菜单关掉的时刻，用来挡掉"菜单刚关、手一抖点到球"的那一下。</summary>
         private DateTime menuClosedUtc = DateTime.MinValue;
         private static readonly TimeSpan MenuClickGuard = TimeSpan.FromMilliseconds(400);
@@ -1305,10 +1314,16 @@ namespace NetSpeedBall
 
         public static void SavePreview(string path)
         {
+            SavePreview(path, 0);
+        }
+
+        public static void SavePreview(string path, int variant)
+        {
             using (SpeedBallForm preview = new SpeedBallForm())
             using (Bitmap bitmap = new Bitmap(preview.Width, preview.Height))
             using (Graphics g = Graphics.FromImage(bitmap))
             {
+                preview.previewVariant = variant;
                 // 按当前 DPI 出图，跟屏幕上看到的一模一样
                 g.Clear(Color.Transparent);
                 preview.currentSample = new SpeedSample(850.0 * 1024.0, 25.6 * 1024.0, true);
@@ -2001,64 +2016,84 @@ namespace NetSpeedBall
             string down = SpeedFormatter.FormatCompact(heldDownload.Target);
             string up = SpeedFormatter.FormatCompact(heldUpload.Target);
 
-            // 三行文字上移 5px，给沿外圈顺时针经过下方的火箭留出空间。
-            DrawCenteredLine(g, main.Value, speedFont, 28, Color.FromArgb(20, 27, 42), BallSize - 30);
-            DrawCenteredLine(g, main.Unit, unitFont, 61, Color.FromArgb(70, 84, 102), BallSize - 48);
-            DrawStatPair(g, "\u2191", up, "\u2193", down, 79);
+            // 数字别太贪大：球是 122 见方，25 磅的数字会把单位挤到身上，
+            // 22 磅配上下面留出的空档才是能看的样子。
+            Font bigFont = UiScale.Font(22.0f, FontStyle.Bold);
+            Font smallUnitFont = UiScale.Font(8.5f, FontStyle.Regular);
+            int numberY = 27;
+            int unitY = 63;
+            int statY = 85;
+            if (previewVariant == 1)
+            {
+                bigFont = UiScale.Font(20.0f, FontStyle.Bold);
+                numberY = 29;
+                unitY = 62;
+                statY = 83;
+            }
+            else if (previewVariant == 2)
+            {
+                bigFont = speedFont;
+                smallUnitFont = unitFont;
+                numberY = 28;
+                unitY = 61;
+                statY = 79;
+            }
+            else if (previewVariant == 3)
+            {
+                bigFont = UiScale.Font(18.0f, FontStyle.Bold);
+                numberY = 31;
+                unitY = 61;
+                statY = 82;
+            }
+
+            DrawCenteredLine(g, main.Value, bigFont, numberY, Color.FromArgb(20, 27, 42), BallSize - 30);
+            DrawCenteredLine(g, main.Unit, smallUnitFont, unitY, Color.FromArgb(70, 84, 102), BallSize - 48);
+            DrawStatPair(g, "\u2191", up, "\u2193", down, statY);
         }
 
         private void DrawStatPair(Graphics g, string upArrow, string up, string downArrow, string down, int y)
         {
-            Font valueFont = statFont;
-            Font arrowFont = statArrowFont;
-            bool disposeFonts = false;
-            float arrowGap = 1.5f;
-            float pairGap = 7.0f;
-            // The ball is a circular window and its bottom edge is much narrower than
-            // the form, so keep this row inside the safe chord width of the circle.
-            float maxWidth = BallSize - 34.0f;
-            float total = MeasureStatRow(g, upArrow, arrowFont, up, valueFont,
+            const float arrowGap = 1.5f;
+            const float pairGap = 7.0f;
+            float total = MeasureStatRow(g, upArrow, statArrowFont, up, statFont,
                 downArrow, down, arrowGap, pairGap);
-            if (total > maxWidth)
+            if (total <= 0.0f)
             {
-                float scale = maxWidth / total;
-                valueFont = new Font(statFont.FontFamily, Math.Max(8.0f, statFont.Size * scale),
-                    statFont.Style, statFont.Unit);
-                arrowFont = new Font(statArrowFont.FontFamily, Math.Max(9.5f, statArrowFont.Size * scale),
-                    statArrowFont.Style, statArrowFont.Unit);
-                disposeFonts = true;
-                total = MeasureStatRow(g, upArrow, arrowFont, up, valueFont,
-                    downArrow, down, arrowGap, pairGap);
+                return;
             }
 
-            float x = (BallSize - total) / 2.0f;
-            float numY = y;
-            float arrowY = y - (arrowFont.Height - valueFont.Height) / 2.0f;
+            // 球是圆的，底下这一行必须挤进圆的"安全宽度"里。
+            // 超了就整行等比缩小（不是只改字号），这样不管字体测量的误差怎么算，
+            // 画出来的宽度都不会越过圆边。
+            float maxWidth = BallSize - 40.0f;
+            float scale = total > maxWidth ? maxWidth / total : 1.0f;
+            float x = (BallSize - total * scale) / 2.0f;
+            float arrowOffset = (statFont.Height - statArrowFont.Height) / 2.0f;
+
+            GraphicsState state = g.Save();
+            g.TranslateTransform(x, y);
+            g.ScaleTransform(scale, scale);
 
             using (Brush upBrush = new SolidBrush(Color.FromArgb(255, 16, 198, 94)))
             using (Brush downBrush = new SolidBrush(Color.FromArgb(255, 35, 119, 238)))
             using (Brush light = new SolidBrush(Color.FromArgb(176, 255, 255, 255)))
             {
-                float cx = x;
-                DrawStatSegment(g, upArrow, arrowFont, light, ref cx, arrowY + 1);
-                DrawStatSegment(g, up, valueFont, light, ref cx, numY + 1);
-                cx += pairGap;
-                DrawStatSegment(g, downArrow, arrowFont, light, ref cx, arrowY + 1);
-                DrawStatSegment(g, down, valueFont, light, ref cx, numY + 1);
-
-                cx = x;
-                DrawStatSegment(g, upArrow, arrowFont, upBrush, ref cx, arrowY);
-                DrawStatSegment(g, up, valueFont, upBrush, ref cx, numY);
-                cx += pairGap;
-                DrawStatSegment(g, downArrow, arrowFont, downBrush, ref cx, arrowY);
-                DrawStatSegment(g, down, valueFont, downBrush, ref cx, numY);
+                DrawStatRun(g, upArrow, up, downArrow, down, arrowGap, pairGap, arrowOffset, 1.0f, light, light);
+                DrawStatRun(g, upArrow, up, downArrow, down, arrowGap, pairGap, arrowOffset, 0.0f, upBrush, downBrush);
             }
 
-            if (disposeFonts)
-            {
-                valueFont.Dispose();
-                arrowFont.Dispose();
-            }
+            g.Restore(state);
+        }
+
+        private void DrawStatRun(Graphics g, string upArrow, string up, string downArrow, string down,
+            float arrowGap, float pairGap, float arrowOffset, float dy, Brush upBrush, Brush downBrush)
+        {
+            float cx = 0.0f;
+            DrawStatSegment(g, upArrow, statArrowFont, upBrush, ref cx, -arrowOffset + dy);
+            DrawStatSegment(g, up, statFont, upBrush, ref cx, dy);
+            cx += pairGap;
+            DrawStatSegment(g, downArrow, statArrowFont, downBrush, ref cx, -arrowOffset + dy);
+            DrawStatSegment(g, down, statFont, downBrush, ref cx, dy);
         }
 
         private static float MeasureStatRow(Graphics g, string upArrow, Font arrowFont, string up, Font valueFont,
