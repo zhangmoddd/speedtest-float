@@ -20,6 +20,23 @@
   border-bottom: 1px solid var(--border);
 }
 
+/* 路径变了（点面包屑 / 点文件夹卡片 / 从搜索结果定位进某个文件夹）
+   让整条闪一下强调色，然后淡掉。
+   `animation` 而不是 `transition`：它是一次性反馈，不是状态 ——
+   类名在 1.6 秒后被移除，动画结束回到透明，不留任何常驻样式。 */
+.folderbar--flash {
+  animation: folderbar-flash 1600ms ease-out;
+}
+
+@keyframes folderbar-flash {
+  0% {
+    background-color: var(--accent-soft);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
 .folderbar__trail {
   flex: 1;
   min-width: 0;

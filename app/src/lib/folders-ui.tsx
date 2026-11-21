@@ -311,8 +311,35 @@ export interface FolderBarProps {
 
 /** 面包屑 + 新建按钮。放在内容区顶部。 */
 export function FolderBar({ trail, onEnter, onCreate }: FolderBarProps) {
+  /**
+   * 路径变化时让整条面包屑闪一下。
+   *
+   * # 为什么需要
+   *
+   * 从全局搜索定位到一条**在子文件夹里**的笔记时，用户的眼睛全在那个闪烁的
+   * 卡片上，很容易没注意到"页面已经进到「临时」文件夹了" —— 尤其当列表里
+   * 恰好还有一条标题就叫「临时」的笔记时，他会以为下面那张卡片是"临时文件夹
+   * 的入口"，从而判断自己还在顶层（真实的用户反馈原话：
+   * "找到了、也闪了，但找到的是外头的，没有进去"）。
+   *
+   * 面包屑是这个界面上唯一说明"我在哪一层"的东西，让它跟着变一次色，
+   * "进去了"这件事才有第二个信号。手动点面包屑、点文件夹卡片时同样会闪 ——
+   * 那本来也是"位置变了"，反馈一致。
+   */
+  const trailKey = trail.map((f) => f.id).join("/");
+  const [flash, setFlash] = useState(false);
+  const prevTrailKey = useRef(trailKey);
+
+  useEffect(() => {
+    if (prevTrailKey.current === trailKey) return;
+    prevTrailKey.current = trailKey;
+    setFlash(true);
+    const timer = window.setTimeout(() => setFlash(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [trailKey]);
+
   return (
-    <div className="folderbar">
+    <div className={`folderbar${flash ? " folderbar--flash" : ""}`}>
       <nav className="folderbar__trail">
         <button
           type="button"

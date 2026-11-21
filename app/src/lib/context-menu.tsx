@@ -536,7 +536,7 @@ export interface UseFocusHighlightResult {
  *
  * # 清除时机（两条路，先到先算）
  *
- * 1. **到点自动灭**：`HIGHLIGHT_TTL_MS`（2600ms）之后自己消失；
+ * 1. **到点自动灭**：`HIGHLIGHT_TTL_MS`（4000ms）之后自己消失；
  * 2. **用户一交互就灭**：点一下、滚一下、按个键、或者窗口失焦
  *    —— 他开始操作了，说明他已经找到那一条了。
  *

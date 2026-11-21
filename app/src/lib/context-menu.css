@@ -141,11 +141,16 @@
    所以只加**一圈描边 + 一层很淡的底色**，并且用 `outline`（不占布局、
    不影响卡片尺寸）。
 
-   进场做成**闪两下**（亮 → 灭 → 亮 → 灭 → 停住）：
+   进场做成**慢慢闪两下**（淡入 → 暗 → 亮 → 暗 → 停住）：
    跳转之后列表可能已经滚到别处、屏幕上几十张卡片长得一模一样，
    一次淡入（220ms）很容易被完全忽略 —— 用户的原话是
    "跳过去应该让我一下子看到目标在哪里"。闪动是余光也能捕捉到的信号，
    而最后一帧停在常亮，保证"闪完之后那一条还是被标着的"。
+
+   ⚠️ 速度和幅度都是被投诉后改过的：第一版 1.1 秒、背景在白和淡蓝之间
+   整块跳，用户的反馈是"太快了，闪眼睛"。现在的规则是
+   **2 秒、只让描边明显呼吸、背景只在很淡的两档之间走**
+   （0.04 ↔ 0.10 的透明蓝），停住的那一帧仍然是完整的高亮。
    ============================================================ */
 
 .card--focus,
@@ -157,31 +162,33 @@
      看起来像两个卡片粘在一起了 */
   outline-offset: -2px;
   background-color: var(--accent-soft);
-  animation: focus-blink 1100ms ease-in-out;
+  animation: focus-blink 2000ms ease-in-out;
 }
 
-/* 两亮两灭：12% / 54% 是两次亮起，38% / 78% 是两次熄灭，
-   100% 停回亮态（配合上面的 `outline` 与 `background-color`）。 */
+/* 两次呼吸：
+   15% / 65% 是完全点亮（描边实色），40% / 90% 退到很淡，
+   100% 停回常亮。描边在 1.0 ↔ 0.28 透明度之间走，背景只在 0.10 ↔ 0.04，
+   所以"闪"发生在描边上，卡片底色不会一大块一大块地翻。 */
 @keyframes focus-blink {
   0% {
-    outline-color: transparent;
-    background-color: transparent;
+    outline-color: rgba(29, 78, 216, 0.25);
+    background-color: rgba(29, 78, 216, 0.04);
   }
-  12% {
+  15% {
     outline-color: var(--accent);
     background-color: var(--accent-soft);
   }
-  38% {
-    outline-color: transparent;
-    background-color: transparent;
+  40% {
+    outline-color: rgba(29, 78, 216, 0.28);
+    background-color: rgba(29, 78, 216, 0.04);
   }
-  54% {
+  65% {
     outline-color: var(--accent);
     background-color: var(--accent-soft);
   }
-  78% {
-    outline-color: transparent;
-    background-color: transparent;
+  90% {
+    outline-color: rgba(29, 78, 216, 0.32);
+    background-color: rgba(29, 78, 216, 0.05);
   }
   100% {
     outline-color: var(--accent);
