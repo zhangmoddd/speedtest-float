@@ -14,6 +14,9 @@
  *
  * - `Enter` = **去那里把它打开**（片段 / 备忘 / 计时器打开编辑器；链接只定位高亮，
  *   因为链接的"打开"是启动程序，那是它的主动作）
+ * - **鼠标点击结果行 = 只定位**，不打开。跳过去之后目标会滚到视口中间并闪两下，
+ *   用户先看清"它在哪"，想打开再点那张卡片。打开编辑器会把列表换掉，
+ *   等于把"位置"这个信息当场销毁 —— 而点搜索结果的人往往正要找位置。
  * - `Ctrl+Enter` = **执行这个条目的主动作**（片段 → 键入到光标；链接 → 启动；
  *   备忘 / 计时器 → 打开编辑器）
  * - `Shift+Enter` = **复制这一条的内容到剪贴板**
@@ -58,8 +61,35 @@ import {
   type PaletteKey,
 } from "./navigation";
 import { searchAll, type SearchData, type SearchHit, type SearchKind } from "./search";
+import { markSegments } from "./search-highlight";
 
 import "./command-palette.css";
+
+/**
+ * 把一段文字里命中搜索词的部分套上 `<mark>`。
+ *
+ * 为什么不在 `searchAll` 里顺手返回切好的片段：搜索结果还要参与排序、
+ * 被别处（例如以后的搜索历史）复用，而"怎么切"只跟**当前输入**有关。
+ * 放在渲染这一层，改搜索词时切分自然跟着变，不需要重新搜一遍。
+ */
+function Marked({ text, query }: { text: string; query: string }) {
+  const segments = markSegments(text, query);
+  if (segments.length === 1 && !segments[0].hit) return <>{text}</>;
+  return (
+    <>
+      {segments.map((segment, i) =>
+        segment.hit ? (
+          // key 用下标：片段是这次渲染的稳定切法，没有"重新排序"的问题
+          <mark key={i} className="palette__mark">
+            {segment.text}
+          </mark>
+        ) : (
+          <span key={i}>{segment.text}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 /** 每一类结果的图标。 */
 const KIND_ICON: Record<SearchKind, LucideIcon> = {
@@ -476,15 +506,25 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
                 onMouseEnter={() => setCursor(i)}
                 // 按下时不让输入框失焦：失焦之后上下键就选不动了
                 onMouseDown={(e) => e.preventDefault()}
-                // 点一行 = 按回车那一档（"去那里把它打开"）。
-                // 鼠标点是最容易误触的入口，得让它做**最可预期**的那件事 ——
-                // 而不是"复制"或"键入到光标"。
-                onClick={() => act(hit, "Enter")}
+                // 点一行 = **只定位**，等价于「跳过去并把它闪出来」。
+                //
+                // ⚠️ 这里刻意**不是**回车那一档（`Enter` 对笔记 / 备忘 / 计时器是
+                // 「定位并打开」）。原因：打开编辑器会把列表整棵换掉，用户就再也
+                // 看不见"这条原来在列表的哪个位置"—— 而他点搜索结果的意图
+                // 通常正是"让我看看它在哪"。想打开的话，定位过去之后点那张卡片
+                // 就行（卡片自己的点击本来就是打开编辑器）。
+                onClick={() => void run(hit, "focus")}
               >
                 <Icon size={14} className="palette__rowicon" />
                 <span className="palette__text">
-                  <span className="palette__title">{hit.title}</span>
-                  {hit.detail && <span className="palette__detail">{hit.detail}</span>}
+                  <span className="palette__title">
+                    <Marked text={hit.title} query={query} />
+                  </span>
+                  {hit.detail && (
+                    <span className="palette__detail">
+                      <Marked text={hit.detail} query={query} />
+                    </span>
+                  )}
                 </span>
                 <span className="palette__kind">{KIND_LABEL[hit.kind]}</span>
               </div>
@@ -521,6 +561,9 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           <span className="palette__keys">
             <kbd>↑</kbd>
             <kbd>↓</kbd> 选择 · <kbd>Esc</kbd> 关闭
+            {/* 鼠标用户看不到「Enter 定位并打开」那张表，得单独说一句
+                点击做的是哪一档 —— 否则点完发现没打开编辑器会以为坏了 */}
+            {hits.length > 0 && <span className="palette__click-hint">点击只定位</span>}
             {hits.length > 0 && <span className="palette__count">{hits.length} 条</span>}
           </span>
         </div>

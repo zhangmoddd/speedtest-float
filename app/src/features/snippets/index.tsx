@@ -603,6 +603,16 @@ export function SnippetsPanel() {
     const folder = folderToEnter(pending);
     if (folder.known) folders.enter(folder.folderId);
 
+    /**
+     * 清掉页内搜索词。
+     *
+     * 它是**上一次**在这一页里搜的东西，和这次从命令面板发起的全局搜索
+     * 没有关系。不清的话，目标很可能正好被那个词过滤掉 —— 列表里根本没有
+     * 那张卡片，于是 `scrollIntoViewSoon` 找不到元素、高亮也无处可挂，
+     * 表现就是"跳过来了，但看不见目标"。
+     */
+    if (query !== "") setQuery("");
+
     focus.show(highlightFrom(pending));
     scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
 

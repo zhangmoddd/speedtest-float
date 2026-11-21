@@ -478,25 +478,43 @@ export const PANEL_BLUR_SETTLE_MS = 120;
  * 把某个 id 的元素滚进可视区。找不到就什么都不做（不是错误）。
  *
  * 为什么要 `requestAnimationFrame` 再滚：定位请求到达时，页面常常**同一帧**
- * 正在换文件夹 / 换日期 —— 列表内容还没提交到 DOM，这时 `getElementById`
- * 找到的是"上一屏"的元素（或者干脆找不到）。等一帧再滚才滚得对。
+ * 正在换文件夹 / 换日期 / 清掉页内搜索词 —— 列表内容还没提交到 DOM，
+ * 这时 `getElementById` 找到的是"上一屏"的元素（或者干脆找不到）。
+ *
+ * # 为什么要重试，而不是只等一帧
+ *
+ * "等一帧"这个假设只在**列表数据已经在手**时成立。真实的跳转路径里，
+ * 目标页可能是刚挂载的：`snippets` 还是 `[]`、文件夹列表还在 IPC 路上、
+ * 备忘页还要先异步读那一天的笔记。这些都不是一帧能完成的。
+ * 原来只找一次、找不到就静默 return —— 表现正是用户报的
+ * 「跳过去了，但没滚到那一条」，而且**没有任何报错**，最难排查。
+ *
+ * 所以这里在 `timeoutMs` 内逐帧重试。找不到就安静放弃（条目可能真的
+ * 被别的窗口删了），不抛错、不弹提示 —— 那不是"操作失败"。
  *
  * 为什么用 `block: "center"` 而不是 `"nearest"`：`nearest` 在条目**已经**
  * 在视口里时**完全不滚**，于是高亮出现的位置可能贴着列表最上/最下边缘，
  * 用户很难注意到。居中滚动会让它出现在视线正中。
  */
-export function scrollIntoViewSoon(domId: string): void {
-  window.requestAnimationFrame(() => {
+export function scrollIntoViewSoon(domId: string, timeoutMs = 800): void {
+  const deadline = Date.now() + timeoutMs;
+
+  const tick = () => {
     const el = document.getElementById(domId);
-    if (!el) return;
-    // 有些 WebView 版本上 `scrollIntoView` 的选项参数会被忽略；
-    // 那时退化成 `scrollIntoView()`（对齐到上边缘），仍然是"能看见"
-    try {
-      el.scrollIntoView({ block: "center", inline: "nearest" });
-    } catch {
-      el.scrollIntoView();
+    if (el) {
+      // 有些 WebView 版本上 `scrollIntoView` 的选项参数会被忽略；
+      // 那时退化成 `scrollIntoView()`（对齐到上边缘），仍然是"能看见"
+      try {
+        el.scrollIntoView({ block: "center", inline: "nearest" });
+      } catch {
+        el.scrollIntoView();
+      }
+      return;
     }
-  });
+    if (Date.now() < deadline) window.requestAnimationFrame(tick);
+  };
+
+  window.requestAnimationFrame(tick);
 }
 
 export interface UseFocusHighlightResult {

@@ -135,11 +135,17 @@
    搜索结果定位后的高亮（lib/focus-highlight.ts）
 
    规则：短暂（2.6 秒）+ 用户一交互就灭，所以它**不能**是
-   `:hover` 那种常驻态，也不能改 `background` —— 那会和卡片自己的
-   悬停态打架，用户分不清"这是高亮还是我鼠标停在这儿"。
+   `:hover` 那种常驻态，也不能改 `background` 的**最终值** ——
+   那会和卡片自己的悬停态打架，用户分不清"这是高亮还是我鼠标停在这儿"。
 
    所以只加**一圈描边 + 一层很淡的底色**，并且用 `outline`（不占布局、
-   不影响卡片尺寸），动画只做一次淡入。
+   不影响卡片尺寸）。
+
+   进场做成**闪两下**（亮 → 灭 → 亮 → 灭 → 停住）：
+   跳转之后列表可能已经滚到别处、屏幕上几十张卡片长得一模一样，
+   一次淡入（220ms）很容易被完全忽略 —— 用户的原话是
+   "跳过去应该让我一下子看到目标在哪里"。闪动是余光也能捕捉到的信号，
+   而最后一帧停在常亮，保证"闪完之后那一条还是被标着的"。
    ============================================================ */
 
 .card--focus,
@@ -151,21 +157,40 @@
      看起来像两个卡片粘在一起了 */
   outline-offset: -2px;
   background-color: var(--accent-soft);
-  animation: focus-highlight-in 220ms ease-out;
+  animation: focus-blink 1100ms ease-in-out;
 }
 
-@keyframes focus-highlight-in {
-  from {
+/* 两亮两灭：12% / 54% 是两次亮起，38% / 78% 是两次熄灭，
+   100% 停回亮态（配合上面的 `outline` 与 `background-color`）。 */
+@keyframes focus-blink {
+  0% {
     outline-color: transparent;
     background-color: transparent;
   }
-  to {
+  12% {
+    outline-color: var(--accent);
+    background-color: var(--accent-soft);
+  }
+  38% {
+    outline-color: transparent;
+    background-color: transparent;
+  }
+  54% {
+    outline-color: var(--accent);
+    background-color: var(--accent-soft);
+  }
+  78% {
+    outline-color: transparent;
+    background-color: transparent;
+  }
+  100% {
     outline-color: var(--accent);
     background-color: var(--accent-soft);
   }
 }
 
-/* 用户关掉了动画就不要再动：那是"晕动症"设置，不是装饰偏好 */
+/* 用户关掉了动画就不要再动：那是"晕动症"设置，不是装饰偏好。
+   这时靠上面那两条静态的描边 + 底色照样能标出目标。 */
 @media (prefers-reduced-motion: reduce) {
   .card--focus,
   .memo__card--focus,

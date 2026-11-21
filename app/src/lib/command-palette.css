@@ -147,6 +147,24 @@
   white-space: nowrap;
 }
 
+/* 搜索词命中的那一段。
+   用琥珀底而不是强调蓝：选中行本身就是淡蓝底（`.palette__row--on`），
+   再叠一层蓝就等于没标。琥珀在浅底和淡蓝底上都跳得出来，而且
+   "黄色荧光笔"是搜索高亮的通用心智。
+   底色半透明 + 继承文字颜色：标题（深灰）和副标题（浅灰）各自保持
+   自己的层级，不会因为被标中而突然变成同一档。 */
+.palette__mark {
+  padding: 0 1px;
+  border-radius: 3px;
+  background: rgba(250, 204, 21, 0.55);
+  color: inherit;
+  font-weight: 600;
+}
+
+.palette__click-hint {
+  white-space: nowrap;
+}
+
 .palette__kind {
   flex-shrink: 0;
   padding: 1px 5px;
