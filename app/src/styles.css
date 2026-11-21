@@ -100,7 +100,12 @@ textarea {
   font-family: inherit;
 }
 
-/* 细滚动条，避免粗滚动条破坏紧凑布局 */
+/* 细滚动条，避免粗滚动条破坏紧凑布局。
+   ⚠️ 占位宽度（8px）和可见宽度（4px）是两回事，别再改错：
+   轨道固定占 8px —— 这个值决定内容区的右边界，改了所有页面的宽度都会跟着动；
+   真正看得见的那条胶囊靠 `border: 2px solid transparent` + `background-clip: content-box`
+   缩到 4px 并居中在轨道里。原来直接把 8px 填满，在 420px 宽的面板里
+   看起来就是一条贴在边框上的深色杠，比内容还抢眼。 */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -109,11 +114,17 @@ textarea {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.16);
-  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.28);
+  background: rgba(0, 0, 0, 0.34);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* ============================================================
