@@ -126,6 +126,10 @@ const KIND_ICON: Record<LinkKind, LucideIcon> = {
  * target → PNG data URL。
  *
  * 刻意放在模块作用域而不是 useRef：见文件头「设计决策 3」。
+ *
+ * 这只是**本窗口内**的一层。Rust 侧还有一层磁盘缓存
+ * （`%APPDATA%\浮光\icon-cache.json`，见 `linkicon.rs`）：向系统要一个图标要几毫秒到
+ * 几百毫秒、而且是串行的，99 个图标实测要 3.9 秒 —— 不存盘的话每次重开面板都要重新刷一遍。
  */
 const iconCache = new Map<string, string>();
 

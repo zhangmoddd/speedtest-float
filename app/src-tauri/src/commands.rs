@@ -1062,9 +1062,12 @@ pub async fn links_dedupe(app: AppHandle) -> usize {
 ///
 /// 失败返回 `null`，前端会退回按类型区分的内置图标。
 /// 提取涉及 Shell 与 GDI，属于"尽力而为"，不能让失败影响到界面。
+///
+/// 走磁盘缓存（见 `linkicon::extract_cached`）：向系统要图标很慢
+/// （实测 99 个加起来 3.9 秒），每次打开面板都重来的话，图标墙要刷好几秒。
 #[tauri::command]
-pub async fn link_icon(path: String) -> Option<IconData> {
-    linkicon::extract(&path)
+pub async fn link_icon(app: AppHandle, path: String) -> Option<IconData> {
+    linkicon::extract_cached(&app, &path)
 }
 
 /// 判断一批路径各自是什么（拖拽添加链接时用）。

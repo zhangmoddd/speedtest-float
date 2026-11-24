@@ -17,9 +17,13 @@
 
 #![cfg(windows)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tauri::AppHandle;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ,
@@ -35,6 +39,251 @@ pub struct IconData {
     pub height: u32,
     /// RGBA 像素的 base64 编码，长度应为 width*height*4。
     pub rgba_base64: String,
+}
+
+// ===============================================================
+// 磁盘缓存
+// ===============================================================
+//
+// # 为什么要存盘
+//
+// 向系统要图标不便宜：在用户的机器上实测（128 条链接、99 个不同的目标），
+// 光 `SHGetFileInfoW` 这一步加起来就要 **3.9 秒**，最慢的单个 451 毫秒
+// （指向慢盘或需要解析目标的 `.lnk`）。而提取是串行的（见 `ICON_LOCK`），
+// 于是每次重开面板、每开一个新面板窗口，整面图标墙都要重新排一遍队 ——
+// 用户的原话：「好多软件的图标都刷的有点慢，要好一会才出来」。
+//
+// 图标几乎不会变，属于"算一次能用很久"的东西。第一次提取完就落盘，
+// 之后直接从缓存给，面板一打开图标就在。
+//
+// # 存在哪、长什么样
+//
+// `%APPDATA%\浮光\icon-cache.json`，一个 `路径 → {宽, 高, RGBA, 提取时刻}` 的表。
+// 不进备份：备份只搬六段用户数据，图标是能重新提取的衍生品，
+// 带进备份只会白白撑大体积、还会把别的机器的路径带过来。
+//
+// # 怎么保证不会一直显示旧图标
+//
+// 软件升级后图标会变。每条缓存记着提取时刻，超过 [`MAX_AGE_SECS`]（7 天）
+// 时**先把旧的给出去**（界面上瞬间有图），再在后台重新提取一次覆盖 ——
+// 旧图标最多多显示几秒，而不用等。
+//
+// # 坏了怎么办
+//
+// 这个文件坏了就当没有：不走 `storage::read_json`（它会把坏文件改名留证，
+// 对一份可再生的东西没必要），也不往日志里刷屏。下一次提取完会重新写一份好的。
+
+/// 缓存文件名（数据目录下）。
+const CACHE_FILE: &str = "icon-cache.json";
+/// 一条缓存多久之后在后台重新提取一次。
+const MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// 新提取到图标之后，隔多久把缓存落一次盘。
+///
+/// 冷启动时几十个图标会在一两秒内陆续提取出来，每来一个就整份写一次磁盘
+/// （半 MB）是浪费；攒 2 秒一起写，关软件前一般也来得及。
+const FLUSH_DELAY: Duration = Duration::from_millis(2000);
+/// 缓存条数上限。超过就把最老的丢到这个数的一半 —— 删掉的链接、换掉的程序
+/// 不该让这份文件无限长。
+const CACHE_MAX_ENTRIES: usize = 1500;
+
+/// 缓存里的一条。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CacheEntry {
+    w: u32,
+    h: u32,
+    rgba: String,
+    /// 提取时刻（Unix 秒）。
+    at: u64,
+}
+
+/// 进程内的缓存状态。
+#[derive(Debug, Default)]
+struct Cache {
+    entries: HashMap<String, CacheEntry>,
+    /// 有没有改动还没落盘。
+    dirty: bool,
+    /// 有没有从磁盘读过（只读一次）。
+    loaded: bool,
+}
+
+static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+fn cache_slot() -> &'static Mutex<Cache> {
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+/// 有没有一次落盘已经在排队。
+static FLUSH_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// 缓存的键：路径去掉首尾空白、不区分大小写。
+///
+/// 同一个程序在数据里可能写成 `C:\X\A.exe` 和 `c:\x\a.exe`（拖进来时是什么样就是什么样），
+/// Windows 的路径本来就不区分大小写，按原样当键会让同一个图标存两份、提取两次。
+fn cache_key(path: &str) -> String {
+    path.trim().to_lowercase()
+}
+
+/// 现在的 Unix 秒。拿不到（理论上不会）当 0 —— 后果只是那一条被当成过期、重新提取。
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 解析缓存文件。任何不合法的内容都当成空缓存。
+fn parse_cache(raw: &str) -> HashMap<String, CacheEntry> {
+    serde_json::from_str(crate::storage::strip_bom(raw)).unwrap_or_default()
+}
+
+/// 把缓存裁到上限以内：丢最老的，留一半的空间给新条目。
+///
+/// 按"条数"裁而不是按时间阈值：冷启动时几十条是同一秒提取的，`at` 完全相同，
+/// 按阈值裁会把它们整批一起丢掉（或者一个都丢不掉）。
+fn prune(entries: &mut HashMap<String, CacheEntry>) {
+    if entries.len() <= CACHE_MAX_ENTRIES {
+        return;
+    }
+    let mut list: Vec<(String, CacheEntry)> = entries.drain().collect();
+    // 老的在前；同秒的保持稳定顺序
+    list.sort_by_key(|(_, e)| e.at);
+    let keep_from = list.len() - CACHE_MAX_ENTRIES / 2;
+    list.drain(..keep_from);
+    *entries = list.into_iter().collect();
+}
+
+/// 只在第一次用到时读一次磁盘。
+fn load_once(cache: &mut Cache, app: &AppHandle) {
+    if cache.loaded {
+        return;
+    }
+    cache.loaded = true;
+    let path = match cache_path(app) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // 不走 storage::read_json：那会把坏文件改名留证并记日志。
+    // 缓存坏了就是没有，不值得惊动用户。
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        cache.entries = parse_cache(&raw);
+    }
+}
+
+fn cache_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    crate::storage::safe_data_path(app, CACHE_FILE)
+}
+
+/// 安排一次落盘（2 秒后，期间的新提取一起写）。
+fn schedule_flush(app: AppHandle) {
+    if FLUSH_SCHEDULED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(FLUSH_DELAY);
+        loop {
+            let snapshot = {
+                let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
+                if !cache.dirty {
+                    // 没东西可写就撤掉这次的"排队"标记。必须在锁里改：
+                    // 之后进来的提取会先把 dirty 置真、再来排队，不会被漏掉。
+                    FLUSH_SCHEDULED.store(false, Ordering::Release);
+                    return;
+                }
+                cache.dirty = false;
+                prune(&mut cache.entries);
+                cache.entries.clone()
+            };
+            // 和其它数据文件共用写锁：备份导入正在整份重写数据目录时别插队
+            let path = match cache_path(&app) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let _ = crate::state::with_write_lock(|| {
+                crate::storage::write_json_at(&path, &snapshot)
+            });
+            // 写的这段时间里可能又有新图标进来了，回头再看一眼
+        }
+    });
+}
+
+/// 提取图标，带磁盘缓存。失败返回 `None`。
+///
+/// 调用方拿到的永远是"现在就能给的"：缓存里有就给缓存（哪怕它已经过期），
+/// 没有就现场提取。过期的那条会在后台悄悄重新提取并覆盖，不挡这一次的显示。
+pub fn extract_cached(app: &AppHandle, path: &str) -> Option<IconData> {
+    let key = cache_key(path);
+    let now = now_secs();
+    {
+        let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
+        load_once(&mut cache, app);
+        if let Some(e) = cache.entries.get(&key) {
+            let stale = now.saturating_sub(e.at) > MAX_AGE_SECS;
+            let icon = IconData {
+                width: e.w,
+                height: e.h,
+                rgba_base64: e.rgba.clone(),
+            };
+            drop(cache);
+            if stale {
+                refresh_in_background(app.clone(), path.to_string(), key);
+            }
+            return Some(icon);
+        }
+    }
+    let icon = extract(path)?;
+    {
+        let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
+        cache.entries.insert(
+            key,
+            CacheEntry {
+                w: icon.width,
+                h: icon.height,
+                rgba: icon.rgba_base64.clone(),
+                at: now,
+            },
+        );
+        cache.dirty = true;
+    }
+    schedule_flush(app.clone());
+    Some(icon)
+}
+
+/// 在后台重新提取一条，成功就覆盖缓存。
+///
+/// 提取失败且**路径已经不存在**时把这条缓存删掉：否则一个被卸载的程序
+/// 会永远顶着旧图标。路径还在只是暂时读不到（盘在休眠）就留着，下次再说。
+fn refresh_in_background(app: AppHandle, path: String, key: String) {
+    std::thread::spawn(move || {
+        let Some(icon) = extract(&path) else {
+            // "还在不在"只对本地路径核对。网络路径连 `exists()` 都不能碰 ——
+            // 理由和 `extract` 开头一样：一次探测就是把当前用户的认证发出去。
+            let local = !touches_network(&path) && !drive_letter(&path).is_some_and(is_remote_drive);
+            if local && !std::path::Path::new(&path).exists() {
+                let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
+                cache.entries.remove(&key);
+                cache.dirty = true;
+                drop(cache);
+                schedule_flush(app);
+            }
+            return;
+        };
+        let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
+        cache.entries.insert(
+            key,
+            CacheEntry {
+                w: icon.width,
+                h: icon.height,
+                rgba: icon.rgba_base64,
+                at: now_secs(),
+            },
+        );
+        cache.dirty = true;
+        drop(cache);
+        schedule_flush(app);
+    });
 }
 
 /// 提取串行化用的锁。
@@ -503,5 +752,72 @@ mod tests {
         ] {
             assert!(!touches_network(good), "不该拦住：{good}");
         }
+    }
+
+    // ---------- 磁盘缓存 ----------
+
+    #[test]
+    fn 缓存的键不区分大小写和首尾空白() {
+        // Windows 的路径本来就不区分大小写：按原样当键，同一个图标会存两份、提取两次
+        let a = cache_key(r"C:\Tools\A.exe");
+        assert_eq!(a, cache_key(r"c:\tools\A.EXE"));
+        assert_eq!(a, cache_key("  C:\\Tools\\A.exe  "));
+    }
+
+    #[test]
+    fn 缓存文件能读回来_带bom也行() {
+        let raw = r#"{"c:\\a.exe":{"w":32,"h":32,"rgba":"AAAA","at":100}}"#;
+        let entries = parse_cache(raw);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[&cache_key(r"C:\A.exe")].rgba, "AAAA");
+
+        // 用户用记事本打开看过一眼，存下来就带 BOM 了
+        assert_eq!(parse_cache(&format!("\u{feff}{raw}")).len(), 1);
+    }
+
+    #[test]
+    fn 缓存文件坏了就当成空的而不是崩掉() {
+        // 缓存是可再生的东西：坏文件不该让图标功能整体失效，也不该把坏文件改名留证
+        for bad in ["", "not json", "{", r#"{"c:\\a.exe":{"w":32}}"#] {
+            assert!(parse_cache(bad).is_empty(), "应当成空缓存：{bad:?}");
+        }
+    }
+
+    fn entry(at: u64) -> CacheEntry {
+        CacheEntry {
+            w: 1,
+            h: 1,
+            rgba: "AAAA".into(),
+            at,
+        }
+    }
+
+    #[test]
+    fn 缓存超限时丢最老的并留一半空间() {
+        let mut entries: HashMap<String, CacheEntry> = (0..CACHE_MAX_ENTRIES + 300)
+            .map(|i| (format!("p{i}"), entry(i as u64)))
+            .collect();
+        prune(&mut entries);
+        assert_eq!(entries.len(), CACHE_MAX_ENTRIES / 2, "裁完留一半");
+        assert!(entries.contains_key(&format!("p{}", CACHE_MAX_ENTRIES + 299)), "最新的必须留着");
+        assert!(!entries.contains_key("p0"), "最老的必须丢掉");
+    }
+
+    #[test]
+    fn 同一秒提取的一批超限时不会被整批丢光() {
+        // 冷启动时几十条是同一秒提取的，at 完全相同；按时间阈值裁会把它们一起丢掉
+        let mut entries: HashMap<String, CacheEntry> = (0..CACHE_MAX_ENTRIES + 10)
+            .map(|i| (format!("p{i}"), entry(42)))
+            .collect();
+        prune(&mut entries);
+        assert_eq!(entries.len(), CACHE_MAX_ENTRIES / 2, "同秒也要精确留一半");
+    }
+
+    #[test]
+    fn 没超限时缓存原样不动() {
+        let mut entries: HashMap<String, CacheEntry> =
+            (0..10).map(|i| (format!("p{i}"), entry(i))).collect();
+        prune(&mut entries);
+        assert_eq!(entries.len(), 10);
     }
 }

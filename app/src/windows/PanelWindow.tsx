@@ -24,7 +24,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 
 import { DEFAULT_FEATURE_ID, sortedFeatures } from "../features/registry";
 import { api, emitSettingsChanged, onSettingsChanged } from "../lib/api";
-import { CommandPalette } from "../lib/command-palette";
+import { CommandPalette, warmPaletteData } from "../lib/command-palette";
 import {
   FocusContext,
   useFocusBus,
@@ -191,6 +191,13 @@ export function PanelWindow() {
         /* 读不到就按默认（置顶）显示 */
       }
     })();
+  }, []);
+
+  // 搜索数据预热：面板一挂载就把四份数据读好放着，
+  // 之后按 Ctrl+K 第一个键按下去就有结果，不用先等"正在读取数据…"。
+  // 真正执行动作时用的仍是搜索框打开后重读到的那份（见 command-palette.tsx）。
+  useEffect(() => {
+    warmPaletteData();
   }, []);
 
   // 设置页改「面板保持置顶」时，图钉和**窗口本身**都要跟着变。
