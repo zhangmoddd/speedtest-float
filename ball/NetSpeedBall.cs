@@ -7825,11 +7825,10 @@ namespace NetSpeedBall
     }
 
     /// <summary>
-    /// 拖动悬浮球时出现在屏幕下方的「发射台」。
-    ///
-    /// 画面是一张侧视的发射场：天空、地面、带桁架的发射塔、服务臂、水泥坪、旁边的储罐。
-    /// 没有光圈、弧线、箭头这些装饰。球拖进坪面（激活）时服务臂缩回、塔灯变绿、
-    /// 火箭底部开始排汽；松手后一大团白烟沿地面翻滚散开，再收起。
+    /// 拖动悬浮球时出现在屏幕下方的「发射台」—— 一个卡通小发射台，不是写实场景：
+    /// 淡蓝的天、两朵慢慢飘的云、一座小山丘、圆圆的发射坪、矮墩墩的小塔、一面飘的小旗。
+    /// 出场时整个台子从坪面往上弹出来；球拖进坪面（激活）时夹爪张开、小手臂扬起让路、
+    /// 塔灯变绿、火箭底部开始排汽；松手后一大团棉花糖似的白烟沿坪面翻滚散开，再收起。
     ///
     /// 动画由自己的 33ms 时钟驱动，**只在可见时走**，隐藏时就停，不占 CPU。
     /// </summary>
@@ -7844,12 +7843,16 @@ namespace NetSpeedBall
         // 坪面中心的 x（设计稿坐标，96 DPI）
         private const float PadCx = LW / 2.0f;
 
-        /// <summary>点火冲击波时长（秒）。</summary>
-        private const double BurstDuration = 0.55;
+        /// <summary>点火白烟时长（秒）。</summary>
+        private const double BurstDuration = 0.6;
 
         /// <summary>动画时钟（秒），只在可见时累加。</summary>
         private double clock;
-        /// <summary>点火冲击波进度 0→1；小于 0 表示没在播。</summary>
+        /// <summary>出场进度 0→1（约 0.26 秒）：台子从坪面往上弹出来。</summary>
+        private double popT = 1.0;
+        /// <summary>小手臂扬起、夹爪张开的进度 0→1，跟着激活状态平滑过渡。</summary>
+        private float armRetract;
+        /// <summary>点火白烟进度 0→1；小于 0 表示没在播。</summary>
         private double burst = -1.0;
         private DateTime lastTick;
         private readonly FormsTimer animTimer;
@@ -7868,11 +7871,11 @@ namespace NetSpeedBall
             ShowInTaskbar = false;
             TopMost = true;
             BackColor = Color.FromArgb(248, 252, 255);
-            Opacity = 0.94;
+            Opacity = 1.0;
             DoubleBuffered = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
             hintFont = UiScale.Font(9.0f, FontStyle.Regular, "Microsoft YaHei UI");
-            hintBoldFont = UiScale.Font(10.0f, FontStyle.Bold, "Microsoft YaHei UI");
+            hintBoldFont = UiScale.Font(10.5f, FontStyle.Bold, "Microsoft YaHei UI");
             animTimer = new FormsTimer { Interval = 33 };
             animTimer.Tick += OnAnimTick;
             UpdateWindowRegion();
@@ -7885,6 +7888,7 @@ namespace NetSpeedBall
             if (Visible)
             {
                 lastTick = DateTime.UtcNow;
+                popT = 0.0;
                 animTimer.Start();
             }
             else
@@ -7899,12 +7903,19 @@ namespace NetSpeedBall
             double elapsed = Math.Min(0.08, Math.Max(0.0, (now - lastTick).TotalSeconds));
             lastTick = now;
             clock += elapsed;
+            popT = Math.Min(1.0, popT + elapsed / 0.26);
+            // 手臂和夹爪用 0.2 秒平滑地张开/合上，不瞬变
+            float target = active ? 1.0f : 0.0f;
+            float step = (float)(elapsed / 0.2);
+            armRetract = armRetract < target
+                ? Math.Min(target, armRetract + step)
+                : Math.Max(target, armRetract - step);
             if (burst >= 0.0)
             {
                 burst += elapsed / BurstDuration;
                 if (burst >= 1.0)
                 {
-                    // 冲击波放完，自己收起（球那边不再管）
+                    // 白烟放完，自己收起（球那边不再管）
                     burst = -1.0;
                     Hide();
                     return;
@@ -7913,7 +7924,7 @@ namespace NetSpeedBall
             Invalidate();
         }
 
-        /// <summary>点火：留在屏幕上播一段冲击波，放完自己隐藏。</summary>
+        /// <summary>点火：留在屏幕上播一段白烟，放完自己隐藏。</summary>
         public void PlayBurst()
         {
             SetActive(false);
@@ -7925,7 +7936,7 @@ namespace NetSpeedBall
             Invalidate();
         }
 
-        /// <summary>球又被按住了：冲击波别再播，回到待命。</summary>
+        /// <summary>球又被按住了：白烟别再播，回到待命。</summary>
         public void CancelBurst()
         {
             burst = -1.0;
@@ -7941,6 +7952,8 @@ namespace NetSpeedBall
                 pad.active = activeState;
                 pad.clock = clockSeconds;
                 pad.burst = burstProgress;
+                pad.popT = 1.0;
+                pad.armRetract = activeState ? 1.0f : 0.0f;
                 g.Clear(Color.Transparent);
                 pad.DrawSurface(g);
                 bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
@@ -8056,6 +8069,13 @@ namespace NetSpeedBall
             float scale = Width > 0 ? Width / (float)LW : UiScale.Factor;
             g.ScaleTransform(scale, scale);
 
+            // 出场：整个台子从坪面往上"弹"出来 —— 先小一点，再带着一点回弹长到原大
+            float pop = EaseOutBack((float)Math.Min(1.0, popT));
+            float popScale = 0.84f + 0.16f * pop;
+            g.TranslateTransform(PadCx, DeckTop);
+            g.ScaleTransform(popScale, popScale);
+            g.TranslateTransform(-PadCx, -DeckTop);
+
             float t = (float)clock;
             DrawScene(g, t);
             if (active)
@@ -8072,152 +8092,265 @@ namespace NetSpeedBall
             }
         }
 
-        /// <summary>一张侧视的发射场：天、地、发射塔、服务臂、水泥坪、旁边一个白色储罐。</summary>
+        private static float EaseOutBack(float x)
+        {
+            float c1 = 1.70158f;
+            float c3 = c1 + 1.0f;
+            return 1.0f + c3 * (x - 1.0f) * (x - 1.0f) * (x - 1.0f) + c1 * (x - 1.0f) * (x - 1.0f);
+        }
+
+        /// <summary>卡通小发射台：淡蓝的天、一座小山丘、圆圆的发射坪、矮墩墩的小塔、一面小旗。</summary>
         private void DrawScene(Graphics g, float t)
         {
-            // ---- 卡片：天空到地平线的很淡的渐变，没有别的装饰 ----
             Rectangle card = new Rectangle(3, 3, LW - 7, LH - 7);
             using (GraphicsPath shell = CreateRoundedRectangle(card, 18))
-            using (LinearGradientBrush sky = new LinearGradientBrush(card,
-                       Color.FromArgb(255, 228, 238, 249), Color.FromArgb(255, 250, 252, 254), LinearGradientMode.Vertical))
-            using (Pen edge = new Pen(Color.FromArgb(255, 184, 196, 210), 1.0f))
             {
-                g.FillPath(sky, shell);
-                g.DrawPath(edge, shell);
-            }
-
-            // ---- 地面 ----
-            using (Brush far = new SolidBrush(Color.FromArgb(255, 226, 231, 238)))
-            using (Brush ground = new LinearGradientBrush(new Rectangle(0, 112, LW, LH - 112),
-                       Color.FromArgb(255, 214, 220, 228), Color.FromArgb(255, 200, 208, 218), LinearGradientMode.Vertical))
-            using (Pen horizon = new Pen(Color.FromArgb(255, 196, 204, 214), 1.0f))
-            {
-                g.FillRectangle(far, 3, 112, LW - 7, 4);
-                g.FillRectangle(ground, 3, 116, LW - 7, LH - 7 - 116 + 3);
-                g.DrawLine(horizon, 3, 112, LW - 4, 112);
-            }
-
-            // 地面上远处两根小的照明杆，给场景一点比例感
-            using (Pen pole = new Pen(Color.FromArgb(255, 170, 180, 192), 1.0f))
-            using (Brush lampHead = new SolidBrush(Color.FromArgb(255, 190, 200, 212)))
-            {
-                g.DrawLine(pole, 28, 112, 28, 96);
-                g.DrawLine(pole, 232, 112, 232, 92);
-                g.FillRectangle(lampHead, 25, 94, 6, 2);
-                g.FillRectangle(lampHead, 229, 90, 6, 2);
-            }
-
-            // ---- 左边的设备箱 ----
-            using (Brush box = new SolidBrush(Color.FromArgb(255, 176, 184, 194)))
-            using (Pen boxEdge = new Pen(Color.FromArgb(255, 140, 150, 162), 0.8f))
-            {
-                g.FillRectangle(box, 56, 92, 14, 20);
-                g.DrawRectangle(boxEdge, 56, 92, 14, 20);
-                g.FillRectangle(box, 70, 98, 8, 14);
-                g.DrawRectangle(boxEdge, 70, 98, 8, 14);
-            }
-
-            // ---- 发射塔：两根立柱 + 横档 + 交叉斜撑 ----
-            const int towerLeft = 84;
-            const int towerRight = 102;
-            // 塔顶压在提示文字（10~28）下面，别和字撞上
-            const int towerTop = 40;
-            using (Pen rail = new Pen(Color.FromArgb(255, 118, 128, 142), 2.0f))
-            using (Pen brace = new Pen(Color.FromArgb(255, 156, 166, 178), 1.0f))
-            using (Brush cap = new SolidBrush(Color.FromArgb(255, 104, 114, 128)))
-            {
-                g.DrawLine(rail, towerLeft, towerTop, towerLeft, DeckTop);
-                g.DrawLine(rail, towerRight, towerTop, towerRight, DeckTop);
-                for (int y = towerTop; y < DeckTop; y += 9)
+                using (LinearGradientBrush sky = new LinearGradientBrush(card,
+                           Color.FromArgb(255, 219, 238, 255), Color.FromArgb(255, 250, 253, 255), LinearGradientMode.Vertical))
                 {
-                    int y2 = Math.Min(y + 9, (int)DeckTop);
-                    g.DrawLine(brace, towerLeft, y, towerRight, y);
-                    // 斜撑一根向下一根向上交替，像真的桁架
-                    if (((y - towerTop) / 9) % 2 == 0)
-                    {
-                        g.DrawLine(brace, towerLeft, y, towerRight, y2);
-                    }
-                    else
-                    {
-                        g.DrawLine(brace, towerRight, y, towerLeft, y2);
-                    }
+                    g.FillPath(sky, shell);
                 }
-                g.FillRectangle(cap, towerLeft - 2, towerTop - 3, towerRight - towerLeft + 5, 3);
-            }
 
-            // 塔顶的红色警示灯：慢慢呼吸
-            int beaconAlpha = (int)(120 + 120 * (0.5 + 0.5 * Math.Sin(t * 2.2)));
-            using (Brush beacon = new SolidBrush(Color.FromArgb(beaconAlpha, 255, 86, 64)))
-            {
-                g.FillEllipse(beacon, 91.0f, towerTop - 5.5f, 4, 4);
-            }
+                // 卡片里的东西一律不许画出卡片外
+                GraphicsState clip = g.Save();
+                g.SetClip(shell);
+                DrawClouds(g, t);
+                DrawHill(g);
+                DrawFlag(g, t);
+                DrawBush(g, 46.0f, 114.5f, 1.0f);
+                DrawBush(g, 214.0f, 114.5f, 0.8f);
+                DrawTower(g, t);
+                DrawDeck(g);
+                g.Restore(clip);
 
-            // 塔身上的三盏状态灯：待命灰、激活绿
-            Color lightColor = active ? Color.FromArgb(255, 60, 196, 118) : Color.FromArgb(255, 184, 194, 204);
-            using (Brush light = new SolidBrush(lightColor))
-            {
-                g.FillEllipse(light, 91.5f, 52, 3, 3);
-                g.FillEllipse(light, 91.5f, 68, 3, 3);
-                g.FillEllipse(light, 91.5f, 86, 3, 3);
-            }
-
-            // ---- 服务臂：从塔伸向火箭。火箭在场时缩回去 ----
-            int armLength = active ? 6 : 19;
-            using (Pen arm = new Pen(Color.FromArgb(255, 112, 122, 136), 2.0f))
-            using (Brush joint = new SolidBrush(Color.FromArgb(255, 96, 106, 120)))
-            {
-                g.DrawLine(arm, towerRight, 64, towerRight + armLength, 64);
-                g.FillEllipse(joint, towerRight - 2.5f, 61.5f, 5, 5);
-                g.FillRectangle(joint, towerRight + armLength - 2, 62, 2, 4);
-            }
-
-            // ---- 右边的白色储罐：圆柱，圆顶 ----
-            using (LinearGradientBrush vesselBrush = new LinearGradientBrush(new RectangleF(186, 86, 12, 16),
-                       Color.FromArgb(255, 250, 251, 252), Color.FromArgb(255, 196, 206, 216), LinearGradientMode.Horizontal))
-            using (Pen vesselEdge = new Pen(Color.FromArgb(255, 150, 160, 172), 0.8f))
-            {
-                g.FillRectangle(vesselBrush, 186, 90, 12, 12);
-                g.DrawRectangle(vesselEdge, 186, 90, 12, 12);
-                using (GraphicsPath dome = new GraphicsPath())
+                using (Pen edge = new Pen(Color.FromArgb(255, 184, 208, 228), 1.0f))
                 {
-                    dome.AddBezier(186, 90, 187, 85, 197, 85, 199, 90);
-                    dome.CloseFigure();
-                    g.FillPath(vesselBrush, dome);
-                    g.DrawPath(vesselEdge, dome);
+                    g.DrawPath(edge, shell);
                 }
             }
-            // 储罐到坪面的管子
-            using (Pen pipe = new Pen(Color.FromArgb(255, 160, 170, 182), 1.5f))
+        }
+
+        private static void DrawClouds(Graphics g, float t)
+        {
+            // 两朵小云从右往左慢慢飘，飘出去了再从另一边回来
+            float span = LW + 80.0f;
+            DrawCloud(g, LW + 40.0f - ((t * 5.0f) % span), 44.0f, 1.0f);
+            DrawCloud(g, LW + 40.0f - ((t * 3.0f + 150.0f) % span), 64.0f, 0.68f);
+        }
+
+        private static void DrawCloud(Graphics g, float x, float y, float s)
+        {
+            using (GraphicsPath cloud = new GraphicsPath())
             {
-                g.DrawLine(pipe, 186, 100, 185, 100);
-                g.DrawLine(pipe, 185, 100, 185, DeckTop);
+                cloud.FillMode = FillMode.Winding;
+                cloud.AddEllipse(x - 14 * s, y - 3 * s, 16 * s, 10 * s);
+                cloud.AddEllipse(x - 6 * s, y - 10 * s, 15 * s, 15 * s);
+                cloud.AddEllipse(x + 3 * s, y - 6 * s, 13 * s, 12 * s);
+                cloud.AddEllipse(x - 9 * s, y - 2 * s, 26 * s, 10 * s);
+                using (Brush white = new SolidBrush(Color.FromArgb(225, 255, 255, 255)))
+                {
+                    g.FillPath(white, cloud);
+                }
+                // 云底下淡淡一条影子，云才不是贴纸
+                using (Brush shade = new SolidBrush(Color.FromArgb(70, 170, 200, 226)))
+                {
+                    g.FillEllipse(shade, x - 10 * s, y + 5 * s, 20 * s, 2.5f * s);
+                }
+            }
+        }
+
+        private static void DrawHill(Graphics g)
+        {
+            using (GraphicsPath hill = new GraphicsPath())
+            {
+                hill.AddBezier(3, 124, 60, 103, 198, 103, 255, 124);
+                hill.AddLine(255, LH, 3, LH);
+                hill.CloseFigure();
+                using (LinearGradientBrush grass = new LinearGradientBrush(new Rectangle(3, 103, 252, 45),
+                           Color.FromArgb(255, 213, 240, 222), Color.FromArgb(255, 178, 222, 194), LinearGradientMode.Vertical))
+                {
+                    g.FillPath(grass, hill);
+                }
+            }
+            // 只描山顶那条弧线，底边贴着卡片不描
+            using (Pen edge = new Pen(Color.FromArgb(255, 150, 202, 170), 1.0f))
+            {
+                g.DrawBezier(edge, 3, 124, 60, 103, 198, 103, 255, 124);
+            }
+        }
+
+        private static void DrawBush(Graphics g, float x, float y, float s)
+        {
+            using (GraphicsPath bush = new GraphicsPath())
+            {
+                bush.FillMode = FillMode.Winding;
+                bush.AddEllipse(x - 9 * s, y - 6 * s, 11 * s, 9 * s);
+                bush.AddEllipse(x - 2 * s, y - 9 * s, 11 * s, 12 * s);
+                bush.AddEllipse(x + 3 * s, y - 5 * s, 8 * s, 8 * s);
+                using (Brush leaf = new SolidBrush(Color.FromArgb(255, 150, 210, 172)))
+                {
+                    g.FillPath(leaf, bush);
+                }
+            }
+        }
+
+        /// <summary>坪边一面小旗，慢慢飘。</summary>
+        private static void DrawFlag(Graphics g, float t)
+        {
+            float wave = (float)Math.Sin(t * 3.1) * 1.6f;
+            using (Pen pole = new Pen(Color.FromArgb(255, 160, 178, 196), 1.6f))
+            using (GraphicsPath flag = new GraphicsPath())
+            using (Brush cloth = new SolidBrush(Color.FromArgb(255, 255, 138, 104)))
+            {
+                pole.StartCap = LineCap.Round;
+                g.DrawLine(pole, 190, 112, 190, 84);
+                flag.AddPolygon(new[]
+                {
+                    new PointF(191, 84), new PointF(191, 92), new PointF(205 + wave, 88 + wave * 0.4f)
+                });
+                g.FillPath(cloth, flag);
+            }
+        }
+
+        /// <summary>矮墩墩的小塔：圆角柱子、三个小窗、顶上一盏灯、一条伸向火箭的小手臂。</summary>
+        private void DrawTower(Graphics g, float t)
+        {
+            using (GraphicsPath body = CreateRoundedRectangle(new Rectangle(86, 48, 18, 56), 5))
+            using (LinearGradientBrush wall = new LinearGradientBrush(new Rectangle(86, 48, 18, 56),
+                       Color.FromArgb(255, 246, 249, 252), Color.FromArgb(255, 222, 231, 240), LinearGradientMode.Horizontal))
+            using (Pen edge = new Pen(Color.FromArgb(255, 172, 194, 214), 1.0f))
+            {
+                g.FillPath(wall, body);
+                g.DrawPath(edge, body);
             }
 
-            // ---- 水泥坪：上表面亮、前脸暗，是一块有厚度的台子 ----
-            using (Brush topFace = new LinearGradientBrush(new RectangleF(73, DeckTop, 112, 8),
-                       Color.FromArgb(255, 206, 212, 220), Color.FromArgb(255, 190, 197, 206), LinearGradientMode.Vertical))
-            using (Brush frontFace = new SolidBrush(Color.FromArgb(255, 158, 166, 178)))
-            using (Pen topEdge = new Pen(Color.FromArgb(255, 150, 158, 170), 1.0f))
+            // 塔顶的小帽子
+            using (GraphicsPath cap = CreateRoundedRectangle(new Rectangle(83, 43, 24, 7), 3))
+            using (Brush capBrush = new SolidBrush(Color.FromArgb(255, 214, 226, 238)))
+            using (Pen edge = new Pen(Color.FromArgb(255, 172, 194, 214), 1.0f))
             {
-                g.FillRectangle(topFace, 73, DeckTop, 112, 8);
-                g.FillRectangle(frontFace, 73, DeckTop + 8, 112, 7);
-                g.DrawLine(topEdge, 73, DeckTop, 185, DeckTop);
-            }
-            // 坪面上的几道伸缩缝
-            using (Pen seam = new Pen(Color.FromArgb(255, 176, 184, 194), 0.6f))
-            {
-                g.DrawLine(seam, 101, DeckTop + 1, 101, DeckTop + 7);
-                g.DrawLine(seam, 157, DeckTop + 1, 157, DeckTop + 7);
+                g.FillPath(capBrush, cap);
+                g.DrawPath(edge, cap);
             }
 
-            // 火箭在场时，坪面上有一块被压出来的阴影，让它看着是"放"在台上而不是飘着
+            // 三个圆舷窗
+            using (Brush glass = new SolidBrush(Color.FromArgb(255, 158, 202, 234)))
+            using (Pen edge = new Pen(Color.FromArgb(255, 134, 178, 214), 0.8f))
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    g.FillEllipse(glass, 92.5f, 56.5f + i * 14, 5, 5);
+                    g.DrawEllipse(edge, 92.5f, 56.5f + i * 14, 5, 5);
+                }
+            }
+
+            // 顶灯：待命时红光慢慢呼吸，激活后变绿常亮
             if (active)
             {
-                using (Brush shadow = new SolidBrush(Color.FromArgb(60, 60, 76, 100)))
+                using (GraphicsPath halo = new GraphicsPath())
+                {
+                    halo.AddEllipse(92.0f, 35.0f, 10, 10);
+                    using (PathGradientBrush glow = new PathGradientBrush(halo))
+                    {
+                        glow.CenterColor = Color.FromArgb(110, 90, 220, 150);
+                        glow.SurroundColors = new[] { Color.FromArgb(0, 90, 220, 150) };
+                        g.FillPath(glow, halo);
+                    }
+                }
+            }
+            int breathe = (int)(150 + 90 * (0.5 + 0.5 * Math.Sin(t * 2.4)));
+            using (Brush beacon = new SolidBrush(active
+                       ? Color.FromArgb(255, 74, 204, 126)
+                       : Color.FromArgb(breathe, 255, 104, 86)))
+            {
+                g.FillEllipse(beacon, 94.0f, 37.0f, 6, 6);
+            }
+
+            // 小手臂：平时搭向火箭，火箭在场就扬起来让路
+            float length = 21.0f - 14.0f * armRetract;
+            float angle = -0.5f * armRetract;
+            double rad = angle;
+            float ax = 104.0f;
+            float ay = 62.0f;
+            float bx = ax + length * (float)Math.Cos(rad);
+            float by = ay + length * (float)Math.Sin(rad);
+            using (Pen arm = new Pen(Color.FromArgb(255, 150, 170, 190), 3.0f))
+            using (Brush joint = new SolidBrush(Color.FromArgb(255, 120, 142, 164)))
+            {
+                arm.StartCap = LineCap.Round;
+                arm.EndCap = LineCap.Round;
+                g.DrawLine(arm, ax, ay, bx, by);
+                g.FillEllipse(joint, ax - 2.5f, ay - 2.5f, 5, 5);
+                g.FillEllipse(joint, bx - 2.0f, by - 2.0f, 4, 4);
+            }
+        }
+
+        /// <summary>圆圆的发射坪：有厚度，坪沿三盏小灯，坪上四个夹爪（火箭在场时张开）。</summary>
+        private void DrawDeck(Graphics g)
+        {
+            using (GraphicsPath side = new GraphicsPath())
+            {
+                side.AddArc(PadCx - 30, DeckTop - 8, 60, 16, 0, 180);
+                side.CloseFigure();
+                using (Brush sideBrush = new SolidBrush(Color.FromArgb(255, 196, 210, 224)))
+                {
+                    g.FillPath(sideBrush, side);
+                }
+            }
+
+            using (LinearGradientBrush top = new LinearGradientBrush(new RectangleF(PadCx - 30, DeckTop - 8, 60, 16),
+                       Color.FromArgb(255, 250, 252, 254), Color.FromArgb(255, 228, 236, 244), LinearGradientMode.Vertical))
+            using (Pen edge = new Pen(Color.FromArgb(255, 172, 194, 214), 1.0f))
+            {
+                g.FillEllipse(top, PadCx - 30, DeckTop - 8, 60, 16);
+                g.DrawEllipse(edge, PadCx - 30, DeckTop - 8, 60, 16);
+            }
+
+            // 坪面中间浅浅的一圈，像铺了一层防热层
+            using (Brush inner = new SolidBrush(Color.FromArgb(255, 236, 241, 247)))
+            {
+                g.FillEllipse(inner, PadCx - 21, DeckTop - 5, 42, 10);
+            }
+
+            // 坪沿三盏小灯
+            Color lamp = active ? Color.FromArgb(255, 74, 204, 126) : Color.FromArgb(255, 196, 208, 220);
+            using (Brush lampBrush = new SolidBrush(lamp))
+            {
+                g.FillEllipse(lampBrush, PadCx - 26, DeckTop - 2, 3, 3);
+                g.FillEllipse(lampBrush, PadCx + 23, DeckTop - 2, 3, 3);
+                g.FillEllipse(lampBrush, PadCx - 1.5f, DeckTop - 7, 3, 3);
+            }
+
+            // 火箭在场时，坪面上压出来一块阴影，让它看着是"放"在坪上而不是飘着
+            if (active)
+            {
+                using (Brush shadow = new SolidBrush(Color.FromArgb(50, 60, 76, 100)))
                 {
                     g.FillEllipse(shadow, PadCx - 16, DeckTop - 2, 32, 6);
                 }
             }
+
+            // 四个夹爪：待命时竖着夹住火箭脚，激活时向外翻开放手
+            DrawClamp(g, PadCx - 12, DeckTop + 1, -1, 9.0f);
+            DrawClamp(g, PadCx + 12, DeckTop + 1, 1, 9.0f);
+            DrawClamp(g, PadCx - 8, DeckTop - 2, -1, 7.0f);
+            DrawClamp(g, PadCx + 8, DeckTop - 2, 1, 7.0f);
+        }
+
+        private void DrawClamp(Graphics g, float x, float yBase, int side, float height)
+        {
+            GraphicsState state = g.Save();
+            g.TranslateTransform(x, yBase);
+            g.RotateTransform(side * 48.0f * armRetract);
+            using (Pen claw = new Pen(Color.FromArgb(255, 138, 156, 174), 3.2f))
+            {
+                claw.StartCap = LineCap.Round;
+                claw.EndCap = LineCap.Round;
+                g.DrawLine(claw, 0, 0, 0, -height);
+                // 爪尖一个小勾，向火箭那边弯
+                g.DrawLine(claw, 0, -height, -side * 3.0f, -height + 0.5f);
+            }
+            g.Restore(state);
         }
 
         /// <summary>待命加注时的排汽：几小团白汽从火箭底部往两侧慢慢飘散。</summary>
@@ -8230,15 +8363,15 @@ namespace NetSpeedBall
                 float x = PadCx + side * (5 + phase * 16);
                 float y = DeckTop - 2 - phase * 10;
                 float r = 2.5f + phase * 4.5f;
-                int alpha = (int)(95 * (1 - phase));
-                using (Brush steam = new SolidBrush(Color.FromArgb(alpha, 240, 243, 247)))
+                int alpha = (int)(110 * (1 - phase));
+                using (Brush steam = new SolidBrush(Color.FromArgb(alpha, 255, 255, 255)))
                 {
                     g.FillEllipse(steam, x - r, y - r * 0.8f, r * 2, r * 1.6f);
                 }
             }
         }
 
-        /// <summary>点火：一大团白烟沿着地面向两边翻滚、慢慢散掉；坪心先是一团炽白。</summary>
+        /// <summary>点火：一大团棉花糖似的白烟沿着坪面向两边翻滚、慢慢散掉；坪心先是一团炽白。</summary>
         private void DrawIgnition(Graphics g, float p)
         {
             // 先画远处的、大的；后画近处的
@@ -8248,18 +8381,22 @@ namespace NetSpeedBall
                 float o = (i / 2) + 1;
                 float reach = (6 + o * 11) * (0.35f + p * 1.1f);
                 float x = PadCx + side * reach;
-                float r = (3 + o * 1.6f) * (0.6f + p * 1.6f);
-                float y = DeckTop + 2 - r * 0.45f - p * 3.0f * (o / 6.0f);
-                int alpha = (int)(215 * (1 - p) * (1 - p * 0.3f));
+                float r = (4 + o * 1.9f) * (0.6f + p * 1.7f);
+                float y = DeckTop + 1 - r * 0.4f - p * 4.0f * (o / 6.0f);
+                int alpha = (int)(235 * (1 - p) * (1 - p * 0.3f));
                 if (alpha <= 0)
                 {
                     continue;
                 }
-                // 近处更白、远处更灰，有一点纵深
-                Color color = Color.FromArgb(alpha, 238 - (int)(o * 2), 241 - (int)(o * 2), 246 - (int)(o * 2));
-                using (Brush smoke = new SolidBrush(color))
+                using (GraphicsPath puff = new GraphicsPath())
                 {
-                    g.FillEllipse(smoke, x - r, y - r * 0.75f, r * 2, r * 1.5f);
+                    puff.AddEllipse(x - r, y - r * 0.8f, r * 2, r * 1.6f);
+                    using (PathGradientBrush smoke = new PathGradientBrush(puff))
+                    {
+                        smoke.CenterColor = Color.FromArgb(alpha, 255, 255, 255);
+                        smoke.SurroundColors = new[] { Color.FromArgb((int)(alpha * 0.55), 196, 210, 224) };
+                        g.FillPath(smoke, puff);
+                    }
                 }
             }
 
@@ -8283,12 +8420,12 @@ namespace NetSpeedBall
 
         private void DrawHint(Graphics g)
         {
-            string text = active ? "松手，点火" : "把球拖到发射台上";
+            string text = active ? "松手！" : "把球拖到发射台上";
             using (StringFormat format = new StringFormat())
             {
                 format.Alignment = StringAlignment.Center;
                 format.LineAlignment = StringAlignment.Center;
-                using (Brush brush = new SolidBrush(active ? Color.FromArgb(255, 24, 140, 205) : Color.FromArgb(255, 112, 130, 148)))
+                using (Brush brush = new SolidBrush(active ? Color.FromArgb(255, 24, 140, 205) : Color.FromArgb(255, 110, 132, 152)))
                 {
                     g.DrawString(text, active ? hintBoldFont : hintFont, brush, new RectangleF(0, 10, LW, 18), format);
                 }
