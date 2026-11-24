@@ -3332,18 +3332,21 @@ namespace NetSpeedBall
                 heldDisks[i].Update(disks[i].Percent);
             }
 
+            // 曲线和峰值用**没平滑过**的每秒真实值：平滑后的值会把尖峰压矮，
+            // 一秒 5MB/s 的突发在曲线上只剩 3MB/s，"峰值"也跟着报低。
+            // 大数字仍然用平滑值（不蹦），两者分工。
             if (sampleCount < MaxSamples)
             {
-                downloadHistory[sampleCount] = sample.DownloadBytesPerSecond;
-                uploadHistory[sampleCount] = sample.UploadBytesPerSecond;
+                downloadHistory[sampleCount] = sample.RawDownloadBytesPerSecond;
+                uploadHistory[sampleCount] = sample.RawUploadBytesPerSecond;
                 sampleCount++;
             }
             else
             {
                 Array.Copy(downloadHistory, 1, downloadHistory, 0, MaxSamples - 1);
                 Array.Copy(uploadHistory, 1, uploadHistory, 0, MaxSamples - 1);
-                downloadHistory[MaxSamples - 1] = sample.DownloadBytesPerSecond;
-                uploadHistory[MaxSamples - 1] = sample.UploadBytesPerSecond;
+                downloadHistory[MaxSamples - 1] = sample.RawDownloadBytesPerSecond;
+                uploadHistory[MaxSamples - 1] = sample.RawUploadBytesPerSecond;
             }
 
             double peak = 0;
@@ -9804,6 +9807,9 @@ namespace NetSpeedBall
 
     internal sealed class NetworkSpeedSampler
     {
+        /// <summary>显示用的指数平滑时间常数（秒）。曲线和峰值不用它，见 SpeedSample 的 Raw 值。</summary>
+        private const double SmoothingTauSeconds = 1.0;
+
         private long lastReceived;
         private long lastSent;
         private long lastSignature;
@@ -9870,9 +9876,10 @@ namespace NetSpeedBall
             }
             else
             {
-                // A short exponential average removes one-second counter jitter while
-                // still converging quickly when traffic starts or stops.
-                double alpha = 1.0 - Math.Exp(-elapsed / 2.0);
+                // 短指数平均：压掉一拍一拍的计数抖动，但流量起、停时仍要很快跟上。
+                // 时间常数 1 秒：开始下载后约 1 秒显示到真实值的 63%、2 秒到 86%；
+                // 原来 2 秒的话要 4~5 秒才追上，用户会以为"测慢了"。
+                double alpha = 1.0 - Math.Exp(-elapsed / SmoothingTauSeconds);
                 smoothedDownload += (rawDownload - smoothedDownload) * alpha;
                 smoothedUpload += (rawUpload - smoothedUpload) * alpha;
             }
@@ -9980,9 +9987,17 @@ namespace NetSpeedBall
                     adapter.GetIPProperties().GatewayAddresses;
                 foreach (GatewayIPAddressInformation gateway in gateways)
                 {
-                    if (gateway != null && gateway.Address != null &&
-                        gateway.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
-                        !gateway.Address.Equals(System.Net.IPAddress.Any))
+                    if (gateway == null || gateway.Address == null)
+                    {
+                        continue;
+                    }
+
+                    // IPv4 和 IPv6 的网关都算：纯 IPv6 的网络（没有 IPv4 网关）以前会被
+                    // 当成"没联网"整块漏掉。IPv6 网关通常是路由器的链路本地地址（fe80::），是合法的。
+                    System.Net.Sockets.AddressFamily family = gateway.Address.AddressFamily;
+                    bool isV4 = family == System.Net.Sockets.AddressFamily.InterNetwork && !gateway.Address.Equals(System.Net.IPAddress.Any);
+                    bool isV6 = family == System.Net.Sockets.AddressFamily.InterNetworkV6 && !gateway.Address.Equals(System.Net.IPAddress.IPv6Any);
+                    if (isV4 || isV6)
                     {
                         return true;
                     }
@@ -10028,6 +10043,18 @@ namespace NetSpeedBall
         public readonly double ElapsedSeconds;
         public readonly long DownloadBytes;
         public readonly long UploadBytes;
+
+        /// <summary>这一拍真实的下行速率（字节增量 ÷ 实际间隔），没经过任何平滑。曲线和峰值用它。</summary>
+        public double RawDownloadBytesPerSecond
+        {
+            get { return ElapsedSeconds > 0 ? DownloadBytes / ElapsedSeconds : 0; }
+        }
+
+        /// <summary>这一拍真实的上行速率，没经过任何平滑。</summary>
+        public double RawUploadBytesPerSecond
+        {
+            get { return ElapsedSeconds > 0 ? UploadBytes / ElapsedSeconds : 0; }
+        }
 
         public SpeedSample(double downloadBytesPerSecond, double uploadBytesPerSecond, bool hasAnyAdapter)
             : this(downloadBytesPerSecond, uploadBytesPerSecond, hasAnyAdapter, 1.0,
