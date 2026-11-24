@@ -123,6 +123,19 @@ namespace NetSpeedBall
                     LaunchPadForm.SavePreview(args[1], active, clock, burst);
                     return;
                 }
+
+                // --render-launch 图片路径 [发射进行到第几秒]：看发射过程中球窗口里画的是什么
+                if (string.Equals(args[0], "--render-launch", StringComparison.OrdinalIgnoreCase))
+                {
+                    double launchElapsed = 0.0;
+                    if (args.Length >= 3)
+                    {
+                        double.TryParse(args[2], System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out launchElapsed);
+                    }
+                    SpeedBallForm.SaveLaunchPreview(args[1], launchElapsed);
+                    return;
+                }
             }
 
             bool enableStartup = false;
@@ -1415,6 +1428,10 @@ namespace NetSpeedBall
         /// <param name="rocketAngleDeg">火箭在轨道上的角度：0 = 12 点方向，顺时针。自检用。</param>
         public static void SavePreview(string path, int variant, float rocketAngleDeg)
         {
+            // 自检时可以指定速度（KB/s），用来看不同位数下排版稳不稳：
+            //   NETSPEEDBALL_PREVIEW_DOWN=17.7 NETSPEEDBALL_PREVIEW_UP=7.2
+            double downKb = ReadPreviewSpeed("NETSPEEDBALL_PREVIEW_DOWN", 24.7);
+            double upKb = ReadPreviewSpeed("NETSPEEDBALL_PREVIEW_UP", 17.7);
             using (SpeedBallForm preview = new SpeedBallForm())
             using (Bitmap bitmap = new Bitmap(preview.Width, preview.Height))
             using (Graphics g = Graphics.FromImage(bitmap))
@@ -1423,11 +1440,39 @@ namespace NetSpeedBall
                 preview.rocketAngle = rocketAngleDeg;
                 // 按当前 DPI 出图，跟屏幕上看到的一模一样
                 g.Clear(Color.Transparent);
-                preview.currentSample = new SpeedSample(24.7 * 1024.0, 17.7 * 1024.0, true);
-                preview.heldDownload.Snap(24.7 * 1024.0);
-                preview.heldUpload.Snap(17.7 * 1024.0);
+                preview.currentSample = new SpeedSample(downKb * 1024.0, upKb * 1024.0, true);
+                preview.heldDownload.Snap(downKb * 1024.0);
+                preview.heldUpload.Snap(upKb * 1024.0);
                 preview.shownDownload = preview.heldDownload.Target;
                 preview.shownUpload = preview.heldUpload.Target;
+                preview.DrawSurface(g);
+                bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            }
+        }
+
+        private static double ReadPreviewSpeed(string name, double fallback)
+        {
+            string raw = Environment.GetEnvironmentVariable(name);
+            double value;
+            if (!string.IsNullOrEmpty(raw) && double.TryParse(raw, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out value) && value >= 0.0)
+            {
+                return value;
+            }
+            return fallback;
+        }
+
+        /// <summary>发射过程中某一帧的球窗口内容，给 <c>--render-launch</c> 自检用。</summary>
+        public static void SaveLaunchPreview(string path, double elapsedSeconds)
+        {
+            using (SpeedBallForm preview = new SpeedBallForm())
+            using (Bitmap bitmap = new Bitmap(preview.Width, preview.Height))
+            using (Graphics g = Graphics.FromImage(bitmap))
+            {
+                preview.launchAnimating = elapsedSeconds >= 0.0;
+                preview.overLaunchPad = elapsedSeconds < 0.0;
+                preview.launchElapsed = Math.Max(0.0, elapsedSeconds);
+                g.Clear(Color.Transparent);
                 preview.DrawSurface(g);
                 bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             }
@@ -2072,56 +2117,160 @@ namespace NetSpeedBall
             }
         }
 
+        /// <summary>动画时钟的起点，给火焰闪动、火花这类"和发射进度无关"的随机感用。</summary>
+        private static readonly DateTime ClockOrigin = DateTime.UtcNow;
+
         private void DrawLaunchRocketMode(Graphics g, Rectangle rect)
         {
-            double clock = launchAnimating ? launchElapsed : rocketAngle / 14.0;
-            double pulse = 0.5 + 0.5 * Math.Sin(clock * 16.0);
-            float flight = launchAnimating
-                ? (float)Math.Max(0.0, Math.Min(1.0, (launchElapsed - 0.36) / 0.95))
+            double now = (DateTime.UtcNow - ClockOrigin).TotalSeconds;
+            bool charging = launchAnimating && launchElapsed < LaunchChargeSeconds;
+            bool flying = launchAnimating && launchElapsed >= LaunchChargeSeconds;
+            float charge = charging ? (float)(launchElapsed / LaunchChargeSeconds) : 0.0f;
+            float flight = flying
+                ? Math.Min(1.0f, (float)((launchElapsed - LaunchChargeSeconds) / LaunchFlightSeconds))
                 : 0.0f;
-            // 窗口只有 122px 高，大火箭加长尾焰会从底边被硬裁掉。
-            // 把整枚火箭上移，并把尾焰长度封顶，保证火苗完整。
-            float flameScale = launchAnimating
-                ? 0.72f + (float)Math.Min(0.15, launchElapsed * 0.4) + (float)pulse * 0.05f
-                : 0.50f + (float)pulse * 0.08f;
-            float shakeX = launchAnimating && launchElapsed < 0.36
-                ? (float)Math.Sin(launchElapsed * 82.0) * 1.5f
-                : 0.0f;
-            float lift = launchAnimating && launchElapsed < 0.36
-                ? (float)(launchElapsed / 0.36 * 4.0)
-                : 4.0f;
-            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + rect.Height * 0.39f - lift);
 
-            if (flight > 0.0f)
+            // 火焰闪动：两个不成倍数的正弦叠加，看起来像随机
+            float flicker = 0.86f + 0.08f * (float)Math.Sin(now * 41.0) + 0.06f * (float)Math.Sin(now * 67.0 + 1.3);
+
+            float flameScale;
+            float lift;
+            float shakeX = 0.0f;
+            if (charging)
             {
-                int trailAlpha = (int)(170 * (1.0f - flight * 0.55f));
-                RectangleF trailArea = new RectangleF(center.X - 14, center.Y + 18, 28, 66);
-                using (LinearGradientBrush trailBrush = new LinearGradientBrush(
-                           trailArea, Color.FromArgb(trailAlpha, 255, 176, 70),
-                           Color.FromArgb(0, 85, 190, 235), LinearGradientMode.Vertical))
-                using (Pen trail = new Pen(trailBrush, 8.0f))
-                using (Pen speed = new Pen(Color.FromArgb(trailAlpha / 2, 86, 181, 224), 1.5f))
-                {
-                    trail.StartCap = LineCap.Round;
-                    trail.EndCap = LineCap.Round;
-                    speed.StartCap = LineCap.Round;
-                    speed.EndCap = LineCap.Round;
-                    g.DrawLine(trail, center.X, center.Y + 22, center.X, center.Y + 72);
-                    g.DrawLine(speed, center.X - 22, center.Y + 18, center.X - 22, center.Y + 48 + flight * 18);
-                    g.DrawLine(speed, center.X + 22, center.Y + 28, center.X + 22, center.Y + 58 + flight * 18);
-                }
+                // 点火：往下蹲、火苗从半截长到全开、抖得越来越厉害
+                flameScale = (0.45f + 0.42f * charge) * flicker;
+                lift = 4.0f - 4.0f * charge;
+                shakeX = (float)Math.Sin(launchElapsed * 82.0) * (0.8f + charge * 1.6f);
+            }
+            else if (flying)
+            {
+                flameScale = (0.92f + 0.12f * flight) * flicker;
+                lift = 0.0f;
             }
             else
             {
-                using (Pen chargeRing = new Pen(Color.FromArgb((int)(70 + pulse * 70), 44, 163, 222), 1.4f))
+                // 悬停在发射台上：轻轻上下浮动，火苗小
+                flameScale = (0.5f + 0.06f * (float)Math.Sin(now * 9.0)) * flicker;
+                lift = 4.0f + (float)Math.Sin(now * 3.2) * 1.5f;
+            }
+
+            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + rect.Height * 0.39f - lift);
+
+            if (flying)
+            {
+                DrawLaunchTrail(g, rect, center, flight, now);
+            }
+            else if (charging)
+            {
+                DrawLaunchIgnition(g, center, charge, now);
+            }
+            else
+            {
+                // 悬停：脚下一圈慢慢呼吸的光环
+                double pulse = 0.5 + 0.5 * Math.Sin(now * 10.0);
+                using (Pen hoverRing = new Pen(Color.FromArgb((int)(70 + pulse * 70), 44, 163, 222), 1.4f))
                 {
                     float spread = (float)pulse * 8.0f;
-                    g.DrawEllipse(chargeRing, center.X - 24 - spread, center.Y + 30 - spread * 0.2f,
+                    g.DrawEllipse(hoverRing, center.X - 24 - spread, center.Y + 30 - spread * 0.2f,
                         48 + spread * 2, 10 + spread * 0.4f);
+                }
+
+                // 刚拖进发射台的那一下：球"啪"地变成火箭太生硬，用一圈往外扩的光环把这个切换盖住
+                double age = (DateTime.UtcNow - launchHoverSince).TotalSeconds;
+                if (age >= 0.0 && age < 0.24)
+                {
+                    float pop = (float)(age / 0.24);
+                    int alpha = (int)(200 * (1 - pop));
+                    using (Pen popRing = new Pen(Color.FromArgb(alpha, 44, 163, 222), 2.5f - 1.5f * pop))
+                    {
+                        float r = 20 + 40 * pop;
+                        g.DrawEllipse(popRing, center.X - r, center.Y - r * 0.55f, r * 2, r * 1.1f);
+                    }
                 }
             }
 
             DrawLaunchRocketBody(g, center, 2.25f, -90.0f, true, flameScale);
+        }
+
+        /// <summary>
+        /// 飞行中的拖尾：从喷口往下越来越窄、越来越淡的一条火舌，
+        /// 外加几根相对火箭往下窜的速度线 —— 火箭在往上飞，线就该往下跑。
+        /// </summary>
+        private void DrawLaunchTrail(Graphics g, Rectangle rect, PointF center, float flight, double now)
+        {
+            float fade = 1.0f - flight * 0.6f;
+            using (GraphicsPath trail = new GraphicsPath())
+            {
+                float top = center.Y + 24;
+                trail.AddPolygon(new[]
+                {
+                    new PointF(center.X - 7, top), new PointF(center.X + 7, top),
+                    new PointF(center.X + 1.5f, top + 72), new PointF(center.X - 1.5f, top + 72)
+                });
+                using (LinearGradientBrush brush = new LinearGradientBrush(
+                           new RectangleF(center.X - 7, top, 14, 72),
+                           Color.FromArgb((int)(200 * fade), 255, 150, 60), Color.FromArgb(0, 120, 190, 235),
+                           LinearGradientMode.Vertical))
+                {
+                    g.FillPath(brush, trail);
+                }
+            }
+
+            float[] offsets = { -34, -26, -17, 17, 26, 34 };
+            float[] speeds = { 260, 320, 220, 300, 240, 340 };
+            float[] phases = { 0.1f, 0.55f, 0.3f, 0.8f, 0.2f, 0.65f };
+            using (Pen line = new Pen(Color.FromArgb(150, 86, 181, 224), 1.5f))
+            {
+                line.StartCap = LineCap.Round;
+                line.EndCap = LineCap.Round;
+                for (int i = 0; i < offsets.Length; i++)
+                {
+                    float phase = ((float)(now * speeds[i] / 110.0) + phases[i]) % 1.0f;
+                    float y = rect.Y - 12 + phase * (rect.Height + 24);
+                    float len = 10 + speeds[i] / 30.0f;
+                    // 窜到两头时淡出，不从边缘硬蹦出来
+                    float edge = 1.0f - (float)Math.Abs(phase - 0.5) * 1.6f;
+                    int alpha = (int)(170 * fade * Math.Max(0.0f, edge));
+                    if (alpha <= 0)
+                    {
+                        continue;
+                    }
+                    line.Color = Color.FromArgb(alpha, 86, 181, 224);
+                    g.DrawLine(line, center.X + offsets[i], y, center.X + offsets[i], y + len);
+                }
+            }
+        }
+
+        /// <summary>点火：脚下的光环扩散、喷口往下掉火花。</summary>
+        private void DrawLaunchIgnition(Graphics g, PointF center, float charge, double now)
+        {
+            using (Pen ring = new Pen(Color.FromArgb((int)(170 * (1 - charge * 0.5f)), 44, 163, 222), 1.4f))
+            {
+                float spread = charge * 14.0f;
+                g.DrawEllipse(ring, center.X - 24 - spread, center.Y + 30 - spread * 0.2f,
+                    48 + spread * 2, 10 + spread * 0.4f);
+            }
+
+            for (int i = 0; i < 8; i++)
+            {
+                float seed = i * 1.7f;
+                float life = ((float)(now * 2.6) + i * 0.13f) % 1.0f;
+                float px = center.X + (float)Math.Sin(seed * 3.1) * 9.0f * charge + (float)Math.Cos(seed) * 4.0f * life;
+                float py = center.Y + 46 + life * 40.0f * charge;
+                int alpha = (int)(230 * (1 - life) * charge);
+                if (alpha <= 0)
+                {
+                    continue;
+                }
+                // 刚出来是黄的，掉下去变橙
+                Color color = life < 0.4f ? Color.FromArgb(alpha, 255, 225, 120) : Color.FromArgb(alpha, 255, 150, 50);
+                using (Brush spark = new SolidBrush(color))
+                {
+                    float r = 1.6f + (1 - life) * 1.2f;
+                    g.FillEllipse(spark, px - r, py - r, r * 2, r * 2);
+                }
+            }
         }
 
         private void DrawLaunchRocketBody(Graphics g, PointF center, float scale, float angle, bool flameOn, float flameScale)
@@ -2202,37 +2351,30 @@ namespace NetSpeedBall
 
         private void DrawStatPair(Graphics g, string up, string down, int y)
         {
-            // 箭头不再用字体里的「↑↓」：那个字形比数字高，只能往上挪才勉强对齐，
-            // 挪完就像两个脱节的小点。改成自己画的小三角，中心和数字的视觉中心严格重合。
-            const float arrowWidth = 6.0f;
-            const float arrowHeight = 5.4f;
-            const float arrowGap = 2.5f;
-            const float pairGap = 10.0f;
-            float upWidth = g.MeasureString(up, statFont).Width;
-            float downWidth = g.MeasureString(down, statFont).Width;
-            float rowWidth = arrowWidth + arrowGap + upWidth + pairGap + arrowWidth + arrowGap + downWidth;
-
-            // 球是圆的，底下这一行必须挤进圆的"安全宽度"里。
-            // 超了就整行等比缩小（不是只改字号），这样不管字体测量的误差怎么算，
-            // 画出来的宽度都不会越过圆边。
-            float maxWidth = BallSize - 44.0f;
-            float scale = rowWidth > maxWidth ? maxWidth / rowWidth : 1.0f;
-            float x = (BallSize - rowWidth * scale) / 2.0f;
-
-            GraphicsState state = g.Save();
-            g.TranslateTransform(x, y);
-            g.ScaleTransform(scale, scale);
+            // 缩放比例只按「最宽可能的情况」算一次，和当前显示的数字无关。
+            // 之前是按当前文字量宽度：17.7K 变成 7.2K 时整行就缩一下，连箭头一起忽大忽小，
+            // 字体在缩放变化时粗细也会跟着抖 —— 这就是"箭头突然变大变小变粗变细"的原因。
+            //
+            // 布局（设计稿像素，箭头不缩放，只有文字缩放）：
+            //   [箭头] 2.5 [数字格 slot*scale] pairGap [箭头] 2.5 [数字格 slot*scale]
+            const float textGap = 2.5f;
+            const float pairGap = 8.0f;
+            float slot = Math.Max(g.MeasureString("88.8M", statFont).Width, g.MeasureString("1023K", statFont).Width);
+            float maxWidth = BallSize - 42.0f;
+            float arrowSpan = (ArrowWidth + textGap) * 2.0f;
+            float scale = Math.Min(1.0f, (maxWidth - arrowSpan) / (slot * 2.0f + pairGap));
+            float rowWidth = arrowSpan + (slot * 2.0f + pairGap) * scale;
+            float x = (BallSize - rowWidth) / 2.0f;
 
             // 这一行正好压在火箭绕圈的轨道上，火箭转到下方就会从文字上碾过去。
             // 给文字垫一块几乎不透明的小牌子，火箭从牌子底下经过 —— 两者不再叠在一起。
             using (GraphicsPath chip = new GraphicsPath())
             {
-                RectangleF chipRect = new RectangleF(-7.0f, -2.0f, rowWidth + 14.0f, 17.0f);
+                RectangleF chipRect = new RectangleF(x - 7.0f, y - 2.0f, rowWidth + 14.0f, 17.0f);
                 float d = chipRect.Height;
                 chip.AddArc(chipRect.X, chipRect.Y, d, d, 90, 180);
                 chip.AddArc(chipRect.Right - d, chipRect.Y, d, d, 270, 180);
                 chip.CloseFigure();
-                // 牌子底下一圈很淡的投影，让它和球面分开
                 using (GraphicsPath chipShadow = new GraphicsPath())
                 {
                     RectangleF s = new RectangleF(chipRect.X, chipRect.Y + 1, chipRect.Width, chipRect.Height);
@@ -2253,32 +2395,55 @@ namespace NetSpeedBall
                 }
             }
 
-            // 14px 的数字：字形大约落在 +2 ~ +12.5 之间，视觉中心 ≈ +7.2
-            float centerY = 7.2f;
-            float cx = 0.0f;
-            using (Brush upBrush = new SolidBrush(Color.FromArgb(255, 16, 178, 92)))
-            using (Brush downBrush = new SolidBrush(Color.FromArgb(255, 35, 119, 238)))
+            // 文字缩放后字形大约落在 y+2*scale ~ y+12.5*scale，视觉中心 ≈ y + 7.25*scale
+            float arrowCy = y + 7.25f * scale;
+            float upTextX = x + ArrowWidth + textGap;
+            float upWidth = g.MeasureString(up, statFont).Width * scale;
+            float downArrowCx = upTextX + slot * scale + pairGap * scale + ArrowWidth / 2.0f;
+            float downTextX = downArrowCx + ArrowWidth / 2.0f + textGap;
+
+            using (Brush upBrush = new SolidBrush(Color.FromArgb(255, 12, 160, 82)))
+            using (Brush downBrush = new SolidBrush(Color.FromArgb(255, 28, 108, 228)))
             {
-                DrawArrow(g, cx + arrowWidth / 2.0f, centerY, arrowWidth, arrowHeight, true, upBrush);
-                cx += arrowWidth + arrowGap;
-                g.DrawString(up, statFont, upBrush, cx, 0.0f);
-                cx += upWidth + pairGap;
+                GraphicsState state = g.Save();
+                g.ScaleTransform(scale, scale);
+                g.DrawString(up, statFont, upBrush, upTextX / scale, y / scale);
+                g.DrawString(down, statFont, downBrush, downTextX / scale, y / scale);
+                g.Restore(state);
 
-                DrawArrow(g, cx + arrowWidth / 2.0f, centerY, arrowWidth, arrowHeight, false, downBrush);
-                cx += arrowWidth + arrowGap;
-                g.DrawString(down, statFont, downBrush, cx, 0.0f);
+                DrawArrow(g, x + ArrowWidth / 2.0f, arrowCy, true, upBrush);
+                DrawArrow(g, downArrowCx, arrowCy, false, downBrush);
             }
-
-            g.Restore(state);
         }
 
-        /// <summary>实心小三角，向上（上行）或向下（下行），以 (cx, cy) 为中心。</summary>
-        private static void DrawArrow(Graphics g, float cx, float cy, float width, float height, bool up, Brush brush)
+        /// <summary>箭头的宽高（设计稿像素，不随文字缩放）。</summary>
+        private const float ArrowWidth = 8.5f;
+        private const float ArrowHeight = 8.5f;
+
+        /// <summary>
+        /// 一支真正的箭：三角头 + 短杆，以 (cx, cy) 为中心。纯三角在 8px 下就是个色点，
+        /// 分不清是尖朝上还是尖朝下；带一根杆子，方向一眼就认出来。
+        /// </summary>
+        private static void DrawArrow(Graphics g, float cx, float cy, bool up, Brush brush)
         {
-            float half = width / 2.0f;
+            float half = ArrowWidth / 2.0f;
+            float shaft = 1.5f;
+            float head = ArrowHeight * 0.48f;
+            float top = cy - ArrowHeight / 2.0f;
+            float bottom = cy + ArrowHeight / 2.0f;
             PointF[] points = up
-                ? new[] { new PointF(cx, cy - height / 2.0f), new PointF(cx + half, cy + height / 2.0f), new PointF(cx - half, cy + height / 2.0f) }
-                : new[] { new PointF(cx, cy + height / 2.0f), new PointF(cx + half, cy - height / 2.0f), new PointF(cx - half, cy - height / 2.0f) };
+                ? new[]
+                {
+                    new PointF(cx, top), new PointF(cx + half, top + head), new PointF(cx + shaft, top + head),
+                    new PointF(cx + shaft, bottom), new PointF(cx - shaft, bottom), new PointF(cx - shaft, top + head),
+                    new PointF(cx - half, top + head)
+                }
+                : new[]
+                {
+                    new PointF(cx, bottom), new PointF(cx + half, bottom - head), new PointF(cx + shaft, bottom - head),
+                    new PointF(cx + shaft, top), new PointF(cx - shaft, top), new PointF(cx - shaft, bottom - head),
+                    new PointF(cx - half, bottom - head)
+                };
             g.FillPolygon(brush, points);
         }
 
@@ -2416,8 +2581,15 @@ namespace NetSpeedBall
             overLaunchPad = active;
             launchPadForm.SetActive(active);
             SetLaunchVisualMode(active);
+            if (active)
+            {
+                launchHoverSince = DateTime.UtcNow;
+            }
             Invalidate();
         }
+
+        /// <summary>球拖进发射台的那一刻，用来画那个"变身"光环。</summary>
+        private DateTime launchHoverSince = DateTime.MinValue;
 
         private Point GetBallCenterScreen()
         {
@@ -2468,18 +2640,17 @@ namespace NetSpeedBall
                 // 起步慢、越飞越快：指数 2.0 让前三分之一几乎还在原地蓄力，
                 // 后半段一口气冲出去，比匀加速更像"点火"
                 double accelerated = Math.Pow(t, 2.0);
-                Point next = Lerp(launchStartLocation, launchTargetLocation, accelerated);
-                double sway = Math.Sin(t * Math.PI) * (1.0 - t) * 12.0;
-                next.X += (int)Math.Round(sway);
-                Location = next;
+                // 不再左右摇晃：直着往上冲才像点火，晃着飞像失控
+                Location = Lerp(launchStartLocation, launchTargetLocation, accelerated);
                 Opacity = Math.Max(0.0, 0.96 - Math.Max(0.0, t - 0.72) / 0.28 * 0.96);
                 return;
             }
 
-            // 飞出屏幕后不是瞬移回来，而是在原位淡入 —— 瞬移会让人以为球"闪"了一下
+            // 飞出屏幕后不是瞬移回来，而是从上方 8px 处落回原位并淡入 —— 瞬移会让人以为球"闪"了一下
             double back = Math.Min(1.0, (launchElapsed - LaunchChargeSeconds - LaunchFlightSeconds) / returnDuration);
-            Location = launchReturnLocation;
-            Opacity = launchReturnOpacity * EaseOutCubic(back);
+            double eased = EaseOutCubic(back);
+            Location = new Point(launchReturnLocation.X, launchReturnLocation.Y - (int)Math.Round((1.0 - eased) * 8.0));
+            Opacity = launchReturnOpacity * eased;
 
             if (launchElapsed >= totalDuration)
             {
