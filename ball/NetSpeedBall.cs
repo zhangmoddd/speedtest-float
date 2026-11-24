@@ -1125,7 +1125,7 @@ namespace NetSpeedBall
 
     internal sealed class SpeedBallForm : Form
     {
-        private const int BallSize = 122;
+        internal const int BallSize = 122;
         // 第二个实例靠这个标题找到已经隐藏起来的球，所以标题必须保持稳定。
         public const string WindowTitle = "\u7f51\u7edc\u6d4b\u901f\u7403";
         // 第二个实例启动时会广播这条消息，界面上收到就把悬浮球叫出来。
@@ -1188,6 +1188,9 @@ namespace NetSpeedBall
         private Point launchStartLocation;
         private Point launchTargetLocation;
         private Point launchReturnLocation;
+        /// <summary>松手时球离发射位还差多少：点火的前一小段会先滑到正中（像被夹具拉到位）。</summary>
+        private Point launchSnapFrom;
+        private bool launchUseDock;
         private double launchReturnOpacity;
         private readonly TrafficStore trafficStore;
         private DockEdge dockEdge;
@@ -1550,6 +1553,14 @@ namespace NetSpeedBall
                 return;
             }
             Location = new Point(screenPoint.X - dragStart.X, screenPoint.Y - dragStart.Y);
+            // 拖到发射台上方时往发射位轻轻吸：火箭的喷口正好落在坪面上，不然它悬在半空像没放好
+            if (launchPadForm.Visible && launchPadForm.AcceptsBall(GetBallCenterScreen()))
+            {
+                Point dock = launchPadForm.GetDockLocation(Size);
+                Location = new Point(
+                    Location.X + (int)Math.Round((dock.X - Location.X) * 0.35),
+                    Location.Y + (int)Math.Round((dock.Y - Location.Y) * 0.35));
+            }
             UpdateLaunchPadHover();
         }
 
@@ -2029,91 +2040,139 @@ namespace NetSpeedBall
             float pulse = 0.92f + 0.08f * (float)Math.Sin(rocketAngle * 0.24f);
             GraphicsState state = g.Save();
             g.TranslateTransform(position.X, position.Y);
-            g.RotateTransform(angle + 90.0f);
+            // 造型是尖头朝上画的；angle 是轨道位置角（0 = 12 点），机头要指向前进方向（顺时针）
+            g.RotateTransform(angle + 180.0f);
             g.ScaleTransform(0.84f, 0.84f);
             DrawRocketArtwork(g, visibleFlame, pulse);
             g.Restore(state);
         }
 
         // 球面小火箭和发射大火箭共用这一套造型，避免两个画面像两个程序。
+        // 造型是**竖着**画的（尖头朝上），坐标原点在箭体中部；一共约 21 个单位高。
+        // 从上到下：整流罩 → 黑色级间段 → 白色箭体 → 尾翼 → 发动机段 → 喇叭形喷口 → 喷焰。
         private static void DrawRocketArtwork(Graphics g, float flameStrength, float flameScale)
         {
+            const float bodyHalf = 2.6f;
+            const float noseTip = -10.5f;
+            const float noseBase = -5.6f;
+            const float bodyBottom = 7.0f;
+            const float nozzleExit = 10.0f;
+
+            // ---- 喷焰（画在箭体下面，所以先画）----
             if (flameStrength > 0.0f)
             {
-                float length = (7.0f + 14.0f * flameStrength) * flameScale;
-                float width = 2.2f + 1.8f * flameStrength;
-                float tail = -10.5f - length;
-                using (GraphicsPath outerFlame = new GraphicsPath())
-                using (GraphicsPath innerFlame = new GraphicsPath())
-                using (Brush orange = new SolidBrush(Color.FromArgb(245, 255, 125, 46)))
-                using (Brush yellow = new SolidBrush(Color.FromArgb(255, 255, 225, 128)))
+                float length = (3.5f + 8.5f * flameStrength) * flameScale;
+                using (GraphicsPath plume = new GraphicsPath())
                 {
-                    outerFlame.AddBezier(-10.0f, -width, -14.0f, -width * 0.8f, tail + 2.0f, -1.2f, tail, 0.0f);
-                    outerFlame.AddBezier(tail, 0.0f, tail + 2.0f, 1.2f, -14.0f, width * 0.8f, -10.0f, width);
-                    outerFlame.CloseFigure();
-                    innerFlame.AddBezier(-10.0f, -width * 0.48f, -13.0f, -1.0f, tail + length * 0.42f, -0.5f, tail + length * 0.30f, 0.0f);
-                    innerFlame.AddBezier(tail + length * 0.30f, 0.0f, tail + length * 0.42f, 0.5f, -13.0f, 1.0f, -10.0f, width * 0.48f);
-                    innerFlame.CloseFigure();
-                    g.FillPath(orange, outerFlame);
-                    g.FillPath(yellow, innerFlame);
+                    // 海平面喷焰：出口处比喷口略宽，往下先鼓一下再收成尖
+                    plume.AddBezier(-1.9f, nozzleExit - 0.3f, -2.9f, nozzleExit + 1.2f, -2.3f, nozzleExit + length * 0.45f, 0, nozzleExit + length);
+                    plume.AddBezier(0, nozzleExit + length, 2.3f, nozzleExit + length * 0.45f, 2.9f, nozzleExit + 1.2f, 1.9f, nozzleExit - 0.3f);
+                    plume.CloseFigure();
+                    using (Brush orange = new SolidBrush(Color.FromArgb(240, 255, 132, 30)))
+                    {
+                        g.FillPath(orange, plume);
+                    }
+                }
+
+                // 内焰：黄白，短一些
+                using (GraphicsPath core = new GraphicsPath())
+                {
+                    float inner = length * 0.62f;
+                    core.AddBezier(-1.2f, nozzleExit, -1.6f, nozzleExit + 0.8f, -1.1f, nozzleExit + inner * 0.5f, 0, nozzleExit + inner);
+                    core.AddBezier(0, nozzleExit + inner, 1.1f, nozzleExit + inner * 0.5f, 1.6f, nozzleExit + 0.8f, 1.2f, nozzleExit);
+                    core.CloseFigure();
+                    using (Brush yellow = new SolidBrush(Color.FromArgb(255, 255, 232, 150)))
+                    {
+                        g.FillPath(yellow, core);
+                    }
+                }
+
+                // 喷口正下方一点白热
+                using (Brush white = new SolidBrush(Color.FromArgb(230, 255, 255, 240)))
+                {
+                    g.FillEllipse(white, -0.7f, nozzleExit - 0.2f, 1.4f, 2.4f);
+                }
+
+                // 很淡的暖光，让喷焰周围的箭体被照亮一点（是照明，不是光圈）
+                using (GraphicsPath halo = new GraphicsPath())
+                {
+                    halo.AddEllipse(-4.5f, nozzleExit - 2.0f, 9.0f, 6.0f + length * 0.5f);
+                    using (PathGradientBrush glow = new PathGradientBrush(halo))
+                    {
+                        glow.CenterColor = Color.FromArgb((int)(60 * flameStrength), 255, 170, 80);
+                        glow.SurroundColors = new[] { Color.FromArgb(0, 255, 170, 80) };
+                        g.FillPath(glow, halo);
+                    }
                 }
             }
 
-            using (GraphicsPath upperFin = new GraphicsPath())
-            using (GraphicsPath lowerFin = new GraphicsPath())
-            using (Brush finBrush = new SolidBrush(Color.FromArgb(255, 31, 145, 211)))
-            using (Pen finEdge = new Pen(Color.FromArgb(210, 20, 91, 151), 0.75f))
+            // ---- 尾翼 ----
+            using (Brush fin = new SolidBrush(Color.FromArgb(255, 46, 54, 66)))
             {
-                upperFin.AddPolygon(new[]
-                {
-                    new PointF(-6.8f, -3.6f), new PointF(-9.0f, -8.0f),
-                    new PointF(-3.0f, -6.0f), new PointF(-0.8f, -4.2f)
-                });
-                lowerFin.AddPolygon(new[]
-                {
-                    new PointF(-6.8f, 3.6f), new PointF(-9.0f, 8.0f),
-                    new PointF(-3.0f, 6.0f), new PointF(-0.8f, 4.2f)
-                });
-                g.FillPath(finBrush, upperFin);
-                g.FillPath(finBrush, lowerFin);
-                g.DrawPath(finEdge, upperFin);
-                g.DrawPath(finEdge, lowerFin);
+                g.FillPolygon(fin, new[] { new PointF(-bodyHalf, 3.8f), new PointF(-4.2f, 7.2f), new PointF(-bodyHalf, 7.2f) });
+                g.FillPolygon(fin, new[] { new PointF(bodyHalf, 3.8f), new PointF(4.2f, 7.2f), new PointF(bodyHalf, 7.2f) });
             }
 
-            using (Brush nozzle = new SolidBrush(Color.FromArgb(255, 55, 79, 103)))
+            // ---- 喷口：喇叭形 ----
+            using (GraphicsPath bell = new GraphicsPath())
+            using (Brush bellBrush = new SolidBrush(Color.FromArgb(255, 34, 39, 48)))
             {
-                g.FillRectangle(nozzle, -11.2f, -3.1f, 3.0f, 6.2f);
+                bell.AddPolygon(new[]
+                {
+                    new PointF(-1.4f, 8.0f), new PointF(1.4f, 8.0f), new PointF(2.1f, nozzleExit), new PointF(-2.1f, nozzleExit)
+                });
+                g.FillPath(bellBrush, bell);
             }
 
-            using (GraphicsPath body = new GraphicsPath())
+            using (Pen bellLight = new Pen(Color.FromArgb(255, 92, 102, 116), 0.5f))
+            {
+                g.DrawLine(bellLight, -1.3f, 8.3f, -1.8f, nozzleExit - 0.2f);
+            }
+
+            // ---- 发动机段 ----
+            using (LinearGradientBrush skirt = new LinearGradientBrush(new RectangleF(-bodyHalf, 7.0f, bodyHalf * 2, 1.2f),
+                       Color.FromArgb(255, 72, 80, 92), Color.FromArgb(255, 40, 46, 56), LinearGradientMode.Horizontal))
+            {
+                g.FillRectangle(skirt, -bodyHalf, 7.0f, bodyHalf * 2, 1.2f);
+            }
+
+            // ---- 箭体：左亮右暗，是圆柱不是纸片 ----
             using (LinearGradientBrush bodyBrush = new LinearGradientBrush(
-                       new RectangleF(-9.0f, -6.0f, 21.0f, 12.0f),
-                       Color.White, Color.FromArgb(214, 233, 242), LinearGradientMode.Vertical))
-            using (Pen bodyEdge = new Pen(Color.FromArgb(220, 64, 105, 139), 0.85f))
+                       new RectangleF(-bodyHalf, noseBase, bodyHalf * 2, bodyBottom - noseBase),
+                       Color.FromArgb(255, 253, 254, 255), Color.FromArgb(255, 198, 208, 219), LinearGradientMode.Horizontal))
+            using (Pen bodyEdge = new Pen(Color.FromArgb(255, 112, 126, 142), 0.55f))
             {
-                body.AddBezier(-9.0f, -4.5f, -2.5f, -6.0f, 5.8f, -4.8f, 11.2f, 0.0f);
-                body.AddBezier(11.2f, 0.0f, 5.8f, 4.8f, -2.5f, 6.0f, -9.0f, 4.5f);
-                body.CloseFigure();
-                g.FillPath(bodyBrush, body);
-                g.DrawPath(bodyEdge, body);
+                g.FillRectangle(bodyBrush, -bodyHalf, noseBase, bodyHalf * 2, bodyBottom - noseBase);
+                g.DrawRectangle(bodyEdge, -bodyHalf, noseBase, bodyHalf * 2, bodyBottom - noseBase);
             }
 
-            using (GraphicsPath nose = new GraphicsPath())
-            using (Brush noseBrush = new SolidBrush(Color.FromArgb(255, 24, 143, 211)))
+            // 两道面板接缝
+            using (Pen seam = new Pen(Color.FromArgb(255, 206, 214, 223), 0.4f))
             {
-                nose.AddBezier(4.0f, -4.55f, 7.0f, -3.7f, 9.6f, -1.6f, 11.2f, 0.0f);
-                nose.AddBezier(11.2f, 0.0f, 9.6f, 1.6f, 7.0f, 3.7f, 4.0f, 4.55f);
+                g.DrawLine(seam, -bodyHalf + 0.3f, -1.4f, bodyHalf - 0.3f, -1.4f);
+                g.DrawLine(seam, -bodyHalf + 0.3f, 2.6f, bodyHalf - 0.3f, 2.6f);
+            }
+
+            // ---- 黑色级间段 ----
+            using (LinearGradientBrush band = new LinearGradientBrush(new RectangleF(-bodyHalf, noseBase, bodyHalf * 2, 1.3f),
+                       Color.FromArgb(255, 62, 68, 78), Color.FromArgb(255, 22, 25, 31), LinearGradientMode.Horizontal))
+            {
+                g.FillRectangle(band, -bodyHalf, noseBase, bodyHalf * 2, 1.3f);
+            }
+
+            // ---- 整流罩 ----
+            using (GraphicsPath nose = new GraphicsPath())
+            using (LinearGradientBrush noseBrush = new LinearGradientBrush(
+                       new RectangleF(-bodyHalf, noseTip, bodyHalf * 2, noseBase - noseTip),
+                       Color.FromArgb(255, 255, 255, 255), Color.FromArgb(255, 206, 216, 226), LinearGradientMode.Horizontal))
+            using (Pen noseEdge = new Pen(Color.FromArgb(255, 112, 126, 142), 0.55f))
+            {
+                nose.AddBezier(0, noseTip, 0.9f, noseTip + 0.3f, 2.2f, noseTip + 2.8f, bodyHalf, noseBase);
+                nose.AddLine(bodyHalf, noseBase, -bodyHalf, noseBase);
+                nose.AddBezier(-bodyHalf, noseBase, -2.2f, noseTip + 2.8f, -0.9f, noseTip + 0.3f, 0, noseTip);
                 nose.CloseFigure();
                 g.FillPath(noseBrush, nose);
-            }
-
-            using (Brush glass = new SolidBrush(Color.FromArgb(255, 19, 55, 82)))
-            using (Brush shine = new SolidBrush(Color.FromArgb(230, 157, 232, 255)))
-            using (Pen windowEdge = new Pen(Color.White, 0.9f))
-            {
-                g.FillEllipse(glass, -0.4f, -2.65f, 5.3f, 5.3f);
-                g.DrawEllipse(windowEdge, -0.4f, -2.65f, 5.3f, 5.3f);
-                g.FillEllipse(shine, 0.65f, -1.65f, 1.65f, 1.35f);
+                g.DrawPath(noseEdge, nose);
             }
         }
 
@@ -2131,146 +2190,44 @@ namespace NetSpeedBall
                 : 0.0f;
 
             // 火焰闪动：两个不成倍数的正弦叠加，看起来像随机
-            float flicker = 0.86f + 0.08f * (float)Math.Sin(now * 41.0) + 0.06f * (float)Math.Sin(now * 67.0 + 1.3);
+            float flicker = 0.9f + 0.06f * (float)Math.Sin(now * 41.0) + 0.04f * (float)Math.Sin(now * 67.0 + 1.3);
 
-            float flameScale;
+            // flame 同时是"喷焰强度"和"喷焰长度"：0 = 发动机没点着
+            float flame;
             float lift;
             float shakeX = 0.0f;
             if (charging)
             {
-                // 点火：往下蹲、火苗从半截长到全开、抖得越来越厉害
-                flameScale = (0.45f + 0.42f * charge) * flicker;
-                lift = 4.0f - 4.0f * charge;
-                shakeX = (float)Math.Sin(launchElapsed * 82.0) * (0.8f + charge * 1.6f);
+                // 点火：喷焰从半截长到全开，箭体被推着往下蹲、越抖越厉害
+                flame = (0.5f + 0.5f * charge) * flicker;
+                lift = 3.0f * (1.0f - charge);
+                shakeX = (float)Math.Sin(launchElapsed * 82.0) * (0.6f + charge * 1.4f);
             }
             else if (flying)
             {
-                flameScale = (0.92f + 0.12f * flight) * flicker;
+                flame = (1.0f + 0.18f * flight) * flicker;
                 lift = 0.0f;
             }
             else
             {
-                // 悬停在发射台上：轻轻上下浮动，火苗小
-                flameScale = (0.5f + 0.06f * (float)Math.Sin(now * 9.0)) * flicker;
-                lift = 4.0f + (float)Math.Sin(now * 3.2) * 1.5f;
+                // 悬停在发射台上：发动机没点火，只是被吊着轻轻浮动
+                flame = 0.0f;
+                lift = (float)Math.Sin(now * 3.2) * 1.0f;
             }
 
-            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + rect.Height * 0.39f - lift);
-
-            if (flying)
-            {
-                DrawLaunchTrail(g, rect, center, flight, now);
-            }
-            else if (charging)
-            {
-                DrawLaunchIgnition(g, center, charge, now);
-            }
-            else
-            {
-                // 悬停：脚下一圈慢慢呼吸的光环
-                double pulse = 0.5 + 0.5 * Math.Sin(now * 10.0);
-                using (Pen hoverRing = new Pen(Color.FromArgb((int)(70 + pulse * 70), 44, 163, 222), 1.4f))
-                {
-                    float spread = (float)pulse * 8.0f;
-                    g.DrawEllipse(hoverRing, center.X - 24 - spread, center.Y + 30 - spread * 0.2f,
-                        48 + spread * 2, 10 + spread * 0.4f);
-                }
-
-                // 刚拖进发射台的那一下：球"啪"地变成火箭太生硬，用一圈往外扩的光环把这个切换盖住
-                double age = (DateTime.UtcNow - launchHoverSince).TotalSeconds;
-                if (age >= 0.0 && age < 0.24)
-                {
-                    float pop = (float)(age / 0.24);
-                    int alpha = (int)(200 * (1 - pop));
-                    using (Pen popRing = new Pen(Color.FromArgb(alpha, 44, 163, 222), 2.5f - 1.5f * pop))
-                    {
-                        float r = 20 + 40 * pop;
-                        g.DrawEllipse(popRing, center.X - r, center.Y - r * 0.55f, r * 2, r * 1.1f);
-                    }
-                }
-            }
-
-            DrawLaunchRocketBody(g, center, 2.25f, -90.0f, true, flameScale);
+            // 火箭立在窗口中间偏上：喷口大约在 y=77（设计稿），喷焰往下到 y≈118
+            PointF center = new PointF(rect.X + rect.Width / 2.0f + shakeX, rect.Y + LaunchRocketCenterY - lift);
+            DrawLaunchRocketBody(g, center, LaunchRocketScale, 0.0f, flame > 0.0f, flame);
         }
 
-        /// <summary>
-        /// 飞行中的拖尾：从喷口往下越来越窄、越来越淡的一条火舌，
-        /// 外加几根相对火箭往下窜的速度线 —— 火箭在往上飞，线就该往下跑。
-        /// </summary>
-        private void DrawLaunchTrail(Graphics g, Rectangle rect, PointF center, float flight, double now)
+        /// <summary>发射时大火箭在球窗口里的位置和大小（设计稿坐标）。</summary>
+        internal const float LaunchRocketCenterY = 46.0f;
+        internal const float LaunchRocketScale = 3.1f;
+
+        /// <summary>喷口出口在设计稿里的 y：火箭中部 + 喷口到中部的距离（10）× 比例。发射台靠它对位。</summary>
+        internal static float LaunchNozzleDesignY
         {
-            float fade = 1.0f - flight * 0.6f;
-            using (GraphicsPath trail = new GraphicsPath())
-            {
-                float top = center.Y + 24;
-                trail.AddPolygon(new[]
-                {
-                    new PointF(center.X - 7, top), new PointF(center.X + 7, top),
-                    new PointF(center.X + 1.5f, top + 72), new PointF(center.X - 1.5f, top + 72)
-                });
-                using (LinearGradientBrush brush = new LinearGradientBrush(
-                           new RectangleF(center.X - 7, top, 14, 72),
-                           Color.FromArgb((int)(200 * fade), 255, 150, 60), Color.FromArgb(0, 120, 190, 235),
-                           LinearGradientMode.Vertical))
-                {
-                    g.FillPath(brush, trail);
-                }
-            }
-
-            float[] offsets = { -34, -26, -17, 17, 26, 34 };
-            float[] speeds = { 260, 320, 220, 300, 240, 340 };
-            float[] phases = { 0.1f, 0.55f, 0.3f, 0.8f, 0.2f, 0.65f };
-            using (Pen line = new Pen(Color.FromArgb(150, 86, 181, 224), 1.5f))
-            {
-                line.StartCap = LineCap.Round;
-                line.EndCap = LineCap.Round;
-                for (int i = 0; i < offsets.Length; i++)
-                {
-                    float phase = ((float)(now * speeds[i] / 110.0) + phases[i]) % 1.0f;
-                    float y = rect.Y - 12 + phase * (rect.Height + 24);
-                    float len = 10 + speeds[i] / 30.0f;
-                    // 窜到两头时淡出，不从边缘硬蹦出来
-                    float edge = 1.0f - (float)Math.Abs(phase - 0.5) * 1.6f;
-                    int alpha = (int)(170 * fade * Math.Max(0.0f, edge));
-                    if (alpha <= 0)
-                    {
-                        continue;
-                    }
-                    line.Color = Color.FromArgb(alpha, 86, 181, 224);
-                    g.DrawLine(line, center.X + offsets[i], y, center.X + offsets[i], y + len);
-                }
-            }
-        }
-
-        /// <summary>点火：脚下的光环扩散、喷口往下掉火花。</summary>
-        private void DrawLaunchIgnition(Graphics g, PointF center, float charge, double now)
-        {
-            using (Pen ring = new Pen(Color.FromArgb((int)(170 * (1 - charge * 0.5f)), 44, 163, 222), 1.4f))
-            {
-                float spread = charge * 14.0f;
-                g.DrawEllipse(ring, center.X - 24 - spread, center.Y + 30 - spread * 0.2f,
-                    48 + spread * 2, 10 + spread * 0.4f);
-            }
-
-            for (int i = 0; i < 8; i++)
-            {
-                float seed = i * 1.7f;
-                float life = ((float)(now * 2.6) + i * 0.13f) % 1.0f;
-                float px = center.X + (float)Math.Sin(seed * 3.1) * 9.0f * charge + (float)Math.Cos(seed) * 4.0f * life;
-                float py = center.Y + 46 + life * 40.0f * charge;
-                int alpha = (int)(230 * (1 - life) * charge);
-                if (alpha <= 0)
-                {
-                    continue;
-                }
-                // 刚出来是黄的，掉下去变橙
-                Color color = life < 0.4f ? Color.FromArgb(alpha, 255, 225, 120) : Color.FromArgb(alpha, 255, 150, 50);
-                using (Brush spark = new SolidBrush(color))
-                {
-                    float r = 1.6f + (1 - life) * 1.2f;
-                    g.FillEllipse(spark, px - r, py - r, r * 2, r * 2);
-                }
-            }
+            get { return LaunchRocketCenterY + 10.0f * LaunchRocketScale; }
         }
 
         private void DrawLaunchRocketBody(Graphics g, PointF center, float scale, float angle, bool flameOn, float flameScale)
@@ -2581,15 +2538,8 @@ namespace NetSpeedBall
             overLaunchPad = active;
             launchPadForm.SetActive(active);
             SetLaunchVisualMode(active);
-            if (active)
-            {
-                launchHoverSince = DateTime.UtcNow;
-            }
             Invalidate();
         }
-
-        /// <summary>球拖进发射台的那一刻，用来画那个"变身"光环。</summary>
-        private DateTime launchHoverSince = DateTime.MinValue;
 
         private Point GetBallCenterScreen()
         {
@@ -2603,16 +2553,21 @@ namespace NetSpeedBall
             Cursor = Cursors.Default;
             launchAnimating = true;
             launchElapsed = 0.0;
-            launchStartLocation = Location;
             launchReturnLocation = dragOriginLocation;
             launchReturnOpacity = Opacity;
+
+            // 松手的位置可能离发射位还差几十像素：起飞点按发射位算，
+            // 点火的前一小段先从松手处滑到正中（像被夹具拉到位），然后才升空
+            launchUseDock = launchPadForm.Visible;
+            launchSnapFrom = Location;
+            launchStartLocation = launchUseDock ? launchPadForm.GetDockLocation(Size) : Location;
 
             Rectangle area = Screen.FromControl(this).WorkingArea;
             int targetX = launchStartLocation.X + 18;
             int targetY = area.Top - Height - 40;
             launchTargetLocation = new Point(targetX, targetY);
 
-            // 发射台不跟着消失，而是播一段点火冲击波（约 0.55 秒）再自己收起
+            // 发射台不跟着消失，而是播一段点火白烟（约 0.55 秒）再自己收起
             launchPadForm.PlayBurst();
             overLaunchPad = true;
             SetLaunchVisualMode(true);
@@ -2630,7 +2585,12 @@ namespace NetSpeedBall
                 double charge = launchElapsed / LaunchChargeSeconds;
                 int shakeX = (int)Math.Round(Math.Sin(launchElapsed * 82.0) * (1.0 + charge * 2.2));
                 int compression = (int)Math.Round(Math.Sin(charge * Math.PI) * 5.0);
-                Location = new Point(launchStartLocation.X + shakeX, launchStartLocation.Y + compression);
+                Point baseLocation = launchStartLocation;
+                if (launchUseDock)
+                {
+                    baseLocation = Lerp(launchSnapFrom, launchStartLocation, EaseOutCubic(Math.Min(1.0, charge / 0.4)));
+                }
+                Location = new Point(baseLocation.X + shakeX, baseLocation.Y + compression);
                 return;
             }
 
@@ -7867,9 +7827,9 @@ namespace NetSpeedBall
     /// <summary>
     /// 拖动悬浮球时出现在屏幕下方的「发射台」。
     ///
-    /// 画面是一块俯视的起降坪：坪面几圈同心椭圆，外沿一圈跑道灯依次点亮，
-    /// 中间一道竖直光柱；球拖进来（激活）时光柱变亮、三个箭头循环上升、
-    /// 提示变成「松手，发射！」。松手后不是瞬间消失，而是播一段点火冲击波再收起。
+    /// 画面是一张侧视的发射场：天空、地面、带桁架的发射塔、服务臂、水泥坪、旁边的储罐。
+    /// 没有光圈、弧线、箭头这些装饰。球拖进坪面（激活）时服务臂缩回、塔灯变绿、
+    /// 火箭底部开始排汽；松手后一大团白烟沿地面翻滚散开，再收起。
     ///
     /// 动画由自己的 33ms 时钟驱动，**只在可见时走**，隐藏时就停，不占 CPU。
     /// </summary>
@@ -7881,11 +7841,8 @@ namespace NetSpeedBall
         private const int LW = 258;
         private const int LH = 148;
 
-        // 起降坪的几何（设计稿坐标，96 DPI）
+        // 坪面中心的 x（设计稿坐标，96 DPI）
         private const float PadCx = LW / 2.0f;
-        private const float PadCy = 104.0f;
-        private const float PadRx = 86.0f;
-        private const float PadRy = 25.0f;
 
         /// <summary>点火冲击波时长（秒）。</summary>
         private const double BurstDuration = 0.55;
@@ -8073,6 +8030,22 @@ namespace NetSpeedBall
             DrawSurface(e.Graphics);
         }
 
+        /// <summary>发射坪面（设计稿 y）。火箭的喷口就该落在这一高度上。</summary>
+        private const float DeckTop = 102.0f;
+
+        /// <summary>
+        /// 球该停在哪儿：让球的喷口正好落在坪面中心。拖动时球会往这个点轻轻吸，
+        /// 不然火箭会悬在发射台上方半截，像没放好。
+        /// </summary>
+        public Point GetDockLocation(Size ballSize)
+        {
+            float s = Width > 0 ? Width / (float)LW : UiScale.Factor;
+            float bs = ballSize.Width > 0 ? ballSize.Width / (float)SpeedBallForm.BallSize : UiScale.Factor;
+            return new Point(
+                Left + (int)Math.Round(PadCx * s - SpeedBallForm.BallSize / 2.0f * bs),
+                Top + (int)Math.Round(DeckTop * s - SpeedBallForm.LaunchNozzleDesignY * bs));
+        }
+
         /// <summary>整块画面。坐标全部按 96 DPI 的设计稿写。</summary>
         private void DrawSurface(Graphics raw)
         {
@@ -8084,289 +8057,241 @@ namespace NetSpeedBall
             g.ScaleTransform(scale, scale);
 
             float t = (float)clock;
-            // 待命时呼吸很慢（0.45 Hz），激活时明显加快（1.5 Hz）
-            float pulse = 0.5f + 0.5f * (float)Math.Sin(t * 2.0 * Math.PI * (active ? 1.5 : 0.45));
-
-            DrawShell(g, pulse);
-            DrawBeam(g, t, pulse);
-            DrawPad(g, t, pulse);
-            DrawPadLights(g, t);
+            DrawScene(g, t);
             if (active)
             {
-                DrawChevrons(g, t);
+                DrawVenting(g, t);
             }
-            // 点火那一下不再显示提示文字：画面只剩冲击波
+            if (burst >= 0.0)
+            {
+                DrawIgnition(g, (float)Math.Min(1.0, burst));
+            }
             if (burst < 0.0)
             {
                 DrawHint(g);
             }
-            if (burst >= 0.0)
-            {
-                DrawBurst(g, (float)Math.Min(1.0, burst));
-            }
         }
 
-        private void DrawShell(Graphics g, float pulse)
+        /// <summary>一张侧视的发射场：天、地、发射塔、服务臂、水泥坪、旁边一个白色储罐。</summary>
+        private void DrawScene(Graphics g, float t)
         {
-            Rectangle rect = new Rectangle(3, 3, LW - 7, LH - 7);
-            using (GraphicsPath shell = CreateRoundedRectangle(rect, 30))
-            using (LinearGradientBrush background = new LinearGradientBrush(rect,
-                       Color.FromArgb(254, 255, 255),
-                       active ? Color.FromArgb(234, 246, 255) : Color.FromArgb(238, 246, 252),
-                       LinearGradientMode.Vertical))
-            using (Pen edge = new Pen(
-                       active ? Color.FromArgb((int)(205 + 45 * pulse), 31, 158, 214) : Color.FromArgb(155, 148, 188, 213),
-                       active ? 1.6f : 1.2f))
+            // ---- 卡片：天空到地平线的很淡的渐变，没有别的装饰 ----
+            Rectangle card = new Rectangle(3, 3, LW - 7, LH - 7);
+            using (GraphicsPath shell = CreateRoundedRectangle(card, 18))
+            using (LinearGradientBrush sky = new LinearGradientBrush(card,
+                       Color.FromArgb(255, 228, 238, 249), Color.FromArgb(255, 250, 252, 254), LinearGradientMode.Vertical))
+            using (Pen edge = new Pen(Color.FromArgb(255, 184, 196, 210), 1.0f))
             {
-                g.FillPath(background, shell);
+                g.FillPath(sky, shell);
                 g.DrawPath(edge, shell);
             }
 
-            // 顶部一条极淡的高光，让面板有一点点厚度
-            using (GraphicsPath top = CreateRoundedRectangle(new Rectangle(8, 6, LW - 16, 60), 24))
-            using (LinearGradientBrush sheen = new LinearGradientBrush(new Rectangle(8, 6, LW - 16, 60),
-                       Color.FromArgb(110, 255, 255, 255), Color.FromArgb(0, 255, 255, 255),
-                       LinearGradientMode.Vertical))
+            // ---- 地面 ----
+            using (Brush far = new SolidBrush(Color.FromArgb(255, 226, 231, 238)))
+            using (Brush ground = new LinearGradientBrush(new Rectangle(0, 112, LW, LH - 112),
+                       Color.FromArgb(255, 214, 220, 228), Color.FromArgb(255, 200, 208, 218), LinearGradientMode.Vertical))
+            using (Pen horizon = new Pen(Color.FromArgb(255, 196, 204, 214), 1.0f))
             {
-                g.FillPath(sheen, top);
+                g.FillRectangle(far, 3, 112, LW - 7, 4);
+                g.FillRectangle(ground, 3, 116, LW - 7, LH - 7 - 116 + 3);
+                g.DrawLine(horizon, 3, 112, LW - 4, 112);
             }
-        }
 
-        /// <summary>从坪心往上的光柱：下窄上宽，中间亮、两侧透。</summary>
-        private void DrawBeam(Graphics g, float t, float pulse)
-        {
-            using (GraphicsPath beam = new GraphicsPath())
+            // 地面上远处两根小的照明杆，给场景一点比例感
+            using (Pen pole = new Pen(Color.FromArgb(255, 170, 180, 192), 1.0f))
+            using (Brush lampHead = new SolidBrush(Color.FromArgb(255, 190, 200, 212)))
             {
-                beam.AddPolygon(new[]
+                g.DrawLine(pole, 28, 112, 28, 96);
+                g.DrawLine(pole, 232, 112, 232, 92);
+                g.FillRectangle(lampHead, 25, 94, 6, 2);
+                g.FillRectangle(lampHead, 229, 90, 6, 2);
+            }
+
+            // ---- 左边的设备箱 ----
+            using (Brush box = new SolidBrush(Color.FromArgb(255, 176, 184, 194)))
+            using (Pen boxEdge = new Pen(Color.FromArgb(255, 140, 150, 162), 0.8f))
+            {
+                g.FillRectangle(box, 56, 92, 14, 20);
+                g.DrawRectangle(boxEdge, 56, 92, 14, 20);
+                g.FillRectangle(box, 70, 98, 8, 14);
+                g.DrawRectangle(boxEdge, 70, 98, 8, 14);
+            }
+
+            // ---- 发射塔：两根立柱 + 横档 + 交叉斜撑 ----
+            const int towerLeft = 84;
+            const int towerRight = 102;
+            // 塔顶压在提示文字（10~28）下面，别和字撞上
+            const int towerTop = 40;
+            using (Pen rail = new Pen(Color.FromArgb(255, 118, 128, 142), 2.0f))
+            using (Pen brace = new Pen(Color.FromArgb(255, 156, 166, 178), 1.0f))
+            using (Brush cap = new SolidBrush(Color.FromArgb(255, 104, 114, 128)))
+            {
+                g.DrawLine(rail, towerLeft, towerTop, towerLeft, DeckTop);
+                g.DrawLine(rail, towerRight, towerTop, towerRight, DeckTop);
+                for (int y = towerTop; y < DeckTop; y += 9)
                 {
-                    new PointF(PadCx - 12, PadCy - 2), new PointF(PadCx - 40, 20),
-                    new PointF(PadCx + 40, 20), new PointF(PadCx + 12, PadCy - 2)
-                });
-                int alpha = active ? (int)(70 + 50 * pulse) : 26;
-                // 用路径渐变而不是线性的：中间亮、往两条斜边渐隐，光柱才是"一束"而不是一块
-                using (PathGradientBrush brush = new PathGradientBrush(beam))
-                {
-                    brush.CenterPoint = new PointF(PadCx, PadCy - 6);
-                    brush.CenterColor = Color.FromArgb(alpha, 90, 190, 235);
-                    brush.SurroundColors = new[] { Color.FromArgb(0, 90, 190, 235) };
-                    g.FillPath(brush, beam);
-                }
-            }
-
-            if (!active)
-            {
-                return;
-            }
-
-            // 光柱里几道竖向细光，激活时才出现；各自以不同速度往上漂、循环
-            using (Pen ray = new Pen(Color.FromArgb(70, 255, 255, 255), 1.2f))
-            {
-                ray.StartCap = LineCap.Round;
-                ray.EndCap = LineCap.Round;
-                for (int i = 0; i < 3; i++)
-                {
-                    float phase = (t * (0.9f + i * 0.25f) + i * 0.37f) % 1.0f;
-                    float y = PadCy - 6 - phase * (PadCy - 34);
-                    float x = PadCx - 14 + i * 14;
-                    ray.Color = Color.FromArgb((int)(90 * (1.0f - phase)), 255, 255, 255);
-                    g.DrawLine(ray, x, y, x, y - 16);
-                }
-            }
-        }
-
-        private static RectangleF PadEllipse(float rx, float ry)
-        {
-            return new RectangleF(PadCx - rx, PadCy - ry, rx * 2, ry * 2);
-        }
-
-        /// <summary>俯视的起降坪：投影 → 外环斜面 → 坪面 → 跑道弧 → 中心盘。</summary>
-        private void DrawPad(Graphics g, float t, float pulse)
-        {
-            using (Brush shadow = new SolidBrush(Color.FromArgb(26, 40, 110, 150)))
-            {
-                g.FillEllipse(shadow, PadEllipse(PadRx + 3, PadRy + 3));
-            }
-
-            // 外环：斜面感来自上亮下暗
-            RectangleF outer = PadEllipse(PadRx, PadRy);
-            using (LinearGradientBrush ringBrush = new LinearGradientBrush(outer,
-                       active ? Color.FromArgb(255, 130, 210, 242) : Color.FromArgb(255, 170, 208, 228),
-                       active ? Color.FromArgb(255, 38, 150, 206) : Color.FromArgb(255, 112, 166, 200),
-                       LinearGradientMode.Vertical))
-            using (Pen edge = new Pen(Color.FromArgb(active ? 225 : 150, 45, 128, 169), 1.0f))
-            {
-                g.FillEllipse(ringBrush, outer);
-                g.DrawEllipse(edge, outer);
-            }
-
-            // 坪面
-            RectangleF deck = PadEllipse(PadRx - 7, PadRy - 3.4f);
-            using (LinearGradientBrush deckBrush = new LinearGradientBrush(deck,
-                       Color.FromArgb(255, 255, 255, 255), Color.FromArgb(255, 228, 241, 251),
-                       LinearGradientMode.Vertical))
-            {
-                g.FillEllipse(deckBrush, deck);
-            }
-
-            // 跑道：两段弧绕着转。待命慢，激活快
-            RectangleF track = PadEllipse(PadRx - 17, PadRy - 7.6f);
-            using (Pen trackPen = new Pen(Color.FromArgb(active ? 215 : 135, 50, 160, 210), active ? 1.8f : 1.3f))
-            {
-                trackPen.StartCap = LineCap.Round;
-                trackPen.EndCap = LineCap.Round;
-                float sweep = t * (active ? 140.0f : 36.0f);
-                g.DrawArc(trackPen, track, sweep, 72);
-                g.DrawArc(trackPen, track, sweep + 180, 72);
-            }
-
-            // 中心盘：激活时中心发白、边缘泛蓝
-            RectangleF core = PadEllipse(36, 11.5f);
-            using (GraphicsPath corePath = new GraphicsPath())
-            {
-                corePath.AddEllipse(core);
-                using (PathGradientBrush glow = new PathGradientBrush(corePath))
-                {
-                    glow.CenterColor = active ? Color.FromArgb(255, 255, 255, 255) : Color.FromArgb(255, 243, 250, 255);
-                    glow.SurroundColors = new[]
+                    int y2 = Math.Min(y + 9, (int)DeckTop);
+                    g.DrawLine(brace, towerLeft, y, towerRight, y);
+                    // 斜撑一根向下一根向上交替，像真的桁架
+                    if (((y - towerTop) / 9) % 2 == 0)
                     {
-                        active ? Color.FromArgb(255, (int)(120 + 60 * pulse), 200, 238) : Color.FromArgb(255, 186, 216, 236)
-                    };
-                    g.FillPath(glow, corePath);
-                }
-                using (Pen coreEdge = new Pen(Color.FromArgb(active ? 230 : 150, 45, 128, 169), 1.0f))
-                {
-                    g.DrawPath(coreEdge, corePath);
-                }
-            }
-
-            // 坪心一个小箭头：指向上方 = 发射方向
-            using (Brush mark = new SolidBrush(active ? Color.FromArgb(240, 30, 150, 215) : Color.FromArgb(170, 90, 160, 195)))
-            {
-                g.FillPolygon(mark, new[]
-                {
-                    new PointF(PadCx, PadCy - 5.5f), new PointF(PadCx + 5, PadCy + 2.5f), new PointF(PadCx - 5, PadCy + 2.5f)
-                });
-            }
-        }
-
-        /// <summary>外沿一圈跑道灯：待命时一盏一盏追着亮，激活时全亮。</summary>
-        private void DrawPadLights(Graphics g, float t)
-        {
-            const int count = 12;
-            int chase = (int)Math.Floor(t * 7.0) % count;
-            for (int i = 0; i < count; i++)
-            {
-                double angle = (i * 360.0 / count - 90.0) * Math.PI / 180.0;
-                float x = PadCx + (float)Math.Cos(angle) * (PadRx - 1.5f);
-                float y = PadCy + (float)Math.Sin(angle) * (PadRy - 1.0f);
-                bool lit = active || i == chase || i == (chase + count - 1) % count;
-                if (lit)
-                {
-                    using (Brush halo = new SolidBrush(Color.FromArgb(active ? 110 : 70, 255, 200, 90)))
+                        g.DrawLine(brace, towerLeft, y, towerRight, y2);
+                    }
+                    else
                     {
-                        g.FillEllipse(halo, x - 5, y - 5, 10, 10);
+                        g.DrawLine(brace, towerRight, y, towerLeft, y2);
                     }
                 }
-                using (Brush lamp = new SolidBrush(lit ? Color.FromArgb(255, 255, 196, 80) : Color.FromArgb(255, 196, 218, 234)))
+                g.FillRectangle(cap, towerLeft - 2, towerTop - 3, towerRight - towerLeft + 5, 3);
+            }
+
+            // 塔顶的红色警示灯：慢慢呼吸
+            int beaconAlpha = (int)(120 + 120 * (0.5 + 0.5 * Math.Sin(t * 2.2)));
+            using (Brush beacon = new SolidBrush(Color.FromArgb(beaconAlpha, 255, 86, 64)))
+            {
+                g.FillEllipse(beacon, 91.0f, towerTop - 5.5f, 4, 4);
+            }
+
+            // 塔身上的三盏状态灯：待命灰、激活绿
+            Color lightColor = active ? Color.FromArgb(255, 60, 196, 118) : Color.FromArgb(255, 184, 194, 204);
+            using (Brush light = new SolidBrush(lightColor))
+            {
+                g.FillEllipse(light, 91.5f, 52, 3, 3);
+                g.FillEllipse(light, 91.5f, 68, 3, 3);
+                g.FillEllipse(light, 91.5f, 86, 3, 3);
+            }
+
+            // ---- 服务臂：从塔伸向火箭。火箭在场时缩回去 ----
+            int armLength = active ? 6 : 19;
+            using (Pen arm = new Pen(Color.FromArgb(255, 112, 122, 136), 2.0f))
+            using (Brush joint = new SolidBrush(Color.FromArgb(255, 96, 106, 120)))
+            {
+                g.DrawLine(arm, towerRight, 64, towerRight + armLength, 64);
+                g.FillEllipse(joint, towerRight - 2.5f, 61.5f, 5, 5);
+                g.FillRectangle(joint, towerRight + armLength - 2, 62, 2, 4);
+            }
+
+            // ---- 右边的白色储罐：圆柱，圆顶 ----
+            using (LinearGradientBrush vesselBrush = new LinearGradientBrush(new RectangleF(186, 86, 12, 16),
+                       Color.FromArgb(255, 250, 251, 252), Color.FromArgb(255, 196, 206, 216), LinearGradientMode.Horizontal))
+            using (Pen vesselEdge = new Pen(Color.FromArgb(255, 150, 160, 172), 0.8f))
+            {
+                g.FillRectangle(vesselBrush, 186, 90, 12, 12);
+                g.DrawRectangle(vesselEdge, 186, 90, 12, 12);
+                using (GraphicsPath dome = new GraphicsPath())
                 {
-                    g.FillEllipse(lamp, x - 2.2f, y - 2.2f, 4.4f, 4.4f);
+                    dome.AddBezier(186, 90, 187, 85, 197, 85, 199, 90);
+                    dome.CloseFigure();
+                    g.FillPath(vesselBrush, dome);
+                    g.DrawPath(vesselEdge, dome);
+                }
+            }
+            // 储罐到坪面的管子
+            using (Pen pipe = new Pen(Color.FromArgb(255, 160, 170, 182), 1.5f))
+            {
+                g.DrawLine(pipe, 186, 100, 185, 100);
+                g.DrawLine(pipe, 185, 100, 185, DeckTop);
+            }
+
+            // ---- 水泥坪：上表面亮、前脸暗，是一块有厚度的台子 ----
+            using (Brush topFace = new LinearGradientBrush(new RectangleF(73, DeckTop, 112, 8),
+                       Color.FromArgb(255, 206, 212, 220), Color.FromArgb(255, 190, 197, 206), LinearGradientMode.Vertical))
+            using (Brush frontFace = new SolidBrush(Color.FromArgb(255, 158, 166, 178)))
+            using (Pen topEdge = new Pen(Color.FromArgb(255, 150, 158, 170), 1.0f))
+            {
+                g.FillRectangle(topFace, 73, DeckTop, 112, 8);
+                g.FillRectangle(frontFace, 73, DeckTop + 8, 112, 7);
+                g.DrawLine(topEdge, 73, DeckTop, 185, DeckTop);
+            }
+            // 坪面上的几道伸缩缝
+            using (Pen seam = new Pen(Color.FromArgb(255, 176, 184, 194), 0.6f))
+            {
+                g.DrawLine(seam, 101, DeckTop + 1, 101, DeckTop + 7);
+                g.DrawLine(seam, 157, DeckTop + 1, 157, DeckTop + 7);
+            }
+
+            // 火箭在场时，坪面上有一块被压出来的阴影，让它看着是"放"在台上而不是飘着
+            if (active)
+            {
+                using (Brush shadow = new SolidBrush(Color.FromArgb(60, 60, 76, 100)))
+                {
+                    g.FillEllipse(shadow, PadCx - 16, DeckTop - 2, 32, 6);
                 }
             }
         }
 
-        /// <summary>激活时三个箭头从坪面往上飘、越往上越淡，循环。</summary>
-        private void DrawChevrons(Graphics g, float t)
+        /// <summary>待命加注时的排汽：几小团白汽从火箭底部往两侧慢慢飘散。</summary>
+        private void DrawVenting(Graphics g, float t)
         {
-            const float bottom = PadCy - 24;
-            const float top = 36;
-            using (Pen chevron = new Pen(Color.FromArgb(255, 255, 255, 255), 2.2f))
+            for (int i = 0; i < 6; i++)
             {
-                chevron.StartCap = LineCap.Round;
-                chevron.EndCap = LineCap.Round;
-                for (int i = 0; i < 3; i++)
+                float phase = (t * 0.32f + i * 0.17f) % 1.0f;
+                int side = i % 2 == 0 ? -1 : 1;
+                float x = PadCx + side * (5 + phase * 16);
+                float y = DeckTop - 2 - phase * 10;
+                float r = 2.5f + phase * 4.5f;
+                int alpha = (int)(95 * (1 - phase));
+                using (Brush steam = new SolidBrush(Color.FromArgb(alpha, 240, 243, 247)))
                 {
-                    float phase = (t * 0.9f + i / 3.0f) % 1.0f;
-                    float y = bottom - phase * (bottom - top);
-                    // 两头淡、中间实：刚冒出来和快消失时都不抢眼
-                    float fade = (float)Math.Sin(phase * Math.PI);
-                    int alpha = (int)(230 * fade);
-                    if (alpha <= 0)
+                    g.FillEllipse(steam, x - r, y - r * 0.8f, r * 2, r * 1.6f);
+                }
+            }
+        }
+
+        /// <summary>点火：一大团白烟沿着地面向两边翻滚、慢慢散掉；坪心先是一团炽白。</summary>
+        private void DrawIgnition(Graphics g, float p)
+        {
+            // 先画远处的、大的；后画近处的
+            for (int i = 11; i >= 0; i--)
+            {
+                int side = i % 2 == 0 ? -1 : 1;
+                float o = (i / 2) + 1;
+                float reach = (6 + o * 11) * (0.35f + p * 1.1f);
+                float x = PadCx + side * reach;
+                float r = (3 + o * 1.6f) * (0.6f + p * 1.6f);
+                float y = DeckTop + 2 - r * 0.45f - p * 3.0f * (o / 6.0f);
+                int alpha = (int)(215 * (1 - p) * (1 - p * 0.3f));
+                if (alpha <= 0)
+                {
+                    continue;
+                }
+                // 近处更白、远处更灰，有一点纵深
+                Color color = Color.FromArgb(alpha, 238 - (int)(o * 2), 241 - (int)(o * 2), 246 - (int)(o * 2));
+                using (Brush smoke = new SolidBrush(color))
+                {
+                    g.FillEllipse(smoke, x - r, y - r * 0.75f, r * 2, r * 1.5f);
+                }
+            }
+
+            // 点火那一瞬间的炽白
+            if (p < 0.45f)
+            {
+                float f = 1 - p / 0.45f;
+                using (GraphicsPath core = new GraphicsPath())
+                {
+                    float rr = 9 + 14 * p;
+                    core.AddEllipse(PadCx - rr, DeckTop - rr * 0.7f, rr * 2, rr * 1.4f);
+                    using (PathGradientBrush glow = new PathGradientBrush(core))
                     {
-                        continue;
+                        glow.CenterColor = Color.FromArgb((int)(240 * f), 255, 244, 210);
+                        glow.SurroundColors = new[] { Color.FromArgb(0, 255, 190, 90) };
+                        g.FillPath(glow, core);
                     }
-                    float half = 7.5f - phase * 2.0f;
-                    chevron.Color = Color.FromArgb(alpha, 36, 158, 222);
-                    g.DrawLine(chevron, PadCx - half, y + 4, PadCx, y - 2);
-                    g.DrawLine(chevron, PadCx, y - 2, PadCx + half, y + 4);
                 }
             }
         }
 
         private void DrawHint(Graphics g)
         {
-            string text = active ? "松手，发射！" : "把球拖到这里发射";
+            string text = active ? "松手，点火" : "把球拖到发射台上";
             using (StringFormat format = new StringFormat())
             {
                 format.Alignment = StringAlignment.Center;
                 format.LineAlignment = StringAlignment.Center;
-                using (Brush brush = new SolidBrush(active ? Color.FromArgb(255, 24, 140, 205) : Color.FromArgb(255, 118, 150, 176)))
+                using (Brush brush = new SolidBrush(active ? Color.FromArgb(255, 24, 140, 205) : Color.FromArgb(255, 112, 130, 148)))
                 {
-                    g.DrawString(text, active ? hintBoldFont : hintFont, brush, new RectangleF(0, 8, LW, 20), format);
+                    g.DrawString(text, active ? hintBoldFont : hintFont, brush, new RectangleF(0, 10, LW, 18), format);
                 }
-            }
-        }
-
-        /// <summary>点火：坪心一闪、一道冲击波沿坪面扩散、光柱猛地拉高。</summary>
-        private void DrawBurst(Graphics g, float p)
-        {
-            float fade = 1.0f - p;
-            // 光柱冲顶：和平时那道光柱同样的画法（路径渐变，四周都渐隐），
-            // 只是更宽更亮。带一点青色：纯白在白面板上看不出"亮"，只有颜色才能表达能量
-            float halfWidth = 46 + 16 * p;
-            using (GraphicsPath cone = new GraphicsPath())
-            {
-                cone.AddPolygon(new[]
-                {
-                    new PointF(PadCx - 16, PadCy - 2), new PointF(PadCx - halfWidth, 8),
-                    new PointF(PadCx + halfWidth, 8), new PointF(PadCx + 16, PadCy - 2)
-                });
-                using (PathGradientBrush flash = new PathGradientBrush(cone))
-                {
-                    flash.CenterPoint = new PointF(PadCx, PadCy - 10);
-                    flash.CenterColor = Color.FromArgb((int)(235 * fade), 120, 210, 255);
-                    flash.SurroundColors = new[] { Color.FromArgb(0, 120, 210, 255) };
-                    g.FillPath(flash, cone);
-                }
-            }
-            // 中间再压一道更窄的纯白，做出"高光芯"
-            using (GraphicsPath coreCone = new GraphicsPath())
-            {
-                coreCone.AddPolygon(new[]
-                {
-                    new PointF(PadCx - 10, PadCy - 2), new PointF(PadCx - 20, 8),
-                    new PointF(PadCx + 20, 8), new PointF(PadCx + 10, PadCy - 2)
-                });
-                using (PathGradientBrush coreFlash = new PathGradientBrush(coreCone))
-                {
-                    coreFlash.CenterPoint = new PointF(PadCx, PadCy - 10);
-                    coreFlash.CenterColor = Color.FromArgb((int)(240 * fade), 255, 255, 255);
-                    coreFlash.SurroundColors = new[] { Color.FromArgb(0, 255, 255, 255) };
-                    g.FillPath(coreFlash, coreCone);
-                }
-            }
-            // 冲击波：从坪心扩散到坪外
-            float rx = 24 + (PadRx + 22) * p;
-            float ry = 7 + (PadRy + 7) * p;
-            using (Pen wave = new Pen(Color.FromArgb((int)(220 * fade), 80, 190, 240), 1.5f + 3.0f * fade))
-            using (Pen waveInner = new Pen(Color.FromArgb((int)(120 * fade), 255, 255, 255), 1.0f + 2.0f * fade))
-            {
-                g.DrawEllipse(wave, PadEllipse(rx, ry));
-                g.DrawEllipse(waveInner, PadEllipse(rx * 0.72f, ry * 0.72f));
-            }
-            // 坪心高光
-            using (Brush core = new SolidBrush(Color.FromArgb((int)(230 * fade), 255, 255, 255)))
-            {
-                g.FillEllipse(core, PadEllipse(40 * (0.6f + 0.4f * (1 - p)), 13 * (0.6f + 0.4f * (1 - p))));
             }
         }
 
@@ -8377,9 +8302,9 @@ namespace NetSpeedBall
                 return;
             }
 
-            // 裁剪形状要跟画出来的圆角一致（外框 30 + 3px 留边），
+            // 裁剪形状要跟画出来的圆角一致（外框 18 + 3px 留边），
             // 否则四角会露出一圈底色的直角"小耳朵"
-            int radius = Math.Max(8, UiScale.Px(31));
+            int radius = Math.Max(8, UiScale.Px(21));
             using (GraphicsPath path = CreateRoundedRectangle(new Rectangle(0, 0, Width, Height), radius))
             {
                 Region oldRegion = Region;
