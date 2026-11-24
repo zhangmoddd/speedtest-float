@@ -17,8 +17,15 @@
 //! 2. 跳过回环（type 24）和隧道（type 131）—— 先单独统计
 //! 3. 跳过描述里带虚拟化关键词的网卡（VMware / Hyper-V / VirtualBox / TAP / Wintun …）
 //!    这类网卡会把同一份流量再算一遍
-//! 4. **隧道优先**：只要有隧道网卡在线且有流量，就只统计隧道，不再统计物理网卡。
-//!    否则 VPN 开着的时候同一份流量会被算两次（物理网卡一次、隧道一次）
+//! 4. **隧道优先，但按"这一拍的增量"比**：隧道和物理网卡各算一组累计值，
+//!    每一拍看谁真的在涨。隧道增量不小于物理增量的一半，才只统计隧道；
+//!    否则只统计物理网卡。全隧道模式下两者接近（隧道略小，少了 VPN 封装开销），
+//!    所以选隧道；分流 VPN、或者 Tailscale 这类常驻但没在传数据的隧道，
+//!    物理增量远大于隧道增量，就选物理。
+//!
+//!    以前这里是按**开机以来的累计值**判断的（隧道累计 > 0 就只认隧道）：
+//!    常驻隧道网卡开机后传过一点数据就永远 > 0，之后真实走 Wi-Fi 的流量会被整段漏掉，
+//!    球上一直显示接近 0。
 //!
 //! 这套规则是照着 `reference/netspeedball/NetSpeedBall.cs` 的口径复刻的，
 //! 那边踩过的坑这里不再踩一遍。
@@ -84,10 +91,7 @@ pub fn start() {
     // 先同步采一次基准值，否则第一次调用会拿到 0 并且要等一个间隔才有数
     let _ = read_counters();
     thread::spawn(|| {
-        let mut prev = match read_counters() {
-            Some(v) => v,
-            None => Counters::default(),
-        };
+        let mut prev = read_counters().unwrap_or_default();
         let mut prev_at = Instant::now();
 
         let mut smooth_down = 0.0f64;
@@ -112,9 +116,10 @@ pub fn start() {
                 continue;
             };
 
-            // 计数器回绕或网卡被拔掉重插时会变小，这时不能算出差值
-            let d_down = cur.down.saturating_sub(prev.down) as f64 / elapsed;
-            let d_up = cur.up.saturating_sub(prev.up) as f64 / elapsed;
+            // 这一拍统计哪一组（隧道 / 其余），以及那一组的字节增量
+            let (down_bytes, up_bytes, used_tunnel) = pick_group(&prev, &cur);
+            let d_down = down_bytes as f64 / elapsed;
+            let d_up = up_bytes as f64 / elapsed;
 
             let (mut down, mut up) = if primed {
                 (
@@ -142,8 +147,8 @@ pub fn start() {
                 *slot = NetSpeedSample {
                     down,
                     up,
-                    down_total: cur.down,
-                    up_total: cur.up,
+                    down_total: if used_tunnel { cur.tunnel_down } else { cur.other_down },
+                    up_total: if used_tunnel { cur.tunnel_up } else { cur.other_up },
                     available: cur.available,
                 };
             }
@@ -154,12 +159,41 @@ pub fn start() {
     });
 }
 
-/// 累计字节数快照。
-#[derive(Clone, Copy, Default)]
+/// 两组网卡的累计字节数快照（开机以来）。
+///
+/// 隧道一组、其余可统计的网卡一组；选哪组是每一拍按增量决定的，见 [`pick_group`]。
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
 struct Counters {
-    down: u64,
-    up: u64,
+    tunnel_down: u64,
+    tunnel_up: u64,
+    other_down: u64,
+    other_up: u64,
     available: bool,
+}
+
+/// 决定这一拍统计哪一组：返回 `(下行增量, 上行增量, 是否选了隧道)`。
+///
+/// 按**这一拍的增量**比，不按开机以来的累计值：
+/// - 常驻隧道（Tailscale 这类）开机后传过一点数据，累计值永远 > 0，但此刻没在涨；
+///   真实流量走的是 Wi-Fi —— 必须选物理。
+/// - 全隧道 VPN（出口节点）：隧道增量 ≈ 物理增量（隧道略小），两者都在涨 —— 选隧道，
+///   它是应用层的真实字节数，而且不会把同一份流量算两遍。
+/// - 分流 VPN：物理增量远大于隧道增量 —— 选物理（它的数字里已经包含了 VPN 的封装流量）。
+///
+/// 计数器回绕或网卡重插会变小，`saturating_sub` 保证不会算出负数/天文数字。
+fn pick_group(prev: &Counters, cur: &Counters) -> (u64, u64, bool) {
+    let tunnel_down = cur.tunnel_down.saturating_sub(prev.tunnel_down);
+    let tunnel_up = cur.tunnel_up.saturating_sub(prev.tunnel_up);
+    let other_down = cur.other_down.saturating_sub(prev.other_down);
+    let other_up = cur.other_up.saturating_sub(prev.other_up);
+
+    let tunnel = tunnel_down.saturating_add(tunnel_up);
+    let other = other_down.saturating_add(other_up);
+    if tunnel > 0 && tunnel.saturating_mul(2) >= other {
+        (tunnel_down, tunnel_up, true)
+    } else {
+        (other_down, other_up, false)
+    }
 }
 
 /// 网卡的一行原始信息，从系统表里读出来后立刻转成纯数据，
@@ -226,49 +260,33 @@ fn read_counters() -> Option<Counters> {
     unsafe { FreeMibTable(table as *const core::ffi::c_void) };
 
     if rows.is_empty() {
-        return Some(Counters {
-            down: 0,
-            up: 0,
-            available: false,
-        });
+        return Some(Counters::default());
     }
 
-    let tunnel_down: u64 = rows.iter().filter(|r| r.is_tunnel).map(|r| r.down).sum();
-    let tunnel_up: u64 = rows.iter().filter(|r| r.is_tunnel).map(|r| r.up).sum();
-
-    // 隧道在线且有流量 → 只认隧道，避免和物理网卡重复计数
-    if tunnel_down > 0 || tunnel_up > 0 {
-        return Some(Counters {
-            down: tunnel_down,
-            up: tunnel_up,
-            available: true,
-        });
+    let mut counters = Counters::default();
+    for r in rows.iter().filter(|r| r.is_tunnel) {
+        counters.tunnel_down = counters.tunnel_down.saturating_add(r.down);
+        counters.tunnel_up = counters.tunnel_up.saturating_add(r.up);
     }
-
-    let mut down = 0u64;
-    let mut up = 0u64;
-    let mut any = false;
     for r in rows.iter().filter(|r| !r.is_tunnel && !r.virtual_like) {
-        down += r.down;
-        up += r.up;
-        any = true;
+        counters.other_down = counters.other_down.saturating_add(r.down);
+        counters.other_up = counters.other_up.saturating_add(r.up);
+        counters.available = true;
     }
 
-    // 过滤太狠（比如用户网卡描述里有奇怪字样）导致一个都不剩时，
+    // 过滤太狠（比如用户网卡描述里有奇怪字样）导致一块普通网卡都不剩时，
     // 退回「所有非隧道网卡」，宁可重复计数也不要显示 0
-    if !any {
+    if !counters.available {
         for r in rows.iter().filter(|r| !r.is_tunnel) {
-            down += r.down;
-            up += r.up;
-            any = true;
+            counters.other_down = counters.other_down.saturating_add(r.down);
+            counters.other_up = counters.other_up.saturating_add(r.up);
+            counters.available = true;
         }
     }
+    // 只有隧道、一块普通网卡都没有的机器也算"有网"
+    counters.available = counters.available || counters.tunnel_down > 0 || counters.tunnel_up > 0;
 
-    Some(Counters {
-        down,
-        up,
-        available: any,
-    })
+    Some(counters)
 }
 
 #[cfg(not(windows))]
@@ -309,4 +327,73 @@ fn looks_virtual(lowercased: &str) -> bool {
         "tailscale",
     ];
     KEYWORDS.iter().any(|k| lowercased.contains(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counters(tunnel: (u64, u64), other: (u64, u64)) -> Counters {
+        Counters {
+            tunnel_down: tunnel.0,
+            tunnel_up: tunnel.1,
+            other_down: other.0,
+            other_up: other.1,
+            available: true,
+        }
+    }
+
+    #[test]
+    fn idle_tunnel_with_history_does_not_steal_from_physical() {
+        // Tailscale 这类常驻隧道：开机后传过 1MB，之后没动；真实流量走 Wi-Fi
+        let prev = counters((1_000_000, 500_000), (10, 10));
+        let cur = counters((1_000_000, 500_000), (10 + 3_000, 10 + 700));
+        assert_eq!(pick_group(&prev, &cur), (3_000, 700, false));
+    }
+
+    #[test]
+    fn full_tunnel_prefers_tunnel_counters() {
+        // 全隧道 VPN：两组都在涨，隧道略小（少了封装开销）→ 选隧道，只算一遍
+        let prev = counters((100, 100), (100, 100));
+        let cur = counters((100 + 1_000, 100 + 200), (100 + 1_050, 100 + 210));
+        assert_eq!(pick_group(&prev, &cur), (1_000, 200, true));
+    }
+
+    #[test]
+    fn split_tunnel_falls_back_to_physical() {
+        // 分流 VPN：隧道只涨一点点，物理涨很多 → 选物理
+        let prev = counters((100, 100), (100, 100));
+        let cur = counters((100 + 100, 100 + 20), (100 + 5_000, 100 + 900));
+        assert_eq!(pick_group(&prev, &cur), (5_000, 900, false));
+    }
+
+    #[test]
+    fn tunnel_only_machine_counts_tunnel() {
+        let prev = counters((100, 100), (0, 0));
+        let cur = counters((100 + 400, 100 + 50), (0, 0));
+        assert_eq!(pick_group(&prev, &cur), (400, 50, true));
+    }
+
+    #[test]
+    fn counter_reset_never_underflows() {
+        // 网卡重插后计数器归零：不能算出天文数字
+        let prev = counters((0, 0), (9_000_000, 9_000_000));
+        let cur = counters((0, 0), (120, 80));
+        assert_eq!(pick_group(&prev, &cur), (0, 0, false));
+    }
+
+    #[test]
+    fn nothing_moving_is_zero() {
+        let same = counters((7, 7), (9, 9));
+        assert_eq!(pick_group(&same, &same), (0, 0, false));
+    }
+
+    #[test]
+    fn virtual_keyword_matches_known_products_only() {
+        assert!(looks_virtual("vethernet (default switch) hyper-v virtual ethernet adapter"));
+        assert!(looks_virtual("wireguard tunnel"));
+        assert!(looks_virtual("vmware virtual ethernet adapter for vmnet8"));
+        assert!(!looks_virtual("intel(r) wi-fi 6 ax201 160mhz"));
+        assert!(!looks_virtual("realtek pcie gbe family controller"));
+    }
 }
