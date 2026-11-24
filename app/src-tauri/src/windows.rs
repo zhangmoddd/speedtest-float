@@ -29,6 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
+use crate::models::PendingAlert;
 use crate::storage;
 
 /// 悬浮球窗口标签。
@@ -814,7 +815,7 @@ pub struct AlertContent {
 /// 前端还没挂载完的时候到达），事件被丢弃。而调度线程**已经把 `fired_for` 落盘了**，
 /// 那条提醒就再也不会补弹 —— 用户少收一条提醒，且没有任何地方能发现。
 ///
-/// 首次创建窗口时 URL query 能兜住（见 [`show_alert`] 的说明），但"复用已有窗口"
+/// 首次创建窗口时 URL query 能兜住（见 [`show_alerts`] 的说明），但"复用已有窗口"
 /// 这条路原来没有兜底。所以这里留一份，前端挂载时主动拉。
 static LAST_ALERT: std::sync::OnceLock<std::sync::Mutex<Option<AlertContent>>> =
     std::sync::OnceLock::new();
@@ -831,6 +832,90 @@ pub fn last_alert() -> Option<AlertContent> {
         .clone()
 }
 
+/// 提醒窗里「当前这一批」提醒。
+///
+/// 窗口还开着的时候又来了新提醒，要把新来的**并进这一批**重新拼标题正文
+/// （见 [`show_alerts`]），所以除了拼好的 [`AlertContent`]，还得留着原始条目 ——
+/// 从拼好的文字里拆不回条目：多条时标题是「N 条提醒」、正文是一个列表。
+#[derive(Debug, Default)]
+struct ShownAlerts {
+    items: Vec<PendingAlert>,
+    /// 这一批里含「开机补发的错过提醒」。决定标题措辞（「你错过了 N 条提醒」）。
+    missed: bool,
+}
+
+static SHOWN_ALERTS: std::sync::OnceLock<std::sync::Mutex<ShownAlerts>> =
+    std::sync::OnceLock::new();
+
+fn shown_slot() -> &'static std::sync::Mutex<ShownAlerts> {
+    SHOWN_ALERTS.get_or_init(|| std::sync::Mutex::new(ShownAlerts::default()))
+}
+
+/// 提醒窗当前显示的每一条。
+///
+/// 给「稍后提醒」用：要把**每一条原样**排回去，而不是把拼好的列表当成一条排回去 ——
+/// 后者回来时正文是一个多行的列表，再和别的提醒并在一起就乱套了。
+pub fn shown_alerts() -> Vec<PendingAlert> {
+    shown_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .items
+        .clone()
+}
+
+/// 把新来的提醒并进「窗口里正在显示的那一批」。纯函数，可单测。
+///
+/// # 为什么是并进去，而不是让后一条顶掉前一条、也不是排队
+///
+/// - **顶掉**（原来的做法）：用户可能还没看完第一条，它就没了。而调度线程已经把
+///   第一条标成「提醒过了」，不会再补 —— 等于**丢了一条提醒**。
+/// - **排队**：第二条要等用户点掉第一条才出现。闹钟会一直响到用户处理为止
+///   （上限 10 分钟），排在它后面的「煮蛋好了」就可能晚十分钟才弹 ——
+///   提醒晚到等于没到。
+/// - **并进同一个窗口**：两条都看得见；内容一换，前端就会重新响铃，不用等。
+///
+/// # 规则
+///
+/// - 标题正文都相同的条目不重复追加：同一条提醒被报两次时（稍后提醒和到点提醒撞上、
+///   或同一轮里两条文案一样），列表里出现两行一模一样的字只是噪音。
+/// - 顺序按「原定时刻」排：先发生的先说，和 [`scheduler::compose_alert`] 的口径一致。
+/// - `missed` 只要这一批里有过一次是开机补发就保持为真：标题继续说「你错过了」，
+///   不能因为后来并进来一条新的，就把前几条说成不是错过的。
+fn merge_shown(prev: &mut ShownAlerts, incoming: &[PendingAlert], missed: bool) {
+    for a in incoming {
+        let dup = prev
+            .items
+            .iter()
+            .any(|x| x.title == a.title && x.body == a.body);
+        if !dup {
+            prev.items.push(a.clone());
+        }
+    }
+    prev.items.sort_by_key(|a| a.due_at);
+    prev.missed |= missed;
+}
+
+/// 把当前这一批拼成提醒窗要显示的标题正文。
+///
+/// 一条就是它本身（用户最关心"是什么事"）；多条时标题报条数、正文一行一条。
+/// 闹钟标记取「或」：批里有一条是闹钟，窗口就得按闹钟的时长响。
+fn compose_shown(shown: &ShownAlerts) -> AlertContent {
+    let multi_title = |n: usize| {
+        if shown.missed {
+            format!("你错过了 {n} 条提醒")
+        } else {
+            format!("{n} 条提醒")
+        }
+    };
+    let (title, body) = crate::scheduler::compose_alert(&shown.items, multi_title)
+        .unwrap_or_else(|| ("浮光提醒".to_string(), String::new()));
+    AlertContent {
+        title,
+        body,
+        is_alarm: shown.items.iter().any(|a| a.source == "alarm"),
+    }
+}
+
 /// 弹出提醒窗。
 ///
 /// # 内容怎么传
@@ -844,33 +929,64 @@ pub fn last_alert() -> Option<AlertContent> {
 ///
 /// **复用窗口时事件同样可能丢**（监听器还没注册），所以内容还会存进
 /// [`last_alert`]，前端挂载时主动拉一次兜底。
-pub fn show_alert(app: &AppHandle, title: &str, body: &str, is_alarm: bool) -> tauri::Result<()> {
+///
+/// # 窗口还开着时又来一条
+///
+/// 不顶掉、不排队，并进同一批（见 [`merge_shown`]）。
+///
+/// # 不抢焦点
+///
+/// 显示走 [`platform::show_no_activate`]：窗口照样出现在最上层，但不拿走
+/// 用户正在用的那个程序的键盘焦点。建窗口时先 `visible(false)` + `focused(false)`，
+/// 显示这一步完全交给上面那个函数，一次到位。
+pub fn show_alerts(
+    app: &AppHandle,
+    alerts: &[PendingAlert],
+    missed: bool,
+) -> tauri::Result<()> {
     use tauri::Emitter;
 
-    // 先记下来：无论事件能不能送达，前端挂载时都能拉到
-    *last_alert_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(AlertContent {
-        title: title.to_string(),
-        body: body.to_string(),
-        is_alarm,
-    });
+    if alerts.is_empty() {
+        return Ok(());
+    }
+
+    // 先并进「正在显示的那一批」，再统一拼。无论事件能不能送达，
+    // 前端挂载时都能通过 `alert_current` 拉到这一份（见 [`last_alert`]）。
+    let (content, reused) = {
+        let mut shown = shown_slot().lock().unwrap_or_else(|e| e.into_inner());
+        // 窗口已经不在了 = 上一批已经处理完，这一批从头开始
+        let reused = app.get_webview_window(ALERT).is_some();
+        if !reused {
+            *shown = ShownAlerts::default();
+        }
+        merge_shown(&mut shown, alerts, missed);
+        let content = compose_shown(&shown);
+        *last_alert_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(content.clone());
+        (content, reused)
+    };
+
+    if reused {
+        if let Some(win) = app.get_webview_window(ALERT) {
+            // 先推内容再显示，避免用户看到旧内容闪一下
+            let _ = win.emit(
+                "alert:content",
+                serde_json::json!({
+                    "title": content.title,
+                    "body": content.body,
+                    "isAlarm": content.is_alarm,
+                }),
+            );
+            show_quietly(&win)?;
+        }
+        return Ok(());
+    }
 
     let url = format!(
         "index.html#/alert?title={}&body={}&alarm={}",
-        urlencode(title),
-        urlencode(body),
-        if is_alarm { 1 } else { 0 }
+        urlencode(&content.title),
+        urlencode(&content.body),
+        if content.is_alarm { 1 } else { 0 }
     );
-
-    if let Some(win) = app.get_webview_window(ALERT) {
-        // 先推内容再显示，避免用户看到旧内容闪一下
-        let _ = win.emit(
-            "alert:content",
-            serde_json::json!({ "title": title, "body": body, "isAlarm": is_alarm }),
-        );
-        win.show()?;
-        win.set_focus()?;
-        return Ok(());
-    }
 
     let win = WebviewWindowBuilder::new(app, ALERT, WebviewUrl::App(url.into()))
         // 标题必须是 ALERT_TITLE，理由见 PANEL_TITLE 的说明（平台标题白名单）
@@ -886,16 +1002,31 @@ pub fn show_alert(app: &AppHandle, title: &str, body: &str, is_alarm: bool) -> t
         .shadow(true)
         .always_on_top(true)
         .skip_taskbar(false)
-        .focused(true)
+        // 建出来先藏着、也不激活：显示那一步交给 show_quietly，一次到位
+        .visible(false)
+        .focused(false)
         .center()
         .build()?;
-    win.show()?;
+    show_quietly(&win)?;
     Ok(())
+}
+
+/// 显示提醒窗，但不激活（理由见 [`platform::show_no_activate`]）。
+///
+/// 拿不到原生句柄（理论上不会）就退回普通的 `show()`：
+/// 提醒窗不出现，比抢一下焦点糟得多。
+fn show_quietly(win: &WebviewWindow) -> tauri::Result<()> {
+    match win.hwnd() {
+        Ok(hwnd) => {
+            crate::platform::show_no_activate(hwnd.0 as isize);
+            Ok(())
+        }
+        Err(_) => win.show(),
+    }
 }
 
 /// 极简 URL 编码：只处理会破坏 query 结构的字符。
 /// 不引入额外依赖，因为只需要支持中英文与常见符号。
-#[allow(dead_code)]
 fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
@@ -1013,6 +1144,76 @@ mod tests {
                 "白名单里的「{title}」没有对应窗口"
             );
         }
+    }
+
+    // ---------- 提醒窗：两条挨得近时并进同一批，不顶掉前一条 ----------
+
+    fn item(source: &str, title: &str, body: &str, due_at: i64) -> PendingAlert {
+        PendingAlert {
+            source: source.into(),
+            id: String::new(),
+            title: title.into(),
+            body: body.into(),
+            due_at,
+        }
+    }
+
+    #[test]
+    fn 提醒窗还开着时新来的并进同一批而不是顶掉() {
+        let mut shown = ShownAlerts::default();
+        merge_shown(&mut shown, &[item("timer", "煮蛋", "倒计时已完成", 100)], false);
+        merge_shown(&mut shown, &[item("memo", "开会", "10:30 的会", 200)], false);
+
+        let c = compose_shown(&shown);
+        assert_eq!(c.title, "2 条提醒");
+        // 第一条必须还在：以前后一条会把它直接顶掉，用户来不及看就没了
+        assert!(c.body.contains("煮蛋"), "实际：{}", c.body);
+        assert!(c.body.contains("开会"), "实际：{}", c.body);
+        // 先发生的先说
+        assert!(c.body.find("煮蛋") < c.body.find("开会"));
+    }
+
+    #[test]
+    fn 只有一条时提醒窗显示它本身的标题() {
+        let mut shown = ShownAlerts::default();
+        merge_shown(&mut shown, &[item("timer", "煮蛋", "倒计时已完成", 100)], false);
+
+        let c = compose_shown(&shown);
+        assert_eq!(c.title, "煮蛋", "单条不该报成「1 条提醒」");
+        assert_eq!(c.body, "倒计时已完成");
+        assert!(!c.is_alarm);
+    }
+
+    #[test]
+    fn 内容一样的提醒不重复追加() {
+        let mut shown = ShownAlerts::default();
+        merge_shown(&mut shown, &[item("timer", "煮蛋", "倒计时已完成", 100)], false);
+        // 同一条又被报一次（例如稍后提醒和到点提醒撞上）
+        merge_shown(&mut shown, &[item("snooze", "煮蛋", "倒计时已完成", 300)], false);
+
+        let c = compose_shown(&shown);
+        assert_eq!(c.title, "煮蛋", "实际：{}", c.title);
+        assert_eq!(shown.items.len(), 1);
+    }
+
+    #[test]
+    fn 并进来的是闹钟时整批按闹钟响() {
+        let mut shown = ShownAlerts::default();
+        merge_shown(&mut shown, &[item("timer", "煮蛋", "倒计时已完成", 100)], false);
+        assert!(!compose_shown(&shown).is_alarm);
+
+        merge_shown(&mut shown, &[item("alarm", "起床", "闹钟响了", 200)], false);
+        assert!(compose_shown(&shown).is_alarm, "批里有一条闹钟就得按闹钟响");
+    }
+
+    #[test]
+    fn 开机补发的那批并进新提醒后标题仍说你错过了() {
+        let mut shown = ShownAlerts::default();
+        merge_shown(&mut shown, &[item("memo", "昨天的", "该交报告了", 50)], true);
+        merge_shown(&mut shown, &[item("timer", "煮蛋", "倒计时已完成", 900)], false);
+
+        let c = compose_shown(&shown);
+        assert_eq!(c.title, "你错过了 2 条提醒", "实际：{}", c.title);
     }
 
     #[test]

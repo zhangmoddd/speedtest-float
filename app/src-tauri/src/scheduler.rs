@@ -315,9 +315,8 @@ fn run(app: &AppHandle, first: bool) {
     // 稍后提醒是**独立于数据**的一条队列：这一 tick 可能没有任何到点，
     // 但用户几分钟前排的「稍后提醒」到时间了。
     //
-    // 并进同一个列表里让 `compose_alert` 统一拼标题正文，而不是另弹一次：
-    // 提醒窗只有一个，两次 `show_alert` 会让后一条把前一条顶掉，
-    // 而 `evaluate` 已经把那些标记成"已弹过"了 —— 那等于丢了一条提醒。
+    // 并进同一个列表里、一次弹出（怎么拼、怎么和还开着的提醒窗合并，
+    // 见 `windows::show_alerts`）。同一时刻到点的两条分成两次弹，只会多响一次铃。
     alerts.extend(take_due_snoozes(now));
     alerts.sort_by_key(|a| a.due_at);
 
@@ -328,20 +327,9 @@ fn run(app: &AppHandle, first: bool) {
     persist(app, timers_changed, memos_changed);
     notify_frontend(app, timers_changed, memos_changed);
 
-    let multi_title = |n: usize| {
-        if first {
-            format!("你错过了 {n} 条提醒")
-        } else {
-            format!("{n} 条提醒")
-        }
-    };
-
-    // 闹钟按手机的逻辑响到你处理为止，其余几种只是一声提醒（见 AlertWindow）
-    let is_alarm = alerts.iter().any(|a| a.source == "alarm");
-
-    if let Some((title, body)) = compose_alert(&alerts, multi_title) {
-        let _ = windows::show_alert(app, &title, &body, is_alarm);
-    }
+    // `first` = 开机后的第一次：措辞用"你错过了"。拼标题正文、和还开着的提醒窗合并，
+    // 都在 `show_alerts` 里做。
+    let _ = windows::show_alerts(app, &alerts, first);
 }
 
 // ===============================================================
@@ -353,6 +341,8 @@ fn run(app: &AppHandle, first: bool) {
 struct Snooze {
     title: String,
     body: String,
+    /// 原来那条是不是闹钟。回来时还按闹钟响（见下面 `take_due` 的说明）。
+    is_alarm: bool,
     /// 该重新弹出来的时刻。
     at: i64,
 }
@@ -368,10 +358,11 @@ struct SnoozeQueue {
 
 impl SnoozeQueue {
     /// 排一条。
-    fn push(&mut self, title: &str, body: &str, minutes: u32, now: i64) {
+    fn push(&mut self, title: &str, body: &str, is_alarm: bool, minutes: u32, now: i64) {
         self.items.push(Snooze {
             title: title.to_owned(),
             body: body.to_owned(),
+            is_alarm,
             at: now + (minutes as i64) * 60_000,
         });
     }
@@ -415,31 +406,49 @@ fn snooze_slot() -> &'static Mutex<SnoozeQueue> {
 /// 排一条稍后提醒。
 ///
 /// `minutes` 由调用方夹到合理区间（见 `commands::snooze_alert`）。
-pub fn push_snooze(title: &str, body: &str, minutes: u32, now: i64) {
+/// `is_alarm` 原样带着：闹钟点「稍后」回来还得是闹钟（见 [`take_due_snoozes`]）。
+pub fn push_snooze(title: &str, body: &str, is_alarm: bool, minutes: u32, now: i64) {
     snooze_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(title, body, minutes, now);
+        .push(title, body, is_alarm, minutes, now);
 }
 
 /// 取出所有到点的稍后提醒，剩下的留在队列里。
 ///
 /// 转成 [`PendingAlert`] 而不是单独弹一次：理由见 `run` 里那段说明。
+///
+/// # 来源字段
+///
+/// 普通提醒回来时来源标 `snooze`；**闹钟回来时仍标 `alarm`**。提醒窗只认
+/// `source == "alarm"` 来决定响多久 —— 以前不管什么都标 `snooze`，于是
+/// 闹钟点「稍后 5 分钟」，五分钟后回来只响 30 秒就自己停了，叫不醒人。
 pub fn take_due_snoozes(now: i64) -> Vec<PendingAlert> {
     snooze_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take_due(now)
         .into_iter()
-        .map(|s| PendingAlert {
-            source: "snooze".into(),
-            // 稍后提醒不对应任何一条数据，没有 id 可给
-            id: String::new(),
-            title: s.title,
-            body: s.body,
-            due_at: s.at,
-        })
+        .map(snooze_to_alert)
         .collect()
+}
+
+/// 一条到点的稍后提醒 → 待弹提醒。纯函数，可单测。
+///
+/// # 来源字段
+///
+/// 普通提醒回来时来源标 `snooze`；**闹钟回来时仍标 `alarm`**。提醒窗只认
+/// `source == "alarm"` 来决定响多久 —— 以前不管什么都标 `snooze`，于是
+/// 闹钟点「稍后 5 分钟」，五分钟后回来只响 30 秒就自己停了，叫不醒人。
+fn snooze_to_alert(s: Snooze) -> PendingAlert {
+    PendingAlert {
+        source: if s.is_alarm { "alarm" } else { "snooze" }.into(),
+        // 稍后提醒不对应任何一条数据，没有 id 可给
+        id: String::new(),
+        title: s.title,
+        body: s.body,
+        due_at: s.at,
+    }
 }
 
 /// 落盘被修改的集合。
@@ -494,7 +503,7 @@ mod tests {
     #[test]
     fn 稍后提醒排进去之后还没到点不会被取走() {
         let mut q = SnoozeQueue::default();
-        q.push("开会", "10:30 的会", 5, NOW);
+        q.push("开会", "10:30 的会", false, 5, NOW);
 
         assert!(q.take_due(NOW).is_empty(), "刚排上就取走等于没延后");
         assert!(q.take_due(NOW + 4 * 60_000).is_empty(), "差一分钟也不该取");
@@ -505,7 +514,7 @@ mod tests {
     #[test]
     fn 稍后提醒到点会被取走而且只取一次() {
         let mut q = SnoozeQueue::default();
-        q.push("开会", "10:30 的会", 5, NOW);
+        q.push("开会", "10:30 的会", false, 5, NOW);
 
         let due = q.take_due(NOW + 5 * 60_000);
         assert_eq!(due.len(), 1, "正好到点就该取走");
@@ -520,8 +529,8 @@ mod tests {
     #[test]
     fn 稍后提醒只取到点的那些其余留着() {
         let mut q = SnoozeQueue::default();
-        q.push("早的", "1", 5, NOW);
-        q.push("晚的", "2", 30, NOW);
+        q.push("早的", "1", false, 5, NOW);
+        q.push("晚的", "2", false, 30, NOW);
 
         let due = q.take_due(NOW + 6 * 60_000);
         assert_eq!(due.len(), 1);
@@ -535,18 +544,34 @@ mod tests {
     fn 稍后提醒排出来的是一条独立来源的待弹提醒() {
         // 它不对应任何一条数据，所以没有 id；来源标成 snooze
         let mut q = SnoozeQueue::default();
-        q.push("开会", "10:30 的会", 5, NOW);
+        q.push("开会", "10:30 的会", false, 5, NOW);
         let due = q.take_due(NOW + 5 * 60_000);
 
-        let alert = PendingAlert {
-            source: "snooze".into(),
-            id: String::new(),
-            title: due[0].title.clone(),
-            body: due[0].body.clone(),
-            due_at: due[0].at,
-        };
+        let alert = snooze_to_alert(due[0].clone());
         assert_eq!(alert.source, "snooze");
         assert!(alert.id.is_empty());
+        assert_eq!(alert.due_at, NOW + 5 * 60_000, "回来的时刻就是排的那个时刻");
+    }
+
+    #[test]
+    fn 闹钟点了稍后提醒回来还是闹钟() {
+        // 提醒窗只认 source == "alarm" 决定响多久。以前稍后提醒一律标 snooze，
+        // 闹钟点「稍后 5 分钟」回来只响 30 秒就自己停了 —— 等于叫不醒人。
+        let alarm = snooze_to_alert(Snooze {
+            title: "起床".into(),
+            body: "闹钟响了".into(),
+            is_alarm: true,
+            at: NOW,
+        });
+        let reminder = snooze_to_alert(Snooze {
+            title: "煮蛋".into(),
+            body: "倒计时已完成".into(),
+            is_alarm: false,
+            at: NOW,
+        });
+
+        assert_eq!(alarm.source, "alarm", "闹钟回来还是闹钟");
+        assert_eq!(reminder.source, "snooze", "普通提醒回来还是普通提醒");
     }
 
     #[test]

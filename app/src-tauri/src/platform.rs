@@ -7,10 +7,13 @@
 //! 1. 借用剪贴板：写入文本 → 模拟 Ctrl+V → 延时 → 把用户原本的剪贴板内容还回去。
 //! 2. 粘贴前把前台焦点还给「用户上一次真正在用的窗口」，否则 Ctrl+V 会打到浮光自己身上。
 //! 3. **只有悬浮球是不抢焦点的窗口**（`windows.rs` 里 `focused(false)`）；
-//!    主面板和提醒窗都是 `focused(true)` + `set_focus()`，会拿走焦点 ——
+//!    主面板是 `focused(true)` + `set_focus()`，会拿走焦点 ——
 //!    这是刻意的取舍（不抢焦点的窗口在 Windows 上按钮点击不可靠，
 //!    见 README 的「已知限制」）。这条注释原来写的是"悬浮球与主面板都用
 //!    `WS_EX_NOACTIVATE`"，**全项目根本没有那个样式**，是错的，已改正。
+//!    提醒窗介于两者之间：显示时**不激活**（[`show_no_activate`]），
+//!    但窗口本身照常可激活 —— 置顶的提醒不抢焦点也看得见，而用户去点它时
+//!    按钮和以前一样好点。
 
 #![cfg(windows)]
 
@@ -110,6 +113,51 @@ pub fn force_foreground(hwnd: isize) -> bool {
         return false;
     }
     unsafe { attach_and_focus(hwnd as HWND) }
+}
+
+/// 把一个窗口显示出来，但**不激活**它 —— 键盘焦点留在用户正在用的那个程序里。
+///
+/// # 用在哪
+///
+/// 提醒窗到点弹出时用。`WebviewWindow::show()` 内部是 `ShowWindow(SW_SHOW)`，
+/// 会把窗口提到前台并拿走键盘焦点：用户正在别的程序里打字，提醒一响，
+/// 接下来几个字就打进提醒窗了（或者更糟 —— 回车/空格正好落在按钮上）。
+/// 提醒窗本来就是置顶的，不抢焦点也照样看得见，所以抢焦点没有任何好处。
+///
+/// # 做法
+///
+/// `SetWindowPos(HWND_TOPMOST, …, SWP_NOACTIVATE | SWP_SHOWWINDOW)`：窗口照样
+/// 出现在最上层，只是不激活。
+///
+/// # 和「不抢焦点的窗口按钮点不动」不是一回事
+///
+/// 那条说的是给窗口加 `WS_EX_NOACTIVATE` 样式（见本文件开头）—— 这种窗口
+/// **永远**不能被激活。这里只是"这一次显示的时候别激活"：窗口照常可以被激活，
+/// 用户去点它时 Windows 会先激活再把点击交给它，按钮和以前一样好点。
+///
+/// # 已知副作用
+///
+/// 绕过了 tao 的 `set_visible`，Tauri 记的「是否可见」不会更新
+/// （`is_visible()` 仍返回 false）。目前没有代码读提醒窗的这个状态：
+/// 前端点「知道了」/「稍后」都是直接 `close()` 销毁窗口，不走 hide。
+pub fn show_no_activate(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
 }
 
 /// AttachThreadInput + SetForegroundWindow 的共用实现。

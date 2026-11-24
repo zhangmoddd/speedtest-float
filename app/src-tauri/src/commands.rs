@@ -1195,16 +1195,18 @@ pub async fn settings_get(app: AppHandle) -> Settings {
 /// 会让这条提醒永远回不来。
 #[tauri::command]
 pub async fn snooze_alert(minutes: u32) -> Result<(), String> {
-    let Some(current) = windows::last_alert() else {
+    let shown = windows::shown_alerts();
+    if shown.is_empty() {
         return Err("现在没有正在显示的提醒".into());
-    };
+    }
     let minutes = minutes.clamp(1, 60);
-    crate::scheduler::push_snooze(
-        &current.title,
-        &current.body,
-        minutes,
-        crate::models::now_ms(),
-    );
+    let now = crate::models::now_ms();
+    // 一条一条排，而不是把拼好的列表当成一条：窗口里可能是两条并在一起的
+    // （标题「2 条提醒」、正文是列表），整条排回去，五分钟后回来的是一段多行文字，
+    // 再和别的提醒并在一起就乱套了。拆开排，回来时自然又是一条一条的。
+    for a in &shown {
+        crate::scheduler::push_snooze(&a.title, &a.body, a.source == "alarm", minutes, now);
+    }
     Ok(())
 }
 
