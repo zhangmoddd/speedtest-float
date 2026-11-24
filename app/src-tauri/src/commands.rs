@@ -1026,7 +1026,8 @@ pub async fn links_auto_repair(
 #[tauri::command]
 pub async fn links_dedupe(app: AppHandle) -> usize {
     let store = app.state::<Store>();
-    let mut removed = 0usize;
+    // 先声明不赋初值：下面那块里一定会算出来，赋 0 的话编译器会提示「初值从未被读」
+    let removed;
     {
         let mut st = store.lock();
         let mut best: std::collections::HashMap<(Option<String>, String), (String, i64)> =

@@ -344,17 +344,20 @@ fn walk_dir(dir: &Path, visit: &mut impl FnMut(&EntryInfo) -> bool) -> bool {
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const _) };
 
             let name_len = info.FileNameLength as usize / 2;
-            if name_len > 0 {
-                // SAFETY: `FileName` 是记录里的变长尾巴，长度由
-                // `FileNameLength` 给出；`offset` 之后这段内存由内核刚写满。
-                let name_ptr = unsafe {
-                    buf.as_ptr()
-                        .add(offset)
-                        .add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName))
-                        as *const u16
-                };
-                let name: Vec<u16> =
-                    unsafe { std::slice::from_raw_parts(name_ptr, name_len) }.to_vec();
+            let name_start = offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            // 内核不可能给出越界的 FileNameLength；万一真的越界，就当这条没有名字
+            // （和 name_len == 0 走同一个跳过分支），而不是去碰缓冲区外面的内存。
+            if name_len > 0 && name_start + name_len * 2 <= buf.len() {
+                // `FileName` 是记录里的变长尾巴，这段内存由内核刚写满。
+                //
+                // 这里**不**把指针转成 `*const u16` 再切片：缓冲区是 `Vec<u8>`，
+                // 只保证 1 字节对齐，而 `&[u16]` 要求 2 字节对齐 —— 上面那条
+                // `read_unaligned` 正是为了这个，不能再从旁边绕过去。
+                // 按字节对读回来（Windows 是小端），结果完全一样，且没有 unsafe。
+                let name: Vec<u16> = buf[name_start..name_start + name_len * 2]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
                 let name = String::from_utf16_lossy(&name);
 
                 // `.` / `..` 不是真实条目，跳过（有的文件系统实现会返回）
