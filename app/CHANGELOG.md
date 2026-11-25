@@ -2,7 +2,7 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.1] - 2026-11-25
 
 ### 修复
 
@@ -883,4 +883,5 @@
   （备份的信封校验排在强类型反序列化**之后**，所以它认不出"版本更新"这种情况，
   只会说解析失败）。两个方向都**不会丢数据**，只是报错信息会误导人。
 
+[0.2.1]: https://github.com/zhangmoddd/speedtest-float/releases/tag/v0.2.1
 [0.1.0]: https://github.com/zhangmoddd/fuguang/releases/tag/v0.1.0
