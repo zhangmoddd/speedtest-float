@@ -123,7 +123,7 @@ export function pickerStartDir(status: LinkStatus): string | undefined {
  * 把候选路径缩成相对「原来那个文件夹」的形式。
  *
  * 候选全都同名、又都在同一个父目录的子树里，完整路径的公共前缀很长
- * （`C:\Users\Administrator\Desktop\` 这类），照原样显示的话，
+ * （`C:\Users\你\Desktop\` 这类），照原样显示的话，
  * **真正有区别的那一段会被挤到看不见的地方**。缩成 `临时\run.bat` 之后，
  * 一眼就能看出"哦，被收进「临时」了"。
  *

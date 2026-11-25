@@ -506,12 +506,12 @@ mod tests {
     fn 路径比较忽略大小写与斜杠方向() {
         // 同一份 exe 在注册表里可能是任意一种写法，逐字节比较会误判成"没开启"
         assert!(same_exe(
-            r"D:\software\浮光\fuguang.exe",
-            r"d:/SOFTWARE/浮光/FUGUANG.EXE"
+            r"C:\Apps\浮光\fuguang.exe",
+            r"c:/APPS/浮光/FUGUANG.EXE"
         ));
         assert!(same_exe(
-            r"D:\software\浮光\fuguang.exe",
-            r"D:\software\浮光\fuguang.exe\"
+            r"C:\Apps\浮光\fuguang.exe",
+            r"C:\Apps\浮光\fuguang.exe\"
         ));
     }
 
@@ -520,11 +520,11 @@ mod tests {
         // 这一条是本次修复的核心：注册表里躺着**另一个** exe 的路径时，
         // 设置页必须显示"未开启"，否则用户会以为自启的就是当前这个正式版
         assert!(!same_exe(
-            r"D:\Project\codex\浮光\src-tauri\target\debug\fuguang.exe",
-            r"D:\software\浮光\fuguang.exe"
+            r"C:\dev\浮光\src-tauri\target\debug\fuguang.exe",
+            r"C:\Apps\浮光\fuguang.exe"
         ));
-        assert!(!same_exe("", r"D:\software\浮光\fuguang.exe"));
-        assert!(!same_exe(r"D:\software\浮光\fuguang.exe", ""));
+        assert!(!same_exe("", r"C:\Apps\浮光\fuguang.exe"));
+        assert!(!same_exe(r"C:\Apps\浮光\fuguang.exe", ""));
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
     fn 失效自启项的判定收得很紧() {
         // 这段判定决定"删不删用户的注册表"，三个分支都必须钉住 ——
         // 删错一次就是把用户能用的自启搞没了。
-        let me = r"D:\software\浮光\fuguang.exe";
+        let me = r"C:\Apps\浮光\fuguang.exe";
         let existing = std::env::temp_dir().to_string_lossy().to_string();
         let missing = std::env::temp_dir()
             .join("fuguang-绝对不存在的文件-9f3a.exe")
@@ -630,17 +630,17 @@ mod tests {
 
     #[test]
     fn 路径比较要认得出同一个文件的几种写法() {
-        let me = r"D:\software\浮光\fuguang.exe";
+        let me = r"C:\Apps\浮光\fuguang.exe";
         // 尾部空格 / 尾部点：Windows 忽略（实测这两种 CreateProcess 都能启动，
         // 不裁就会让 is_enabled 谎报"未开启"）
-        assert!(same_exe(r"D:\software\浮光\fuguang.exe ", me));
-        assert!(same_exe(r"D:\software\浮光\fuguang.exe.", me));
+        assert!(same_exe(r"C:\Apps\浮光\fuguang.exe ", me));
+        assert!(same_exe(r"C:\Apps\浮光\fuguang.exe.", me));
         // `\\?\` 前缀（canonicalize 会加上它）
-        assert!(same_exe(r"\\?\D:\software\浮光\fuguang.exe", me));
+        assert!(same_exe(r"\\?\C:\Apps\浮光\fuguang.exe", me));
         // 正斜杠 / 大小写
-        assert!(same_exe(r"d:/SOFTWARE/浮光/FUGUANG.EXE", me));
+        assert!(same_exe(r"c:/APPS/浮光/FUGUANG.EXE", me));
         // 不同的文件不能算相同
-        assert!(!same_exe(r"D:\software\浮光\fuguang2.exe", me));
+        assert!(!same_exe(r"C:\Apps\浮光\fuguang2.exe", me));
     }
 
     #[test]

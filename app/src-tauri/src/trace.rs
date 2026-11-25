@@ -6,8 +6,8 @@
 //! 不是**这个东西本身**。文件夹一改名，整条路径就作废：
 //!
 //! ```text
-//! 原来：D:\Project\workbuddy\2026-09-14-20-48-18\清内存-双击这个.bat
-//! 后来：D:\Project\workbuddy\一键清内存工具\清内存-双击这个.bat
+//! 原来：D:\工作\2026-09-14-20-48-18\启动-双击这个.bat
+//! 后来：D:\工作\清理小工具\启动-双击这个.bat
 //! ```
 //!
 //! 文件一个字节都没动，只是被拖进了改名后的文件夹。可对链接来说，
@@ -427,9 +427,9 @@ fn roots_for(hint: &str) -> Vec<PathBuf> {
     // 1. 原位置所在的目录，以及它**最近还活着的**那几层祖先。
     //
     //    这一条是"文件夹被改名"那种情况的正解：
-    //    `D:\Project\workbuddy\2026-09-14-20-48-18` 没了，
-    //    但 `D:\Project\workbuddy` 还在 —— 从后者往下走就能看到
-    //    `一键清内存工具\清内存-双击这个.bat`。
+    //    `D:\工作\2026-09-14-20-48-18` 没了，
+    //    但 `D:\工作` 还在 —— 从后者往下走就能看到
+    //    `清理小工具\启动-双击这个.bat`。
     let mut hops = 0;
     while let Some(dir) = cur {
         if dir.is_dir() {
@@ -455,7 +455,7 @@ fn roots_for(hint: &str) -> Vec<PathBuf> {
     //    ⚠️ 这里原来是 `if let Some(first) = roots.first()` —— 也就是
     //    "连一层祖上都找不到就放弃"。那正好漏掉唯一还能找的地方：
     //    原路径整个被删/改名时 roots 可能是空的，而用户把文件拖到盘根
-    //    （`D:\清内存-双击这个.bat`）是非常常见的动作，实测就撞上了。
+    //    （`D:\启动-双击这个.bat`）是非常常见的动作，实测就撞上了。
     //
     //    ⚠️ 为什么还要挪到最前面（实测数据）：盘根只有几十个目录项，
     //    扫它几乎免费；而它后面的祖先可能是几万项的巨型目录。
@@ -502,13 +502,13 @@ pub fn find_by_trace(trace: &FileTrace, hint: &str, want_dir: bool) -> Vec<Trace
     //
     // ⚠️ 这里原来是"逐个根挖到底，挖完一个再挖下一个"，实测撞了个正着：
     //
-    //   用户先把文件挪进 `D:\Project\workbuddy\一键清内存工具\`，链接跟着改好；
+    //   用户先把文件挪进 `D:\工作\清理小工具\`，链接跟着改好；
     //   后来又把文件拖到了 `D:\` 的根目录。这时往上退出来的根依次是
-    //   `D:\Project\workbuddy`（两万多个条目）、`D:\Project`（更多）、`D:\`（几十个）。
+    //   `D:\工作`（两万多个条目）、`D:\Project`（更多）、`D:\`（几十个）。
     //   串行扫的话，前两个根就把条目预算吃光了，`D:\` **一次都没轮到** ——
     //   界面上就是"找不到"，而文件就在最浅的那一层，一眼就能看见。
     //
-    // 合并成一个队列之后，`D:\` 的第一层会和 `D:\Project\workbuddy` 的第一层
+    // 合并成一个队列之后，`D:\` 的第一层会和 `D:\工作` 的第一层
     // 一起被扫。**便宜的根先出结果，贵的根不会把它挡在后面。**
     // 队列第三项：这个根和目标**是不是同一个卷**。
     //
@@ -683,7 +683,7 @@ mod tests {
         let dir = temp_dir("find");
         let sub = dir.join("收起来了");
         std::fs::create_dir_all(&sub).unwrap();
-        let a = dir.join("清内存-双击这个.bat");
+        let a = dir.join("启动-双击这个.bat");
         std::fs::write(&a, b"echo clear").unwrap();
         let trace = trace_of(&a.to_string_lossy()).unwrap();
 
@@ -709,13 +709,13 @@ mod tests {
         let trace = trace_of(&a.to_string_lossy()).unwrap();
         assert_eq!(trace.bytes, 0);
 
-        let b = dir.join("一键清内存工具");
+        let b = dir.join("清理小工具");
         std::fs::rename(&a, &b).unwrap();
 
         let hits = find_by_trace(&trace, &a.to_string_lossy(), true);
         assert!(
             hits.iter()
-                .any(|h| h.how == TraceMatch::SameFile && h.path.ends_with("一键清内存工具")),
+                .any(|h| h.how == TraceMatch::SameFile && h.path.ends_with("清理小工具")),
             "实际：{hits:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -723,7 +723,7 @@ mod tests {
 
     /// ⚠️ 这条钉的是一个**用户实测撞上的失败**。
     ///
-    /// 真实过程：文件先被挪进 `…\workbuddy\一键清内存工具\`（链接跟着改好），
+    /// 真实过程：文件先被挪进 `D:\工作\清理小工具\`（链接跟着改好），
     /// 后来又被人拖到 `D:\` 的根目录。这时往上退出来的起点是
     /// `…\workbuddy`（两万多个条目）、`…\Project`（更多）、`D:\`（几十个）。
     ///
@@ -745,7 +745,7 @@ mod tests {
         }
 
         // 目标在浅层（相当于用户把它拖到了盘根那一层）
-        let target = dir.join("清内存-双击这个.bat");
+        let target = dir.join("启动-双击这个.bat");
         std::fs::write(&target, b"echo clear").unwrap();
         let trace = trace_of(&target.to_string_lossy()).unwrap();
 
@@ -753,7 +753,7 @@ mod tests {
         std::fs::rename(&target, &moved).unwrap();
 
         // 链接里存的还是那个深层的、已经不存在的路径
-        let stale = deep.join("不存在").join("清内存-双击这个.bat");
+        let stale = deep.join("不存在").join("启动-双击这个.bat");
         let hits = find_by_trace(&trace, &stale.to_string_lossy(), false);
 
         assert!(

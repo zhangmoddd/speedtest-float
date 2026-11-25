@@ -745,7 +745,7 @@ mod tests {
         // 误判的代价是"图标不显示了"，所以也要钉住正常路径
         for good in [
             r"C:\Windows\notepad.exe",
-            r"D:\software\浮光\fuguang.exe",
+            r"C:\Apps\浮光\fuguang.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             "notepad.exe",
             "",

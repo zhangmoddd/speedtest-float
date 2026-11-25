@@ -924,7 +924,7 @@ const SEARCH_MAX_DEPTH: usize = 3;
 /// 现在换了策略：原父目录不在了会往上退到最近还活着的祖先再往下找 ——
 /// 搜索范围一下子从"一个文件夹"变成"一层几百个文件夹"。
 ///
-/// 实测那条真实用例（`D:\Project\workbuddy`，下面 130 个子文件夹、
+/// 实测那条真实用例（`D:\工作`，下面 130 个子文件夹、
 /// 递归两万多个条目）在 4000 的预算下**走不到目标就停了**，
 /// 也就是说用户点了「找找看」，明明文件就在那儿，界面却说没找到。
 ///
@@ -1054,7 +1054,7 @@ pub fn find_same_name(target: &str, want_dir: bool) -> Vec<SameNameCandidate> {
     //
     // 这时候直接返回空表等于一次都没查 —— 而用户最常见的动作恰恰是
     // "把文件夹改个名"：`…\workbuddy\2026-09-14-20-48-18\` 变成
-    // `…\workbuddy\一键清内存工具\`，里面的文件一个字节都没动。
+    // `D:\工作\清理小工具\`，里面的文件一个字节都没动。
     //
     // 所以往上退到**最近还活着的**那一层，从那里往下找。
     // 上限 4 层：再往上就退到盘根了，那已经不是"附近"，而是全盘搜索 ——
@@ -1581,8 +1581,8 @@ mod tests {
 
     /// ⚠️ 这条钉的是一个**真实踩过的坑**：父文件夹被改名。
     ///
-    /// 真实用例：`D:\Project\workbuddy\2026-09-14-20-48-18\清内存-双击这个.bat`
-    /// 那个文件夹被改名成 `一键清内存工具`，文件原封不动。
+    /// 真实用例：`D:\工作\2026-09-14-20-48-18\启动-双击这个.bat`
+    /// 那个文件夹被改名成 `清理小工具`，文件原封不动。
     ///
     /// 改动之前这里是直接返回空表（"原来那个文件夹也没了，搜不动"），
     /// 于是用户看到的是"文件夹没了"、下面一个候选都没有 ——
@@ -1594,17 +1594,17 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("建临时目录");
 
         // 现在叫这个名字，文件在里面
-        let now = dir.join("一键清内存工具");
+        let now = dir.join("清理小工具");
         std::fs::create_dir_all(&now).expect("建子目录");
-        std::fs::write(now.join("清内存-双击这个.bat"), b"echo clear").expect("写");
+        std::fs::write(now.join("启动-双击这个.bat"), b"echo clear").expect("写");
 
         // 链接里存的还是那个已经不存在的老文件夹
-        let stale = dir.join("2026-09-14-20-48-18").join("清内存-双击这个.bat");
+        let stale = dir.join("2026-09-14-20-48-18").join("启动-双击这个.bat");
 
         let hits = find_same_name(&stale.to_string_lossy(), false);
         assert!(
             hits.iter()
-                .any(|h| h.path.ends_with("清内存-双击这个.bat")
+                .any(|h| h.path.ends_with("启动-双击这个.bat")
                     && h.how == CandidateMatch::SameName),
             "父目录改名后应该往上退一层继续找，实际：{hits:?}"
         );
